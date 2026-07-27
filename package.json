@@ -1,15 +1,1 @@
-{
-  "name": "helios-insiders-relay",
-  "version": "1.0.0",
-  "description": "Persistent WebSocket relay for Helios Insiders — independent from v4.0 relay",
-  "main": "server.js",
-  "scripts": {
-    "start": "node server.js"
-  },
-  "dependencies": {
-    "ws": "^8.18.0"
-  },
-  "engines": {
-    "node": ">=18"
-  }
-}
+
