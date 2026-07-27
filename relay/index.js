@@ -50,12 +50,12 @@ function makeUpstreamState(name) {
   return {
     name,
     ws: null,
-    status: 'disconnected',   // 'connecting' | 'connected' | 'disconnected'
-    authed: false,
+    _state: 'disconnected',    // 'connecting' | 'connected' | 'disconnected'
+    _authConfirmed: false,
     reconnectAttempt: 0,
     reconnectTimer: null,
-    subscriptions: new Set(), // active channel strings for this socket
-    sendQueue: [],             // messages queued before OPEN
+    subscriptions: new Set(),  // active channel strings for this socket
+    sendQueue: [],              // messages queued before auth confirmed
   };
 }
 
@@ -67,20 +67,31 @@ function connectUpstream(state) {
     state.reconnectTimer = null;
   }
 
-  state.status = 'connecting';
-  state.authed = false;
+  state._state = 'connecting';
+  state._authConfirmed = false;
   state.sendQueue = [];
 
   const ws = new WebSocket(UPSTREAM_URLS[state.name]);
   state.ws = ws;
 
   ws.on('open', () => {
-    console.log(`[relay] upstream ${state.name} connected`);
-    state.status = 'connected';
+    state._state = 'connected';
     state.reconnectAttempt = 0;
+    console.log(`[relay] upstream ${state.name} connected`);
 
-    // Authenticate immediately
+    // Send auth immediately on open — do NOT send before this event
     ws.send(JSON.stringify({ action: 'auth', params: MASSIVE_API_KEY }));
+
+    // Auth timeout guard — if auth not confirmed within 10s, close and reconnect
+    state._authConfirmed = false;
+    const authTimeout = setTimeout(() => {
+      if (!state._authConfirmed) {
+        console.log(`[relay] upstream ${state.name} auth timeout — reconnecting`);
+        ws.close();
+      }
+    }, 10000);
+
+    ws.once('close', () => clearTimeout(authTimeout));
   });
 
   ws.on('message', (data) => {
@@ -88,40 +99,44 @@ function connectUpstream(state) {
     let messages;
     try { messages = JSON.parse(raw); } catch { return; }
 
+    // Massive sends arrays
     const arr = Array.isArray(messages) ? messages : [messages];
 
     for (const msg of arr) {
-      // Auth confirmation
+      // Auth confirmation: ev === 'status' with message containing 'authenticated'
       if (
-        !state.authed &&
+        !state._authConfirmed &&
         msg.ev === 'status' &&
         typeof msg.message === 'string' &&
         msg.message.toLowerCase().includes('authenticated')
       ) {
-        state.authed = true;
+        state._authConfirmed = true;
         console.log(`[relay] auth confirmed: ${state.name}`);
 
-        // Flush queued subscriptions
+        // Flush subscriptions queued before auth
         for (const queued of state.sendQueue) {
-          safeSend(state, queued);
+          if (ws.readyState === WebSocket.OPEN) ws.send(queued);
         }
         state.sendQueue = [];
 
-        // Reconnect replay
+        // Reconnect replay — re-subscribe to all active subscriptions
         if (state.subscriptions.size > 0) {
           const params = [...state.subscriptions].join(',');
-          safeSend(state, JSON.stringify({ action: 'subscribe', params }));
+          if (ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ action: 'subscribe', params }));
+          }
         }
         continue;
       }
 
+      // Forward all data to all browser clients
       broadcast(raw);
     }
   });
 
   ws.on('close', () => {
-    state.status = 'disconnected';
-    state.authed = false;
+    state._state = 'disconnected';
+    state._authConfirmed = false;
     state.ws = null;
 
     const delay = backoffMs(state.reconnectAttempt);
@@ -133,6 +148,7 @@ function connectUpstream(state) {
 
   ws.on('error', (err) => {
     console.error(`[relay] upstream ${state.name} error:`, err.message);
+    // 'close' will follow — handled above
   });
 }
 
@@ -143,14 +159,17 @@ function safeSend(state, message) {
   }
   const rs = state.ws.readyState;
   if (rs === WebSocket.CONNECTING) {
+    // Queue until 'open' + auth
     state.sendQueue.push(message);
   } else if (rs === WebSocket.OPEN) {
-    if (!state.authed) {
+    if (!state._authConfirmed) {
+      // Queue until auth confirmation
       state.sendQueue.push(message);
     } else {
       state.ws.send(message);
     }
   }
+  // CLOSING or CLOSED — drop, reconnect will replay subscriptions
 }
 
 function broadcast(raw) {
@@ -161,27 +180,27 @@ function broadcast(raw) {
   }
 }
 
-// ─── HTTP server (health check + WebSocket upgrade) ──────────────────────────
+// ─── HTTP + WebSocket server ──────────────────────────────────────────────────
 
-const server = http.createServer((req, res) => {
+const server = http.createServer();
+
+server.on('request', (req, res) => {
   if (req.method === 'GET' && req.url === '/health') {
     const body = JSON.stringify({
       status: 'ok',
       upstreams: {
-        stocks:  upstream.stocks.status,
-        options: upstream.options.status,
-        indices: upstream.indices.status,
-      },
+        stocks:  upstream.stocks._state,
+        options: upstream.options._state,
+        indices: upstream.indices._state
+      }
     });
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-res.end(JSON.stringify({
-  status: 'ok',
-  upstreams: {
-    stocks: upstream.stocks._state,
-    options: upstream.options._state,
-    indices: upstream.indices._state
+    res.writeHead(200, { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) });
+    res.end(body);
+    return;
   }
-}));
+  res.writeHead(404);
+  res.end();
+});
 
 // ─── WebSocket server (browser clients) ──────────────────────────────────────
 
@@ -191,6 +210,7 @@ wss.on('connection', (ws) => {
   clients.add(ws);
   console.log(`[relay] browser client connected (total: ${clients.size})`);
 
+  // Greet client
   ws.send(JSON.stringify({
     type: 'connected',
     streams: ['stocks', 'options', 'indices'],
@@ -203,6 +223,7 @@ wss.on('connection', (ws) => {
     if (msg.action === 'subscribe' && typeof msg.params === 'string') {
       const channels = msg.params.split(',').map(c => c.trim()).filter(Boolean);
 
+      // Group channels by upstream
       const grouped = { stocks: [], options: [], indices: [] };
       for (const ch of channels) {
         const name = upstreamForChannel(ch);
