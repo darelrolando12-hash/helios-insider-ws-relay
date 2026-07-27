@@ -15,9 +15,6 @@ const UPSTREAM_URLS = {
 };
 
 // Channel prefix → upstream name
-// Stocks:  T.*  Q.*  A.*  AM.*   (excluding O: variants)
-// Options: T.O: Q.O: A.O: AM.O:
-// Indices: V.I: AM.I:
 function upstreamForChannel(channel) {
   if (/^(T|Q|A|AM)\.O:/i.test(channel)) return 'options';
   if (/^(V|AM)\.I:/i.test(channel))      return 'indices';
@@ -27,7 +24,10 @@ function upstreamForChannel(channel) {
 
 // ─── Reconnect backoff ────────────────────────────────────────────────────────
 
-const BACKOFF_STEPS = [15, 30, 60, 120, 120]; // seconds
+// Kyle (Massive support) confirmed: WS is a buffered protocol — server-side
+// cleanup after a dropped connection takes 10-30 seconds. Reconnect timing
+// must respect this window to avoid hitting max_connections immediately.
+const BACKOFF_STEPS = [30, 60, 120, 120, 120]; // seconds — minimum 30s per Kyle
 
 function backoffMs(attempt) {
   const step = Math.min(attempt, BACKOFF_STEPS.length - 1);
@@ -36,10 +36,8 @@ function backoffMs(attempt) {
 
 // ─── State ────────────────────────────────────────────────────────────────────
 
-// Connected browser clients
 const clients = new Set();
 
-// Per-upstream state
 const upstream = {
   stocks:  makeUpstreamState('stocks'),
   options: makeUpstreamState('options'),
@@ -54,14 +52,29 @@ function makeUpstreamState(name) {
     _authConfirmed: false,
     reconnectAttempt: 0,
     reconnectTimer: null,
-    subscriptions: new Set(),  // active channel strings for this socket
-    sendQueue: [],              // messages queued before auth confirmed
+    subscriptions: new Set(),
+    sendQueue: [],
   };
 }
 
 // ─── Upstream management ──────────────────────────────────────────────────────
 
 function connectUpstream(state) {
+  // ── CRITICAL GUARD (Kyle / Massive support diagnosis) ──────────────────────
+  // 1 connection per asset class is allowed. The server-side cleanup after a
+  // dropped connection takes 10-30s (buffered protocol). If a reconnect fires
+  // while the prior TCP session is still alive server-side, a second connection
+  // is created, max_connections is hit, and the new one is killed with 1006 —
+  // creating an infinite loop. Guard against BOTH connecting AND connected states.
+  if (state.ws && (
+    state.ws.readyState === WebSocket.CONNECTING ||
+    state.ws.readyState === WebSocket.OPEN
+  )) {
+    console.log(`[relay] upstream ${state.name} already ${state._state} — skipping`);
+    return;
+  }
+  // ──────────────────────────────────────────────────────────────────────────
+
   if (state.reconnectTimer) {
     clearTimeout(state.reconnectTimer);
     state.reconnectTimer = null;
@@ -71,6 +84,7 @@ function connectUpstream(state) {
   state._authConfirmed = false;
   state.sendQueue = [];
 
+  console.log(`[relay] upstream ${state.name} connecting...`);
   const ws = new WebSocket(UPSTREAM_URLS[state.name]);
   state.ws = ws;
 
@@ -79,14 +93,12 @@ function connectUpstream(state) {
     state.reconnectAttempt = 0;
     console.log(`[relay] upstream ${state.name} connected`);
 
-    // Send auth immediately on open — do NOT send before this event
     ws.send(JSON.stringify({ action: 'auth', params: MASSIVE_API_KEY }));
 
-    // Auth timeout guard — if auth not confirmed within 10s, close and reconnect
     state._authConfirmed = false;
     const authTimeout = setTimeout(() => {
       if (!state._authConfirmed) {
-        console.log(`[relay] upstream ${state.name} auth timeout — reconnecting`);
+        console.log(`[relay] upstream ${state.name} auth timeout — closing`);
         ws.close();
       }
     }, 10000);
@@ -97,13 +109,14 @@ function connectUpstream(state) {
   ws.on('message', (data) => {
     const raw = data.toString();
     let messages;
-    try { messages = JSON.parse(raw); } catch { return; }
+    try { messages = JSON.parse(raw); } catch (err) {
+      console.error(`[relay] upstream ${state.name} JSON parse error:`, err.message, 'raw:', raw.slice(0, 200));
+      return;
+    }
 
-    // Massive sends arrays
     const arr = Array.isArray(messages) ? messages : [messages];
 
     for (const msg of arr) {
-      // Auth confirmation: ev === 'status' with message containing 'authenticated'
       if (
         !state._authConfirmed &&
         msg.ev === 'status' &&
@@ -113,13 +126,11 @@ function connectUpstream(state) {
         state._authConfirmed = true;
         console.log(`[relay] auth confirmed: ${state.name}`);
 
-        // Flush subscriptions queued before auth
         for (const queued of state.sendQueue) {
           if (ws.readyState === WebSocket.OPEN) ws.send(queued);
         }
         state.sendQueue = [];
 
-        // Reconnect replay — re-subscribe to all active subscriptions
         if (state.subscriptions.size > 0) {
           const params = [...state.subscriptions].join(',');
           if (ws.readyState === WebSocket.OPEN) {
@@ -129,26 +140,34 @@ function connectUpstream(state) {
         continue;
       }
 
-      // Forward all data to all browser clients
+      // Log any status messages for visibility (catches max_connections etc.)
+      if (msg.ev === 'status') {
+        console.log(`[relay] upstream ${state.name} status:`, msg.message || JSON.stringify(msg));
+      }
+
       broadcast(raw);
     }
   });
 
-  ws.on('close', () => {
+  ws.on('close', (code, reason) => {
+    const prevState = state._state;
     state._state = 'disconnected';
     state._authConfirmed = false;
     state.ws = null;
 
     const delay = backoffMs(state.reconnectAttempt);
     state.reconnectAttempt++;
-    console.log(`[relay] upstream ${state.name} disconnected — reconnecting in ${delay / 1000}s`);
+    console.log(`[relay] upstream ${state.name} disconnected (code ${code}, was ${prevState}) — reconnecting in ${delay / 1000}s`);
+    if (reason && reason.length > 0) {
+      console.log(`[relay] upstream ${state.name} close reason:`, reason.toString());
+    }
 
     state.reconnectTimer = setTimeout(() => connectUpstream(state), delay);
   });
 
   ws.on('error', (err) => {
     console.error(`[relay] upstream ${state.name} error:`, err.message);
-    // 'close' will follow — handled above
+    // 'close' will follow
   });
 }
 
@@ -159,17 +178,14 @@ function safeSend(state, message) {
   }
   const rs = state.ws.readyState;
   if (rs === WebSocket.CONNECTING) {
-    // Queue until 'open' + auth
     state.sendQueue.push(message);
   } else if (rs === WebSocket.OPEN) {
     if (!state._authConfirmed) {
-      // Queue until auth confirmation
       state.sendQueue.push(message);
     } else {
       state.ws.send(message);
     }
   }
-  // CLOSING or CLOSED — drop, reconnect will replay subscriptions
 }
 
 function broadcast(raw) {
@@ -210,7 +226,6 @@ wss.on('connection', (ws) => {
   clients.add(ws);
   console.log(`[relay] browser client connected (total: ${clients.size})`);
 
-  // Greet client
   ws.send(JSON.stringify({
     type: 'connected',
     streams: ['stocks', 'options', 'indices'],
@@ -223,7 +238,6 @@ wss.on('connection', (ws) => {
     if (msg.action === 'subscribe' && typeof msg.params === 'string') {
       const channels = msg.params.split(',').map(c => c.trim()).filter(Boolean);
 
-      // Group channels by upstream
       const grouped = { stocks: [], options: [], indices: [] };
       for (const ch of channels) {
         const name = upstreamForChannel(ch);
@@ -251,10 +265,20 @@ wss.on('connection', (ws) => {
 });
 
 // ─── Boot ─────────────────────────────────────────────────────────────────────
+// Staggered startup: each asset class connection is offset by 5 seconds.
+// This prevents simultaneous connection attempts from creating a race condition
+// against any lingering server-side sessions from a prior deployment.
+// Kyle (Massive support) confirmed server cleanup takes 10-30s after a close.
 
 server.listen(PORT, () => {
   console.log(`[relay] listening on port ${PORT}`);
+
+  // stocks — connect immediately
   connectUpstream(upstream.stocks);
-  connectUpstream(upstream.options);
-  connectUpstream(upstream.indices);
+
+  // options — connect after 5s (clear prior session server-side)
+  setTimeout(() => connectUpstream(upstream.options), 5000);
+
+  // indices — connect after 10s
+  setTimeout(() => connectUpstream(upstream.indices), 10000);
 });
