@@ -173,17 +173,15 @@ const server = http.createServer((req, res) => {
         indices: upstream.indices.status,
       },
     });
-    res.writeHead(200, {
-      'Content-Type': 'application/json',
-      'Content-Length': Buffer.byteLength(body),
-    });
-    res.end(body);
-    return;
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+res.end(JSON.stringify({
+  status: 'ok',
+  upstreams: {
+    stocks: upstream.stocks._state,
+    options: upstream.options._state,
+    indices: upstream.indices._state
   }
-
-  res.writeHead(404);
-  res.end();
-});
+}));
 
 // ─── WebSocket server (browser clients) ──────────────────────────────────────
 
