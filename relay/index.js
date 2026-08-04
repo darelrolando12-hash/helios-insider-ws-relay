@@ -85,6 +85,7 @@ function connectUpstream(state) {
   state.sendQueue = [];
 
   console.log(`[relay] upstream ${state.name} connecting...`);
+
   const ws = new WebSocket(UPSTREAM_URLS[state.name]);
   state.ws = ws;
 
@@ -108,6 +109,7 @@ function connectUpstream(state) {
 
   ws.on('message', (data) => {
     const raw = data.toString();
+
     let messages;
     try { messages = JSON.parse(raw); } catch (err) {
       console.error(`[relay] upstream ${state.name} JSON parse error:`, err.message, 'raw:', raw.slice(0, 200));
@@ -253,9 +255,9 @@ wss.on('connection', (ws) => {
     }
   });
 
-  ws.on('close', () => {
+  ws.on('close', (code, reason) => {
     clients.delete(ws);
-    console.log(`[relay] browser client disconnected (total: ${clients.size})`);
+    console.log(`[relay] browser client disconnected code=${code} reason="${reason}" (total: ${clients.size})`);
   });
 
   ws.on('error', (err) => {
@@ -265,11 +267,11 @@ wss.on('connection', (ws) => {
 });
 
 // ─── Boot ─────────────────────────────────────────────────────────────────────
+
 // Staggered startup: each asset class connection is offset by 5 seconds.
 // This prevents simultaneous connection attempts from creating a race condition
 // against any lingering server-side sessions from a prior deployment.
 // Kyle (Massive support) confirmed server cleanup takes 10-30s after a close.
-
 server.listen(PORT, () => {
   console.log(`[relay] listening on port ${PORT}`);
 
