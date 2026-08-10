@@ -228,6 +228,9 @@ wss.on('connection', (ws) => {
   clients.add(ws);
   console.log(`[relay] browser client connected (total: ${clients.size})`);
 
+  ws.isAlive = true;
+  ws.on('pong', () => { ws.isAlive = true; });
+
   ws.send(JSON.stringify({
     type: 'connected',
     streams: ['stocks', 'options', 'indices'],
@@ -249,8 +252,16 @@ wss.on('connection', (ws) => {
       for (const [name, chans] of Object.entries(grouped)) {
         if (chans.length === 0) continue;
         const state = upstream[name];
-        for (const ch of chans) state.subscriptions.add(ch);
-        safeSend(state, JSON.stringify({ action: 'subscribe', params: chans.join(',') }));
+
+        const newChans = chans.filter((ch) => !state.subscriptions.has(ch));
+        if (newChans.length === 0) {
+          console.log(`[relay] ${name}: all ${chans.length} requested channel(s) already subscribed — skipping resubscribe`);
+          continue;
+        }
+
+        for (const ch of newChans) state.subscriptions.add(ch);
+        safeSend(state, JSON.stringify({ action: 'subscribe', params: newChans.join(',') }));
+        console.log(`[relay] ${name}: forwarded ${newChans.length} new channel(s), skipped ${chans.length - newChans.length} already-subscribed`);
       }
     }
   });
@@ -265,6 +276,23 @@ wss.on('connection', (ws) => {
     clients.delete(ws);
   });
 });
+
+// ─── Heartbeat (reap dead browser clients) ───────────────────────────────────
+
+const HEARTBEAT_INTERVAL_MS = 15000; // 15s — no external constraint on this, just detecting dead browser clients fast
+
+const heartbeatInterval = setInterval(() => {
+  for (const ws of clients) {
+    if (ws.isAlive === false) {
+      console.log('[relay] browser client failed heartbeat — terminating');
+      clients.delete(ws);
+      ws.terminate();
+      continue;
+    }
+    ws.isAlive = false;
+    ws.ping();
+  }
+}, HEARTBEAT_INTERVAL_MS);
 
 // ─── Boot ─────────────────────────────────────────────────────────────────────
 
