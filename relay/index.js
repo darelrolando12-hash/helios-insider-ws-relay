@@ -216,9 +216,43 @@ server.on('request', (req, res) => {
     res.end(body);
     return;
   }
+
+  if (req.method === 'GET' && req.url && req.url.startsWith('/rest/')) {
+    handleRestProxy(req, res);
+    return;
+  }
+
   res.writeHead(404);
   res.end();
 });
+
+// ─── REST proxy (browser → relay → Massive) ──────────────────────────────────
+// Everything after /rest/ is forwarded as-is to api.massive.com, with the
+// apiKey attached server-side. The browser never sends or sees the key.
+// This does NOT touch wss/upgrade handling — that runs on a separate event.
+async function handleRestProxy(req, res) {
+  try {
+    const incoming = new URL(req.url, 'http://internal');
+    const forwardPath = incoming.pathname.slice('/rest'.length); // keep leading '/'
+    const target = new URL(forwardPath, 'https://api.massive.com');
+    for (const [key, value] of incoming.searchParams) {
+      target.searchParams.append(key, value);
+    }
+    target.searchParams.set('apiKey', MASSIVE_API_KEY);
+
+    const upstreamRes = await fetch(target.toString(), { method: 'GET' });
+    const bodyText = await upstreamRes.text();
+
+    res.writeHead(upstreamRes.status, {
+      'Content-Type': upstreamRes.headers.get('content-type') || 'application/json',
+    });
+    res.end(bodyText);
+  } catch (err) {
+    console.error('[relay] REST proxy error:', err.message);
+    res.writeHead(502, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'relay proxy failed', message: err.message }));
+  }
+}
 
 // ─── WebSocket server (browser clients) ──────────────────────────────────────
 
