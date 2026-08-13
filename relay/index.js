@@ -217,6 +217,16 @@ server.on('request', (req, res) => {
     return;
   }
 
+  if (req.method === 'OPTIONS' && req.url && req.url.startsWith('/rest/')) {
+    res.writeHead(204, {
+      'Access-Control-Allow-Origin': '*',
+      'Access-Control-Allow-Methods': 'GET, OPTIONS',
+      'Access-Control-Allow-Headers': 'Content-Type, Accept',
+    });
+    res.end();
+    return;
+  }
+
   if (req.method === 'GET' && req.url && req.url.startsWith('/rest/')) {
     handleRestProxy(req, res);
     return;
@@ -245,6 +255,9 @@ async function handleRestProxy(req, res) {
 
     res.writeHead(upstreamRes.status, {
       'Content-Type': upstreamRes.headers.get('content-type') || 'application/json',
+      'Access-Control-Allow-Origin': '*',
+      'Access-Control-Allow-Methods': 'GET, OPTIONS',
+      'Access-Control-Allow-Headers': 'Content-Type, Accept',
     });
     res.end(bodyText);
   } catch (err) {
