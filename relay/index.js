@@ -18,6 +18,10 @@ const UPSTREAM_URLS = {
 function upstreamForChannel(channel) {
   if (/^(T|Q|A|AM)\.O:/i.test(channel)) return 'options';
   if (/^(V|AM)\.I:/i.test(channel))      return 'indices';
+  // LULD halt events are an equities mechanism served on the stocks cluster.
+  // Without this branch LULD.* channels resolve to null and are silently
+  // dropped by the subscribe handler — halt data can never arrive.
+  if (/^LULD\./i.test(channel))          return 'stocks';
   if (/^(T|Q|A|AM)\./i.test(channel))    return 'stocks';
   return null;
 }
@@ -241,10 +245,10 @@ server.on('request', (req, res) => {
 // apiKey attached server-side. The browser never sends or sees the key.
 // This does NOT touch wss/upgrade handling — that runs on a separate event.
 // Browser-side fetch calls give up after 25s. Without its own timeout, a
-// slow/hung upstream call here keeps running orphaned past that point —
-// the browser has already moved on, but the relay is still waiting. A 20s
-// timeout (inside the browser's 25s) makes the relay give up first and
-// return a real error response instead of leaving the request dangling.
+// slow/hung upstream call here keeps running orphaned past that point — the
+// browser has already moved on, but the relay is still waiting. A 20s timeout
+// (inside the browser's 25s) makes the relay give up first and return a real
+// error response instead of leaving the request dangling.
 const REST_PROXY_TIMEOUT_MS = 20_000;
 
 async function handleRestProxy(req, res) {
@@ -273,7 +277,12 @@ async function handleRestProxy(req, res) {
   } catch (err) {
     const timedOut = err.name === 'AbortError';
     console.error('[relay] REST proxy error:', timedOut ? `timed out after ${REST_PROXY_TIMEOUT_MS / 1000}s` : err.message);
-    res.writeHead(timedOut ? 504 : 502, { 'Content-Type': 'application/json' });
+    res.writeHead(timedOut ? 504 : 502, {
+      'Content-Type': 'application/json',
+      'Access-Control-Allow-Origin': '*',
+      'Access-Control-Allow-Methods': 'GET, OPTIONS',
+      'Access-Control-Allow-Headers': 'Content-Type, Accept',
+    });
     res.end(JSON.stringify({ error: 'relay proxy failed', message: timedOut ? 'upstream request timed out' : err.message }));
   } finally {
     clearTimeout(timeout);
@@ -372,20 +381,3 @@ server.listen(PORT, () => {
   // indices — connect after 10s
   setTimeout(() => connectUpstream(upstream.indices), 10000);
 });
-relay/package.json (unchanged, included for completeness — no dependency changes needed):
-
-{
-  "name": "helios-insiders-relay",
-  "version": "1.0.0",
-  "main": "index.js",
-  "engines": {
-    "node": ">=18"
-  },
-  "scripts": {
-    "start": "node index.js",
-    "dev": "node --watch index.js"
-  },
-  "dependencies": {
-    "ws": "^8.18.0"
-  }
-}
