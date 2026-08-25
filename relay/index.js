@@ -240,7 +240,17 @@ server.on('request', (req, res) => {
 // Everything after /rest/ is forwarded as-is to api.massive.com, with the
 // apiKey attached server-side. The browser never sends or sees the key.
 // This does NOT touch wss/upgrade handling — that runs on a separate event.
+// Browser-side fetch calls give up after 25s. Without its own timeout, a
+// slow/hung upstream call here keeps running orphaned past that point —
+// the browser has already moved on, but the relay is still waiting. A 20s
+// timeout (inside the browser's 25s) makes the relay give up first and
+// return a real error response instead of leaving the request dangling.
+const REST_PROXY_TIMEOUT_MS = 20_000;
+
 async function handleRestProxy(req, res) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), REST_PROXY_TIMEOUT_MS);
+
   try {
     const incoming = new URL(req.url, 'http://internal');
     const forwardPath = incoming.pathname.slice('/rest'.length); // keep leading '/'
@@ -250,7 +260,7 @@ async function handleRestProxy(req, res) {
     }
     target.searchParams.set('apiKey', MASSIVE_API_KEY);
 
-    const upstreamRes = await fetch(target.toString(), { method: 'GET' });
+    const upstreamRes = await fetch(target.toString(), { method: 'GET', signal: controller.signal });
     const bodyText = await upstreamRes.text();
 
     res.writeHead(upstreamRes.status, {
@@ -261,9 +271,12 @@ async function handleRestProxy(req, res) {
     });
     res.end(bodyText);
   } catch (err) {
-    console.error('[relay] REST proxy error:', err.message);
-    res.writeHead(502, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ error: 'relay proxy failed', message: err.message }));
+    const timedOut = err.name === 'AbortError';
+    console.error('[relay] REST proxy error:', timedOut ? `timed out after ${REST_PROXY_TIMEOUT_MS / 1000}s` : err.message);
+    res.writeHead(timedOut ? 504 : 502, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'relay proxy failed', message: timedOut ? 'upstream request timed out' : err.message }));
+  } finally {
+    clearTimeout(timeout);
   }
 }
 
@@ -359,3 +372,20 @@ server.listen(PORT, () => {
   // indices — connect after 10s
   setTimeout(() => connectUpstream(upstream.indices), 10000);
 });
+relay/package.json (unchanged, included for completeness — no dependency changes needed):
+
+{
+  "name": "helios-insiders-relay",
+  "version": "1.0.0",
+  "main": "index.js",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node --watch index.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}
