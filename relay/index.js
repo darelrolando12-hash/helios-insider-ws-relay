@@ -346,7 +346,15 @@ wss.on('connection', (ws) => {
 
 // ─── Heartbeat (reap dead browser clients) ───────────────────────────────────
 
-const HEARTBEAT_INTERVAL_MS = 15000; // 15s — no external constraint on this, just detecting dead browser clients fast
+// 30s (was 15s): under full data load (100+ channels, engines computing on the
+// same thread), the browser's main thread can stall long enough that pong
+// frames queue behind pending work and miss a 15s window even though the
+// connection itself is healthy. Confirmed live — 81% of browser disconnects in
+// one measured window were heartbeat terminations, not real network drops.
+// 30s gives roughly a 60s grace period before termination. This is a stopgap;
+// the real fix is moving engines server-side so the browser stops consuming
+// the full stream on its own thread.
+const HEARTBEAT_INTERVAL_MS = 30000;
 
 const heartbeatInterval = setInterval(() => {
   for (const ws of clients) {
@@ -374,9 +382,12 @@ server.listen(PORT, () => {
   // stocks — connect immediately
   connectUpstream(upstream.stocks);
 
-  // options — connect after 5s (clear prior session server-side)
-  setTimeout(() => connectUpstream(upstream.options), 5000);
+  // options — 20s. The prior 5s was INSIDE Kyle's documented 10-30s cleanup
+  // window and lost the race at a real deploy: "Maximum number of websocket
+  // connections exceeded", then a 30s backoff before it succeeded. 20s clears
+  // the window with margin and is still faster than the failure path.
+  setTimeout(() => connectUpstream(upstream.options), 20000);
 
-  // indices — connect after 10s
-  setTimeout(() => connectUpstream(upstream.indices), 10000);
+  // indices — 30s
+  setTimeout(() => connectUpstream(upstream.indices), 30000);
 });
