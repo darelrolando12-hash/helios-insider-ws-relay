@@ -1,7 +1,5 @@
-'use strict';
-
-const http = require('http');
-const { WebSocketServer, WebSocket } = require('ws');
+import http from 'http';
+import { WebSocketServer, WebSocket } from 'ws';
 
 // ─── Config ──────────────────────────────────────────────────────────────────
 
@@ -371,6 +369,7 @@ const heartbeatInterval = setInterval(() => {
 // Kyle (Massive support) confirmed server cleanup takes 10-30s after a close.
 server.listen(PORT, () => {
   console.log(`[relay] listening on port ${PORT}`);
+  console.log(`[relay] node ${process.version} | ESM | engine mode: ${process.env.ENGINE_MODE ?? 'none'}`);
 
   // stocks — connect immediately
   connectUpstream(upstream.stocks);
