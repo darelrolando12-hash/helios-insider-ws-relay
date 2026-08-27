@@ -1,0 +1,140 @@
+# CLAUDE.md — Helios Insiders Engine
+
+*Standing context for this repo. Read this before doing anything.*
+
+---
+
+## What this is
+
+The **Helios Engine** — a Node/TypeScript server running on Railway that holds the market-data connection, runs every trading engine 24/7, and owns all database writes. Browsers and phones are **projectors**: they subscribe, render, and send user actions. They compute nothing.
+
+This is real-money trading infrastructure. Correctness beats speed, always.
+
+---
+
+## THE NON-NEGOTIABLE RULES
+
+### 1. Evidence, never assertion
+
+Every claim about behaviour must be backed by something real: actual command output, actual query results, actual log lines. **"It should work" and "I verified it" are not evidence.**
+
+This standard exists because a previous tool made **six** confident false claims in a single session — reporting a healthy production app as broken, claiming code was removed that wasn't, claiming a file was server-side when it was the browser's, and claiming a function handled reconnects when it was dead code never called.
+
+### 2. `node --check` before every push
+
+Non-negotiable. A copy-paste error once put chat prose inside `index.js` at line 375 and **Railway crash-looped 441 times**. Two seconds of checking prevents a production outage.
+
+### 3. Run the full test suite, not a subset
+
+Report per-file counts. A previous session reported "67/67 passing" while the real suite was 129 tests — five files had never run against the change.
+
+### 4. Root cause, never symptom
+
+Do not patch around a problem. Trace it to the mechanism, prove the mechanism, then fix the mechanism.
+
+**Real example from this codebase:** disclosures appeared "stale." Three rounds of investigation blamed staleness, then category mapping. The actual cause was `ignoreDuplicates: true` (`ON CONFLICT DO NOTHING`) making 91% of rows permanently unrepairable — invisible to the read path since day one.
+
+---
+
+## THE DOMINANT BUG CLASS: SILENT ZEROS
+
+**Seven bugs of the identical shape were found in one session.** Code checking for inputs that structurally cannot exist. Every one looked like normal, healthy behaviour:
+
+| Bug | Looked like |
+|---|---|
+| `isHalted()` returned `null`, gate treated it as "halted" | "No signals today" |
+| Relay routed `LULD.*` to `null` — dropped silently | "No halts today" |
+| Scanner checked `sources` for tags the engine never emits | "Threshold not reached" |
+| `materialEvent` checked categories the provider never produces | "No material events" |
+| 91% of disclosures unreadable (`tickers = null`) | "No filings" |
+| `fetchTradesSince` never called — CVD gap-fill dead | "CVD looks fine" |
+| Watermark advanced past unfinished work after interruption | "Already up to date" |
+
+**When you see a zero, prove it's a real zero.** Ask: can this code path produce a non-zero result *at all*? Has it *ever*?
+
+**Every factor must distinguish "genuinely nothing" from "data unavailable."** Use the `dataQuality: 'real' | 'absent' | 'stale'` shape.
+
+---
+
+## HARD ENVIRONMENT CONSTRAINTS
+
+### Massive (verified from their docs)
+- **Ticker subscriptions: no limit** — consumption-bound only
+- **WS connections: 1 per cluster per account.** The relay holds all three. Nothing else may open one.
+- **Options quotes: 1,000 contracts per connection — hard cap.** Raising it means buying connections.
+- **REST: unlimited, stay under 100 req/sec.** We run ~1/sec.
+- **Slow consumers are actively disconnected.** Keep up or get dropped.
+- Server-side cleanup after a close takes **10–30 seconds**. Reconnect backoff starts at 30s for this reason. Boot stagger is 0s/20s/30s because 5s lost the race at a real deploy.
+
+### Railway
+- **Must stay at 1 replica. Autoscaling off.** Two replicas = two engines = duplicate writes, invisible until the data is polluted.
+- **Runs UTC.** See timezone below.
+- Deploys send SIGTERM and restart the process — in-memory state is lost.
+- Memory: 345MB of 8GB in use. Ample headroom.
+
+### Timezone — a real bug class here
+**Railway runs UTC. The market runs Central.** Any `new Date().getHours()` / `getDate()` / `getFullYear()` silently works in a browser and silently breaks on the server.
+
+- `time.ts` is correct — explicit `Intl.DateTimeFormat` with `America/Chicago`, DST-safe. **Use it.**
+- `toISOString()` is safe — always UTC.
+- **Five ingestion files already had this bug** and were fixed to `getUTCDate()`/`getUTCFullYear()`.
+
+### TypeScript
+Node runs `.ts` natively via type stripping (requires **Node ≥ 22.18**). **No build step, no compiler.**
+Constraint: **erasable syntax only** — no enums, namespaces, parameter properties, decorators. Use `as const` unions. Type-only imports need the `type` keyword.
+
+---
+
+## SHADOW MODE
+
+`ENGINE_MODE=shadow` — compute everything, **log what would be written, write nothing.**
+
+The browser still writes during migration. Running both live would guarantee duplicates. Diff server output against browser output on the same live data; **only flip to `live` when they match**, and disable browser writes in the same step.
+
+---
+
+## TWO COPIES OF ENGINE LOGIC — TEMPORARY, TRACKED
+
+`relay/engine/` (engines, stores, ledger, state, lib) is **authoritative**. This is where engine logic runs server-side going forward.
+
+`src/{engines,stores,ledger,state,lib}` is a **frozen snapshot** — last touched 2026-07-27, unlike the rest of the repo, which has had commits since (including the `relay/` files pushed 2026-08-27). The live frontend is hosted by Wegic at `helios-insiders.wegic.net` and is **not** built from this repo. **Verified from Railway boot logs**: startup output shows `> helios-insiders-relay@1.0.0 start` — that's `relay/package.json`'s `name` field, not the root's `wegic-vite-react` — confirming Railway's Root Directory is set to `relay/`, not repo root. `src/`'s copies have already drifted from current engine logic (confirmed: 17 of 22 overlapping files differ in content, not just formatting, as of 2026-08-27).
+
+**Do not edit `src/{engines,stores,ledger,state,lib}` believing it's live.** It is scheduled for deletion at Shadow Mode cutover — the same step browser writes are disabled per the section above.
+
+---
+
+## KEY ARCHITECTURE FACTS
+
+- The engine subscribes to the relay's `broadcast()` **in-process**. No WebSocket, no network hop.
+- REST goes **direct to Massive** with `MASSIVE_API_KEY` from `process.env` — **not** through the relay's own `/rest/` proxy. That would be a loopback to itself.
+- **One REST module only.** Do not scatter `fetch` calls across engines.
+- **CVD is cumulative from session open.** A mid-session restart must rebuild from the open, not from the last tick.
+- Watermark-based incremental sync must use an **overlap** (watermark − 7 days). Without it, any interruption permanently skips unfinished work.
+
+---
+
+## SCORING REFERENCE
+
+**`confluenceEngine`** — CVD 25 · GEX 20 · EMA 20 · Catalyst 20 · DUMP/RIP 15
+Thresholds: EXIT 55–64 · REVERSAL 65–74 · ENTER/BREAKOUT ≥75
+
+GEX: within 0.5% of flip → 20 · negative regime → 15 · positive → 10 · neutral → 5
+Catalyst: insiderBuy 12 + materialEvent 8 + earningsPending 5, capped at 20
+
+**Swing / 0DTE** — 8 weighted criteria, 128/64/32/16/8/4/2/1 = 255 total
+
+Brain self-excludes cleanly when a fingerprint has no history. **Known open issue:** the fingerprint has ~8,280 buckets and needs n≥30 — roughly 17 years to fill. A hierarchical fallback ladder is designed but not built.
+
+---
+
+## WORKFLOW
+
+1. Branch. Never work directly on `main`.
+2. Make the change.
+3. `node --check` on anything touched.
+4. Full test suite, per-file output.
+5. Show the real diff.
+6. Push. Railway auto-deploys.
+7. **Verify in the Railway logs that it actually did what was intended.**
+
+**Never deploy during market hours** unless the fix is more urgent than the interruption. Deploys drop the upstream connections and reset in-memory state.
