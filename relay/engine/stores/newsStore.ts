@@ -15,8 +15,9 @@
  *   getStatus()                     → 'idle' | 'polling' | 'error'
  */
 
-import * as barsStore from './barsStore';
-import { FEED_TICKERS } from '../state/directionState';
+import { MASSIVE_API_KEY } from '../../config.ts';
+import * as barsStore from './barsStore.ts';
+import { FEED_TICKERS } from '../state/directionState.ts';
 
 // ── NewsArticle ────────────────────────────────────────────────────────────────
 
@@ -220,14 +221,23 @@ function _isMarketOpen(): boolean {
   return barsStore.getResult('SPY').status === 'ready';
 }
 
-const _API_KEY = import.meta.env.VITE_MASSIVE_API_KEY ?? '';
+// Server-side: process.env via config, not import.meta.env (a Vite build-time
+// substitution that is `undefined` under Node — it threw on import here, and
+// would otherwise have silently produced an empty key and a permanently
+// skipped poll).
+//
+// KNOWN DEVIATION: this module calls Massive REST directly rather than going
+// through MassiveRestClient, which breaks the one-REST-module rule. That is
+// pre-existing browser behaviour, carried over unchanged rather than
+// refactored blind; folding it into MassiveRestClient is its own change.
+const _API_KEY = MASSIVE_API_KEY;
 const _BASE_URL = 'https://api.massive.com';
 
 async function _poll(): Promise<void> {
   if (!_isMarketOpen()) return;
 
   if (!_API_KEY) {
-    console.warn('[newsStore] VITE_MASSIVE_API_KEY not set — skipping poll');
+    console.warn('[newsStore] MASSIVE_API_KEY not set — skipping poll');
     return;
   }
 

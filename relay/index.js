@@ -514,4 +514,100 @@ server.listen(PORT, () => {
 
   // indices — 30s
   setTimeout(() => connectUpstream(upstream.indices), 30000);
+
+  maybeStartEngine();
 });
+
+// ─── Engine startup (ENGINE_MODE-gated) ──────────────────────────────────────
+//
+// Three states:
+//   unset / 'off'  engine is not imported at all — this file behaves exactly
+//                  as it did before the engine existed.
+//   'shadow'       engine runs and computes, every DB write intercepted.
+//   'live'         engine runs and owns writes.
+//
+// The import is DYNAMIC and inside the enabled branch on purpose: with the
+// engine off, none of its modules are on this file's import graph, so an
+// engine-side import error cannot affect the relay. Turning the engine on is
+// then a Railway environment-variable change, not a code deploy.
+
+let engineModule = null;
+
+/** Resolves the first time any upstream authenticates. */
+let _resolveUpstreamReady;
+const upstreamReady = new Promise((resolve) => { _resolveUpstreamReady = resolve; });
+onUpstreamReconnect(() => { if (_resolveUpstreamReady) { _resolveUpstreamReady(); _resolveUpstreamReady = null; } });
+
+async function maybeStartEngine() {
+  const mode = (process.env.ENGINE_MODE ?? '').trim().toLowerCase();
+  if (mode === '' || mode === 'off' || mode === 'none') {
+    console.log('[relay] ENGINE_MODE not set — engine disabled, relay-only mode.');
+    return;
+  }
+
+  try {
+    engineModule = await import('./engine/index.ts');
+
+    // Frames reach the engine only once it is loaded. Registered here rather
+    // than inside the engine so the relay owns the subscription lifetime.
+    onFrame((messages) => engineModule.__bus.ingestFrame(messages));
+    onUpstreamReconnect(() => engineModule.__bus.notifyReconnected());
+
+    await engineModule.startEngine(relayControl, { waitForUpstream: upstreamReady });
+  } catch (err) {
+    // An engine failure must never take down the relay: the relay holds the
+    // market-data connection, which is the scarce, slow-to-recover resource.
+    console.error('[relay] ENGINE FAILED TO START — continuing in relay-only mode:', err);
+    engineModule = null;
+  }
+}
+
+// ─── Graceful shutdown ───────────────────────────────────────────────────────
+//
+// Railway's SIGTERM→SIGKILL buffer defaults to 0 seconds (configurable only
+// via the RAILWAY_DEPLOYMENT_DRAINING_SECONDS service variable), so this
+// handler may not get to run at all. Nothing here is load-bearing for
+// correctness — ingestion jobs never advance a watermark for unfinished work,
+// and each is resumable — this only makes a clean exit cleaner when a drain
+// budget exists.
+//
+// Order: stop engine work FIRST, so nothing is left computing against a feed
+// that has already gone away. Then close upstreams deliberately, because
+// Massive's server-side cleanup takes 10-30s and a clean close makes the next
+// boot's 0/20/30s stagger far more likely to win its race.
+
+let _shuttingDown = false;
+
+async function shutdown(signal) {
+  if (_shuttingDown) return;
+  _shuttingDown = true;
+  console.log(`[relay] ${signal} received — shutting down.`);
+
+  clearInterval(heartbeatInterval);
+
+  if (engineModule) {
+    try { await engineModule.stopEngine(signal); }
+    catch (err) { console.error('[relay] engine shutdown error:', err); }
+  }
+
+  for (const state of Object.values(upstream)) {
+    if (state.reconnectTimer) clearTimeout(state.reconnectTimer);
+    if (state.ws) {
+      try { state.ws.close(1001, 'relay shutting down'); }
+      catch { /* already closing */ }
+    }
+  }
+  console.log('[relay] Upstream sockets closed.');
+
+  for (const client of clients) {
+    try { client.close(1001, 'relay restarting'); } catch { /* ignore */ }
+  }
+
+  server.close(() => {
+    console.log('[relay] Shutdown complete.');
+    process.exit(0);
+  });
+}
+
+process.on('SIGTERM', () => void shutdown('SIGTERM'));
+process.on('SIGINT',  () => void shutdown('SIGINT'));

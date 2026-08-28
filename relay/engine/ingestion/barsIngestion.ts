@@ -21,9 +21,9 @@
  * fits well under the 50 000-row limit).
  */
 
-import { supabase }                                   from '../lib/supabase';
-import { MassiveRestClient, MassiveDailyBarResponse } from '../lib/massive/api';
-import { FEED_TICKERS }                               from '../state/directionState';
+import { supabase }                                   from '../lib/supabase.ts';
+import { MassiveRestClient, type MassiveDailyBarResponse } from '../lib/massive/api.ts';
+import { FEED_TICKERS }                               from '../state/directionState.ts';
 
 /**
  * Full set of tickers that need daily bars.

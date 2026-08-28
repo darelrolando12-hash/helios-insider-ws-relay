@@ -1,27 +1,57 @@
 /**
- * ENGINE_MODE — the shadow-mode gate.
+ * ENGINE_MODE — three states.
  *
- * `shadow` (default): compute everything, log what WOULD be written, write
- *                     nothing. The browser still writes during migration;
- *                     running both live would guarantee duplicate rows.
- * `live`            : writes execute for real.
+ *   unset / 'off'  the engine does not start at all. The relay behaves
+ *                  exactly as it does today: upstream sockets, REST proxy,
+ *                  browser fan-out, nothing else.
+ *   'shadow'       the engine runs fully and computes everything, but every
+ *                  database write is intercepted and logged instead of
+ *                  executed.
+ *   'live'         the engine runs and owns writes for real.
  *
- * The default is deliberately `shadow`. An unset or misspelled ENGINE_MODE
- * must never silently produce live writes — the safe failure direction is to
- * write nothing, not to write twice.
+ * The point of `off` being the default is deployability: this branch can be
+ * merged and shipped with the engine dormant, and turning it on later is a
+ * Railway environment-variable change rather than a code deploy — instantly
+ * revertible by unsetting the variable. Enabling an engine should not require
+ * shipping code, and disabling one in a hurry definitely should not.
  *
- * Enforcement happens at ONE place: the Supabase client (see wrapForEngineMode
- * below, used by lib/supabase.ts). Not at the ~15 individual write call sites.
- * Gating call sites would mean ~15 chances to miss one, and a single missed
- * site writes to production during shadow mode.
+ * The safe direction on ambiguity is always "do less": an unset value runs
+ * nothing, and an unrecognised value falls back to shadow (runs, writes
+ * nothing) rather than to live.
+ *
+ * Write enforcement happens at ONE place: the Supabase client (see
+ * wrapForEngineMode below, used by lib/supabase.ts). Not at the ~15 individual
+ * write call sites — gating call sites would mean ~15 chances to miss one, and
+ * a single missed site writes to production during shadow mode.
  */
 
-export type EngineMode = 'shadow' | 'live';
+export type EngineMode = 'off' | 'shadow' | 'live';
 
 // Read ONCE at module load. Not per-call, not scattered.
 const _rawMode = (process.env.ENGINE_MODE ?? '').trim().toLowerCase();
 
-export const ENGINE_MODE: EngineMode = _rawMode === 'live' ? 'live' : 'shadow';
+/**
+ * Pure parse of an ENGINE_MODE string. Exported so the resolution rules can be
+ * tested directly rather than through module-cache manipulation.
+ */
+export function parseEngineMode(raw: string): EngineMode {
+  return _parseMode((raw ?? '').trim().toLowerCase());
+}
+
+function _parseMode(raw: string): EngineMode {
+  if (raw === '' || raw === 'off' || raw === 'none') return 'off';
+  if (raw === 'live')   return 'live';
+  if (raw === 'shadow') return 'shadow';
+  // Unrecognised, non-empty: fall back to shadow, never to live or off.
+  // Shadow is the informative failure — it runs and logs what it would do,
+  // so the misconfiguration is visible rather than presenting as a dead engine.
+  return 'shadow';
+}
+
+export const ENGINE_MODE: EngineMode = _parseMode(_rawMode);
+
+/** True when the engine should boot at all. */
+export const IS_ENABLED = ENGINE_MODE !== 'off';
 
 /** True when writes must be intercepted rather than executed. */
 export const IS_SHADOW = ENGINE_MODE === 'shadow';
@@ -29,13 +59,13 @@ export const IS_SHADOW = ENGINE_MODE === 'shadow';
 /**
  * Whether ENGINE_MODE held a value we did not recognise.
  *
- * An empty value is a normal unset. A non-empty value that is neither
- * 'shadow' nor 'live' (a typo, say 'Live ' or 'production') is a configuration
- * mistake, and silently coercing it to shadow would hide that. Surfaced in the
- * boot banner.
+ * An empty value is a normal unset ('off'). A non-empty value that is none of
+ * off/none/shadow/live (a typo, say 'Live ' or 'production') is a
+ * configuration mistake, and silently coercing it would hide that. Surfaced
+ * in the boot banner.
  */
 export const MODE_INPUT_UNRECOGNISED =
-  _rawMode !== '' && _rawMode !== 'live' && _rawMode !== 'shadow';
+  _rawMode !== '' && !['off', 'none', 'shadow', 'live'].includes(_rawMode);
 
 /** Supabase operations that write. Everything else passes through untouched. */
 const MUTATING_OPS = ['insert', 'upsert', 'update', 'delete'] as const;
@@ -49,7 +79,11 @@ const MUTATING_OPS = ['insert', 'upsert', 'update', 'delete'] as const;
 export function logModeBanner(): void {
   const line = '─'.repeat(68);
   console.log(line);
-  if (IS_SHADOW) {
+  if (ENGINE_MODE === 'off') {
+    console.log(`  ENGINE_MODE = off — ENGINE NOT STARTED`);
+    console.log(`  Relay-only: upstream sockets, REST proxy, browser fan-out.`);
+    console.log(`  Set ENGINE_MODE=shadow in Railway to enable (no deploy needed).`);
+  } else if (IS_SHADOW) {
     console.log(`  ENGINE_MODE = shadow — NO DATABASE WRITES WILL BE EXECUTED`);
     console.log(`  Mutations are intercepted and logged. Reads run normally.`);
   } else {
@@ -118,7 +152,10 @@ function _shadowBuilder(table: string, op: string, payload: unknown): unknown {
  * behaviour change, so `live` is exactly today's semantics.
  */
 export function wrapForEngineMode<T extends object>(client: T): T {
-  if (!IS_SHADOW) return client;
+  // Pass through ONLY in live mode. Anything else — shadow, or off if some
+  // module is imported without the engine booting — gets the interceptor.
+  // Writes are opt-in, never opt-out.
+  if (ENGINE_MODE === 'live') return client;
 
   return new Proxy(client, {
     get(target, prop, receiver) {

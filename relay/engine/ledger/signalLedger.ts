@@ -20,19 +20,19 @@
  *       REVERSAL         → inferred from live CVD classification
  */
 
-import { supabase }                    from '../lib/supabase';
-import * as confluenceEngine           from '../engines/confluenceEngine';
-import * as barsStore                  from '../stores/barsStore';
-import * as cvdStore                   from '../stores/cvdStore';
-import * as marketStore                from '../stores/marketStore';
-import * as luldStore                  from '../stores/luldStore';
-import * as fundamentalsStore          from '../stores/fundamentalsStore';
-import * as catalystGate               from '../engines/catalystGate';
-import { getDirectionState, computeTradeType } from '../state/directionState';
-import type { TradeType }              from '../state/directionState';
-import { vixBucket }                   from '../ledger/brainStore';
-import type { VixBucket }              from '../ledger/brainStore';
-import type { Signal, SignalType }     from '../stores/types';
+import { supabase }                    from '../lib/supabase.ts';
+import * as confluenceEngine           from '../engines/confluenceEngine.ts';
+import * as barsStore                  from '../stores/barsStore.ts';
+import * as cvdStore                   from '../stores/cvdStore.ts';
+import * as marketStore                from '../stores/marketStore.ts';
+import * as luldStore                  from '../stores/luldStore.ts';
+import * as fundamentalsStore          from '../stores/fundamentalsStore.ts';
+import * as catalystGate               from '../engines/catalystGate.ts';
+import { getDirectionState, computeTradeType } from '../state/directionState.ts';
+import type { TradeType }              from '../state/directionState.ts';
+import { vixBucket }                   from '../ledger/brainStore.ts';
+import type { VixBucket }              from '../ledger/brainStore.ts';
+import type { Signal, SignalType }     from '../stores/types.ts';
 
 // ── Exported types ─────────────────────────────────────────────────────────────
 

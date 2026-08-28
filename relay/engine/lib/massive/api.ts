@@ -14,8 +14,8 @@
  * WebSocket relay. This module is the only permitted REST → Massive path.
  */
 
-import type { Bar, MarketStatus } from '../../stores/types';
-import { toCentralTime } from '../time';
+import type { Bar, MarketStatus } from '../../stores/types.ts';
+import { toCentralTime } from '../time.ts';
 
 // ── Internal types ────────────────────────────────────────────────────────────
 

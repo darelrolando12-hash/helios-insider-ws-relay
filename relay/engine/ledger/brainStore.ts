@@ -20,11 +20,11 @@
  * This store never writes to the DB.
  */
 
-import { supabase }              from '../lib/supabase';
-import { toCentralTime }         from '../lib/time';
-import type { Result }           from '../stores/types';
-import { ready, loading, error } from '../stores/types';
-import type { SignalDirection }  from './signalLedger';
+import { supabase }              from '../lib/supabase.ts';
+import { toCentralTime }         from '../lib/time.ts';
+import type { Result }           from '../stores/types.ts';
+import { ready, loading, error } from '../stores/types.ts';
+import type { SignalDirection }  from './signalLedger.ts';
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 

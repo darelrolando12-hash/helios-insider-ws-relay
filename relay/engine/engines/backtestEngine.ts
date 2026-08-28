@@ -63,21 +63,21 @@
  *   four windows, same upsert logic, same scratch band. No special path.
  */
 
-import * as barsStore         from '../stores/barsStore';
-import * as marketStore       from '../stores/marketStore';
-import * as fundamentalsStore from '../stores/fundamentalsStore';
-import * as catalystGate      from './catalystGate';
+import * as barsStore         from '../stores/barsStore.ts';
+import * as marketStore       from '../stores/marketStore.ts';
+import * as fundamentalsStore from '../stores/fundamentalsStore.ts';
+import * as catalystGate      from './catalystGate.ts';
 import {
   scoreConfluence,
   scoreEmaTrend,
   resolveSignalType,
-} from './confluenceEngine';
-import type { Bar, SignalType } from '../stores/types';
-import type { CvdState }       from '../stores/cvdStore';
-import type { MarketContext }  from '../stores/marketStore';
-import { toCentralTime }       from '../lib/time';
-import { supabase }            from '../lib/supabase';
-import { FEED_TICKERS }        from '../state/directionState';
+} from './confluenceEngine.ts';
+import type { Bar, SignalType } from '../stores/types.ts';
+import type { CvdState }       from '../stores/cvdStore.ts';
+import type { MarketContext }  from '../stores/marketStore.ts';
+import { toCentralTime }       from '../lib/time.ts';
+import { supabase }            from '../lib/supabase.ts';
+import { FEED_TICKERS }        from '../state/directionState.ts';
 
 /** 2 years of history as epoch ms — matches bars1mIngestion.ts's backfill window. */
 const TWO_YEARS_MS = 2 * 365 * 24 * 60 * 60 * 1000;

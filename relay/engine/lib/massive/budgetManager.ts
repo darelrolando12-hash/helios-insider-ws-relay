@@ -1,4 +1,4 @@
-import { toCTMidnight } from '../time';
+import { toCTMidnight } from '../time.ts';
 
 export interface OptionContractInfo {
   ticker:     string;  // e.g. O:SPY251219C00650000

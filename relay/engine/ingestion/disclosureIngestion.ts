@@ -70,12 +70,12 @@
  * retention window specified. Same policy as insider_transactions.
  */
 
-import { supabase }           from '../lib/supabase';
-import { MassiveRestClient, type MassiveEightKResult } from '../lib/massive/api';
-import * as fundamentalsStore from '../stores/fundamentalsStore';
-import type { DisclosureCategory, EightKDisclosure } from '../stores/fundamentalsStore';
-import { FEED_TICKERS }       from '../state/directionState';
-import { MATERIAL_CATEGORIES } from '../engines/catalystGate';
+import { supabase }           from '../lib/supabase.ts';
+import { MassiveRestClient, type MassiveEightKResult } from '../lib/massive/api.ts';
+import * as fundamentalsStore from '../stores/fundamentalsStore.ts';
+import type { DisclosureCategory, EightKDisclosure } from '../stores/fundamentalsStore.ts';
+import { FEED_TICKERS }       from '../state/directionState.ts';
+import { MATERIAL_CATEGORIES } from '../engines/catalystGate.ts';
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 

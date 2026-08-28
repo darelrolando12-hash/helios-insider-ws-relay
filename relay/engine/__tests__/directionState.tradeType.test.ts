@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { computeTradeType } from '../state/directionState';
+import { computeTradeType } from '../state/directionState.ts';
 
 // CONTINUATION_GAP_MS is 90 * 60 * 1000 in directionState.ts — not exported,
 // hardcoded here with the same real value to keep assertions self-contained.

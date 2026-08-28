@@ -38,9 +38,9 @@
  *  endpoint. Math.round() applied before upsert (same fix as bars_daily).
  */
 
-import { supabase }             from '../lib/supabase';
-import { MassiveRestClient }    from '../lib/massive/api';
-import { FEED_TICKERS }         from '../state/directionState';
+import { supabase }             from '../lib/supabase.ts';
+import { MassiveRestClient }    from '../lib/massive/api.ts';
+import { FEED_TICKERS }         from '../state/directionState.ts';
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 

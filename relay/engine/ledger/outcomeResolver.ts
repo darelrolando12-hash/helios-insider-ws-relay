@@ -27,9 +27,9 @@
  * Scratch band: |pnlPct| <= 2.0% → result 'scratch'
  */
 
-import { supabase }             from '../lib/supabase';
-import * as barsStore           from '../stores/barsStore';
-import type { SignalDirection } from './signalLedger';
+import { supabase }             from '../lib/supabase.ts';
+import * as barsStore           from '../stores/barsStore.ts';
+import type { SignalDirection } from './signalLedger.ts';
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 

@@ -8,7 +8,7 @@
  */
 import { describe, it, expect, vi } from 'vitest';
 import { EngineBus, type WSMessageWithCT } from '../bus.ts';
-import { wrapForEngineMode, ENGINE_MODE, IS_SHADOW } from '../mode.ts';
+import { wrapForEngineMode, ENGINE_MODE, IS_SHADOW, IS_ENABLED, parseEngineMode } from '../mode.ts';
 
 describe('EngineBus — frame ordering', () => {
   it('dispatches every Q in a frame before any T (stale-spread guard)', () => {
@@ -83,13 +83,76 @@ describe('EngineBus — frame ordering', () => {
     expect(sent.length).toBe(1);
     expect(sent[0].sort()).toEqual(['Q.SPY', 'T.SPY']);
   });
+
+  it('batches a burst of post-attach subscribes into ONE relay call', async () => {
+    const bus = new EngineBus();
+    const sent: string[][] = [];
+    bus.attach({ subscribe: (c) => sent.push(c), unsubscribe: () => {} });
+
+    // Mirrors a real boot: several tickers x several channels, back to back.
+    for (const t of ['SPY', 'QQQ', 'IWM']) {
+      bus.subscribeStock('T', t);
+      bus.subscribeStock('Q', t);
+      bus.subscribeStock('LULD', t);
+    }
+    await Promise.resolve();          // let the microtask flush run
+
+    // One frame, not nine. The browser path already batched this way; the
+    // engine sending 75 separate frames at boot was needless pressure on the
+    // relay's most fragile window.
+    expect(sent.length).toBe(1);
+    expect(sent[0].length).toBe(9);
+    expect(sent[0]).toContain('T.SPY');
+    expect(sent[0]).toContain('LULD.IWM');
+  });
+
+  it('does not re-send an already-subscribed channel', async () => {
+    const bus = new EngineBus();
+    const sent: string[][] = [];
+    bus.attach({ subscribe: (c) => sent.push(c), unsubscribe: () => {} });
+    bus.subscribeStock('T', 'SPY');
+    await Promise.resolve();
+    bus.subscribeStock('T', 'SPY');    // idempotent
+    await Promise.resolve();
+    expect(sent.length).toBe(1);
+    expect(sent[0]).toEqual(['T.SPY']);
+  });
 });
 
 describe('ENGINE_MODE — shadow write gate', () => {
-  it('defaults to shadow when ENGINE_MODE is unset', () => {
-    // vitest.config.ts does not set ENGINE_MODE.
-    expect(ENGINE_MODE).toBe('shadow');
-    expect(IS_SHADOW).toBe(true);
+  it('defaults to off when ENGINE_MODE is unset — the engine does not start', () => {
+    // vitest.config.ts does not set ENGINE_MODE, so this is the unset case.
+    expect(ENGINE_MODE).toBe('off');
+    expect(IS_ENABLED).toBe(false);
+  });
+
+  it('still intercepts writes in off mode — writes are opt-in, never opt-out', () => {
+    // Off means the engine does not boot; but if any module is imported
+    // without a boot, a write must still not reach the database.
+    expect(IS_SHADOW).toBe(false);   // off is not shadow
+    expect(ENGINE_MODE).not.toBe('live');
+  });
+
+  it.each([
+    ['',           'off'],
+    ['off',        'off'],
+    ['none',       'off'],
+    ['shadow',     'shadow'],
+    ['live',       'live'],
+    ['  LIVE  ',   'live'],
+    ['production', 'shadow'],   // unrecognised falls back to shadow, never live
+    ['ON',         'shadow'],
+  ])('parses ENGINE_MODE=%o as %o', (input, expected) => {
+    expect(parseEngineMode(input)).toBe(expected);
+  });
+
+  it('never resolves an unrecognised value to live', () => {
+    for (const bad of ['prod', 'yes', 'true', 'enabled', 'LIVE!', '1']) {
+      expect(parseEngineMode(bad)).not.toBe('live');
+      // Unrecognised means shadow — it runs and logs, so the misconfiguration
+      // is visible rather than presenting as a silently dead engine.
+      expect(parseEngineMode(bad)).toBe('shadow');
+    }
   });
 
   it('intercepts mutations and never calls the real client', async () => {

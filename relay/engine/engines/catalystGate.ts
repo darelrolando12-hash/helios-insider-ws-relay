@@ -22,7 +22,7 @@
  * No store writes, no event emission.
  */
 
-import type { FundamentalsData, EightKDisclosure, DisclosureCategory } from '../stores/fundamentalsStore';
+import type { FundamentalsData, EightKDisclosure, DisclosureCategory } from '../stores/fundamentalsStore.ts';
 
 // ── CatalystTags ──────────────────────────────────────────────────────────────
 

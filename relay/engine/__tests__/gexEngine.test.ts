@@ -7,7 +7,7 @@ import {
   computeFlipLevel,
   computeMaxPain,
   type StrikeData,
-} from '../engines/gexEngine';
+} from '../engines/gexEngine.ts';
 
 // NEUTRAL_GEX_EPSILON is 50_000_000 in gexEngine.ts — not exported, hardcoded
 // here with the same real value so assertions stay self-contained.

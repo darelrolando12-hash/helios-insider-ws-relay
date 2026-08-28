@@ -27,11 +27,11 @@
  * simply overwrites the one row per ticker with fresh numbers.
  */
 
-import { supabase }           from '../lib/supabase';
-import { MassiveRestClient }  from '../lib/massive/api';
-import * as fundamentalsStore from '../stores/fundamentalsStore';
-import { FEED_TICKERS, CASH_SETTLED_TICKERS } from '../state/directionState';
-import type { FinancialRatios } from '../stores/fundamentalsStore';
+import { supabase }           from '../lib/supabase.ts';
+import { MassiveRestClient }  from '../lib/massive/api.ts';
+import * as fundamentalsStore from '../stores/fundamentalsStore.ts';
+import { FEED_TICKERS, CASH_SETTLED_TICKERS } from '../state/directionState.ts';
+import type { FinancialRatios } from '../stores/fundamentalsStore.ts';
 
 const REFRESH_INTERVAL_MS = 24 * 60 * 60_000; // 24 hours
 

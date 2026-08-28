@@ -16,8 +16,8 @@
  */
 
 import { massiveBus, type WSMessageWithCT } from '../bus.ts';
-import { MassiveRestClient }                from '../lib/massive/api';
-import { type Bar, type Result, ready, loading, error } from './types';
+import { MassiveRestClient }                from '../lib/massive/api.ts';
+import { type Bar, type Result, ready, loading, error } from './types.ts';
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -135,7 +135,7 @@ export function hasHistoricalData(ticker: string): boolean {
  * Use this for scoring/analysis that is valid on stale data (e.g. Swing EMA).
  * Use getResult() when you need to know if data is fresh.
  */
-export function getBarsRaw(ticker: string): import('./types').Bar[] {
+export function getBarsRaw(ticker: string): import('./types.ts').Bar[] {
   const state = _state.get(ticker);
   return state ? [...state.bars] : [];
 }

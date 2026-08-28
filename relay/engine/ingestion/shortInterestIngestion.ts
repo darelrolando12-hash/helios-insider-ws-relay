@@ -25,11 +25,11 @@
  * All calls are serialized per-ticker. Fire-and-forget from main.tsx.
  */
 
-import { supabase }              from '../lib/supabase';
-import { MassiveRestClient }     from '../lib/massive/api';
-import * as fundamentalsStore    from '../stores/fundamentalsStore';
-import { FEED_TICKERS }          from '../state/directionState';
-import type { ShortInterestSnapshot } from '../stores/types';
+import { supabase }              from '../lib/supabase.ts';
+import { MassiveRestClient }     from '../lib/massive/api.ts';
+import * as fundamentalsStore    from '../stores/fundamentalsStore.ts';
+import { FEED_TICKERS }          from '../state/directionState.ts';
+import type { ShortInterestSnapshot } from '../stores/types.ts';
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 

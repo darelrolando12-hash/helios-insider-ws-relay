@@ -34,8 +34,8 @@
  * into a final "done" line.
  */
 
-import { supabase }                                    from '../lib/supabase';
-import { MassiveRestClient, MassiveDailyBarResponse }  from '../lib/massive/api';
+import { supabase }                                    from '../lib/supabase.ts';
+import { MassiveRestClient, type MassiveDailyBarResponse }  from '../lib/massive/api.ts';
 
 /** Calendar days back that covers 52 weeks including weekends/holidays. */
 const WEEKS_52_DAYS = 371;

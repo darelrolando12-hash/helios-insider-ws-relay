@@ -20,7 +20,7 @@
  */
 
 import { massiveBus, type WSMessageWithCT } from '../bus.ts';
-import { type LuldEvent, type LuldEventType, type Result, ready, loading } from './types';
+import { type LuldEvent, type LuldEventType, type Result, ready, loading } from './types.ts';
 
 // ── Extended LuldEvent for store consumers ────────────────────────────────────
 

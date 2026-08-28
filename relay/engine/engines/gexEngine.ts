@@ -21,9 +21,9 @@
  *   |netGex| < ε → 'neutral'
  */
 
-import * as marketStore from '../stores/marketStore';
-import type { MarketContext }  from '../stores/marketStore';
-import type { GexRegime, ChainRow } from '../stores/types';
+import * as marketStore from '../stores/marketStore.ts';
+import type { MarketContext }  from '../stores/marketStore.ts';
+import type { GexRegime, ChainRow } from '../stores/types.ts';
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 

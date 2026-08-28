@@ -13,7 +13,7 @@
  *   window matches the typical chain-refresh cadence.
  */
 
-import { type MarketContextSnapshot, type ChainRow, type Result, ready, loading, error } from './types';
+import { type MarketContextSnapshot, type ChainRow, type Result, ready, loading, error } from './types.ts';
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 

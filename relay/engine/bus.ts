@@ -83,6 +83,35 @@ export class EngineBus {
   private _relay: RelayControl | null = null;
   private _connected = false;
 
+  // Subscription batching. cvdEngine/luldStore/barsStore each call
+  // subscribeStock once per channel per ticker, so a 23-ticker boot issues
+  // ~75 separate calls. Sending a WS frame for each one is needless pressure
+  // in exactly the window the relay is most fragile — the browser path already
+  // batches (one frame, all new channels joined). These queues coalesce a
+  // burst of calls into a single subscribe/unsubscribe frame per microtask.
+  private _pendingSubscribe   = new Set<string>();
+  private _pendingUnsubscribe = new Set<string>();
+  private _flushQueued = false;
+
+  private _queueFlush() {
+    if (this._flushQueued) return;
+    this._flushQueued = true;
+    queueMicrotask(() => {
+      this._flushQueued = false;
+      if (!this._relay) return;   // attach() flushes whatever accumulated
+      if (this._pendingSubscribe.size > 0) {
+        const batch = [...this._pendingSubscribe];
+        this._pendingSubscribe.clear();
+        this._relay.subscribe(batch);
+      }
+      if (this._pendingUnsubscribe.size > 0) {
+        const batch = [...this._pendingUnsubscribe];
+        this._pendingUnsubscribe.clear();
+        this._relay.unsubscribe(batch);
+      }
+    });
+  }
+
   /**
    * Attach to the relay's in-process fan-out.
    *
@@ -172,13 +201,15 @@ export class EngineBus {
     const key = `${channel}.${ticker}`;
     if (this._stockSubs.has(key)) return;
     this._stockSubs.add(key);
-    this._relay?.subscribe([key]);
+    this._pendingSubscribe.add(key);
+    this._queueFlush();
   }
 
   public unsubscribeStock(channel: StockChannel, ticker: string) {
     const key = `${channel}.${ticker}`;
     this._stockSubs.delete(key);
-    this._relay?.unsubscribe([key]);
+    this._pendingUnsubscribe.add(key);
+    this._queueFlush();
   }
 
   /**
@@ -208,13 +239,15 @@ export class EngineBus {
     const key = `${channel}.${ticker}`;
     if (this._optionSubs.has(key)) return;
     this._optionSubs.add(key);
-    this._relay?.subscribe([key]);
+    this._pendingSubscribe.add(key);
+    this._queueFlush();
   }
 
   public unsubscribeOption(channel: OptionChannel, ticker: string) {
     const key = `${channel}.${ticker}`;
     this._optionSubs.delete(key);
-    this._relay?.unsubscribe([key]);
+    this._pendingUnsubscribe.add(key);
+    this._queueFlush();
   }
 
   // ── Listener APIs ─────────────────────────────────────────────────────────

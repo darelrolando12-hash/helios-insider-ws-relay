@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
-import { vixBucket, timeOfDayBucket } from '../ledger/brainStore';
-import { toCentralTime } from '../lib/time';
+import { vixBucket, timeOfDayBucket } from '../ledger/brainStore.ts';
+import { toCentralTime } from '../lib/time.ts';
 
 // ── vixBucket ────────────────────────────────────────────────────────────────────
 // Real boundaries per brainStore.ts: <15 | 15-20 | 20-25 | 25+ (all lower-inclusive)

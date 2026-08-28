@@ -37,11 +37,11 @@
  * warrants pruning.
  */
 
-import { supabase }           from '../lib/supabase';
-import { MassiveRestClient, type MassiveForm4Result } from '../lib/massive/api';
-import * as fundamentalsStore from '../stores/fundamentalsStore';
-import { FEED_TICKERS }       from '../state/directionState';
-import type { InsiderTransaction } from '../stores/types';
+import { supabase }           from '../lib/supabase.ts';
+import { MassiveRestClient, type MassiveForm4Result } from '../lib/massive/api.ts';
+import * as fundamentalsStore from '../stores/fundamentalsStore.ts';
+import { FEED_TICKERS }       from '../state/directionState.ts';
+import type { InsiderTransaction } from '../stores/types.ts';
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 

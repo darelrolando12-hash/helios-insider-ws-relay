@@ -20,9 +20,9 @@
  *   (conservative — fires only when price is clearly outside the bands).
  */
 
-import * as luldStore from '../stores/luldStore';
-import type { StoredLuldEvent } from '../stores/luldStore';
-import type { SignalType }      from '../stores/types';
+import * as luldStore from '../stores/luldStore.ts';
+import type { StoredLuldEvent } from '../stores/luldStore.ts';
+import type { SignalType }      from '../stores/types.ts';
 
 // ── Event types ───────────────────────────────────────────────────────────────
 

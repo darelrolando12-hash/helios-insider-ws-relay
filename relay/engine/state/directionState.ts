@@ -26,10 +26,10 @@
  * expandable. The user always knows the session context and the current play.
  */
 
-import * as barsStore    from '../stores/barsStore';
-import * as marketStore  from '../stores/marketStore';
-import * as cvdStore     from '../stores/cvdStore';
-import { computeEma }    from '../engines/confluenceEngine';
+import * as barsStore    from '../stores/barsStore.ts';
+import * as marketStore  from '../stores/marketStore.ts';
+import * as cvdStore     from '../stores/cvdStore.ts';
+import { computeEma }    from '../engines/confluenceEngine.ts';
 
 // ── Exported types ─────────────────────────────────────────────────────────────
 

@@ -23,10 +23,10 @@
  *     → ChainCockpit re-renders with real data
  */
 
-import { MassiveRestClient, type OptionsContractSnapshot } from '../lib/massive/api';
-import * as gexEngine from './gexEngine';
-import type { StrikeData } from './gexEngine';
-import * as barsStore from '../stores/barsStore';
+import { MassiveRestClient, type OptionsContractSnapshot } from '../lib/massive/api.ts';
+import * as gexEngine from './gexEngine.ts';
+import type { StrikeData } from './gexEngine.ts';
+import * as barsStore from '../stores/barsStore.ts';
 
 // ── Constants ──────────────────────────────────────────────────────────────────
 

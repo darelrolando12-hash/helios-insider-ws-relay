@@ -24,8 +24,8 @@ import type {
   InsiderTransaction,
   ShortInterestSnapshot,
   Result,
-} from './types';
-import { ready, loading } from './types';
+} from './types.ts';
+import { ready, loading } from './types.ts';
 
 // ── 8-K Disclosure ────────────────────────────────────────────────────────────
 

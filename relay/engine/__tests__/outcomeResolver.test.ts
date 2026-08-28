@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { computePnlPct, classifyOutcome } from '../ledger/outcomeResolver';
+import { computePnlPct, classifyOutcome } from '../ledger/outcomeResolver.ts';
 
 // SCRATCH_BAND_PCT is 2.0 in outcomeResolver.ts — not exported, so these
 // tests hardcode the same real value to keep assertions self-contained.

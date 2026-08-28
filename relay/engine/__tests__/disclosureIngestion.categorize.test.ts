@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { categorize } from '../ingestion/disclosureIngestion';
+import { categorize } from '../ingestion/disclosureIngestion.ts';
 
 // Real tier-combination strings, taken from disclosureIngestion.ts's own
 // locked-decisions comment block (confirmed against live 8-K data,

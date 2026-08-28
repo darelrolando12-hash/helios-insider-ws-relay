@@ -22,8 +22,8 @@
  * accumulate forever with no removal path.
  */
 
-import { supabase }          from '../lib/supabase';
-import { MassiveRestClient } from '../lib/massive/api';
+import { supabase }          from '../lib/supabase.ts';
+import { MassiveRestClient } from '../lib/massive/api.ts';
 
 /** Exchanges eligible for the breadth universe — NYSE, Nasdaq, AMEX only. */
 const ALLOWED_EXCHANGES = new Set(['XNYS', 'XNAS', 'XASE']);

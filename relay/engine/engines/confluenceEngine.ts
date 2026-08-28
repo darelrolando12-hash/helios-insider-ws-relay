@@ -27,19 +27,19 @@
  * The signal-outcome ledger (Layer 3) subscribes to these events.
  */
 
-import * as barsStore        from '../stores/barsStore';
-import * as marketStore      from '../stores/marketStore';
-import * as cvdStore         from '../stores/cvdStore';
-import * as luldStore        from '../stores/luldStore';
-import * as fundamentalsStore from '../stores/fundamentalsStore';
-import * as directionState   from '../state/directionState';
-import * as catalystGate     from './catalystGate';
-import * as dumpRipDetector  from './dumpRipDetector';
-import type { Signal, SignalType, Bar, MarketStatusValue } from '../stores/types';
-import type { CvdState }     from '../stores/cvdStore';
-import type { MarketContext } from '../stores/marketStore';
-import type { CatalystTags } from './catalystGate';
-import type { DumpRipEvent } from './dumpRipDetector';
+import * as barsStore        from '../stores/barsStore.ts';
+import * as marketStore      from '../stores/marketStore.ts';
+import * as cvdStore         from '../stores/cvdStore.ts';
+import * as luldStore        from '../stores/luldStore.ts';
+import * as fundamentalsStore from '../stores/fundamentalsStore.ts';
+import * as directionState   from '../state/directionState.ts';
+import * as catalystGate     from './catalystGate.ts';
+import * as dumpRipDetector  from './dumpRipDetector.ts';
+import type { Signal, SignalType, Bar, MarketStatusValue } from '../stores/types.ts';
+import type { CvdState }     from '../stores/cvdStore.ts';
+import type { MarketContext } from '../stores/marketStore.ts';
+import type { CatalystTags } from './catalystGate.ts';
+import type { DumpRipEvent } from './dumpRipDetector.ts';
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 

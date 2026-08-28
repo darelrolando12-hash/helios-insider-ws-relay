@@ -23,8 +23,8 @@
  */
 
 import { createClient } from '@supabase/supabase-js';
-import { SUPABASE_URL, SUPABASE_ANON_KEY, assertConfig } from '../../config';
-import { wrapForEngineMode } from '../mode';
+import { SUPABASE_URL, SUPABASE_ANON_KEY, assertConfig } from '../../config.ts';
+import { wrapForEngineMode } from '../mode.ts';
 
 // Fail loudly at import time rather than constructing an empty client.
 assertConfig();

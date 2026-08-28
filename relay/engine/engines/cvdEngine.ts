@@ -29,8 +29,8 @@
  */
 
 import { massiveBus, type WSMessageWithCT } from '../bus.ts';
-import * as cvdStore from '../stores/cvdStore';
-import type { CvdTick, AssetClass, TradeSide } from '../stores/types';
+import * as cvdStore from '../stores/cvdStore.ts';
+import type { CvdTick, AssetClass, TradeSide } from '../stores/types.ts';
 
 // ── Engine lifecycle ──────────────────────────────────────────────────────────
 

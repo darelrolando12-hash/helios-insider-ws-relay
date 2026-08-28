@@ -7,11 +7,11 @@ import {
   scoreConfluence,
   resolveSignalType,
   computeEma,
-} from '../engines/confluenceEngine';
-import type { CvdState } from '../stores/cvdStore';
-import type { MarketContext } from '../stores/marketStore';
-import type { CatalystTags } from '../engines/catalystGate';
-import type { Bar } from '../stores/types';
+} from '../engines/confluenceEngine.ts';
+import type { CvdState } from '../stores/cvdStore.ts';
+import type { MarketContext } from '../stores/marketStore.ts';
+import type { CatalystTags } from '../engines/catalystGate.ts';
+import type { Bar } from '../stores/types.ts';
 
 // ── Test fixtures ──────────────────────────────────────────────────────────────
 

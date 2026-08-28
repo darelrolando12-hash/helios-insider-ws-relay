@@ -22,7 +22,7 @@
  *   A zeroed-out CVD with 0 ticks is 'loading', never 'ready'.
  */
 
-import { type CvdTick, type AssetClass, type Result, ready, loading } from './types';
+import { type CvdTick, type AssetClass, type Result, ready, loading } from './types.ts';
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 

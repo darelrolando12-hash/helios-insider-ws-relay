@@ -10,8 +10,8 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import { computeTags } from '../engines/catalystGate';
-import type { FundamentalsData, EightKDisclosure } from '../stores/fundamentalsStore';
+import { computeTags } from '../engines/catalystGate.ts';
+import type { FundamentalsData, EightKDisclosure } from '../stores/fundamentalsStore.ts';
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const NOW = new Date('2026-08-27T00:00:00Z').getTime();

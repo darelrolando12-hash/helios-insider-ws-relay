@@ -26,10 +26,10 @@
  *   score <  40 → 'low'
  */
 
-import * as fundamentalsStore from '../stores/fundamentalsStore';
-import * as barsStore         from '../stores/barsStore';
-import type { Result }        from '../stores/types';
-import { ready, loading }     from '../stores/types';
+import * as fundamentalsStore from '../stores/fundamentalsStore.ts';
+import * as barsStore         from '../stores/barsStore.ts';
+import type { Result }        from '../stores/types.ts';
+import { ready, loading }     from '../stores/types.ts';
 
 // ── SqueezeRisk ───────────────────────────────────────────────────────────────
 
@@ -145,7 +145,7 @@ export function computeSqueezeRisk(
   shortFloatPct:    number | null,
   daysToCover:      number | null,
   shortVolumeRatio: number | null,
-  bars:             import('../stores/types').Bar[] | null,
+  bars:             import('../stores/types.ts').Bar[] | null,
   asOf:             number,
 ): SqueezeRisk {
   const floatScore     = scoreShortFloat(shortFloatPct);
@@ -222,7 +222,7 @@ export function scoreShortVolumeRatio(ratio: number | null): number {
  *   >= 0%   →  3 pts (flat is mild positive)
  *   negative →  0 pts
  */
-export function scoreMomentum(bars: import('../stores/types').Bar[] | null): number {
+export function scoreMomentum(bars: import('../stores/types.ts').Bar[] | null): number {
   if (!bars || bars.length < 6) return 0;
   const last = bars[bars.length - 1].close;
   const prev = bars[bars.length - 6].close;
