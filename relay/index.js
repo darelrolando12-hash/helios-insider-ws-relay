@@ -120,6 +120,11 @@ function connectUpstream(state) {
 
     const arr = Array.isArray(messages) ? messages : [messages];
 
+    // Whether this frame should be forwarded to browser clients at all.
+    // A frame consisting solely of the auth-confirmation status is consumed
+    // here and never forwarded — same as before.
+    let forwardFrame = false;
+
     for (const msg of arr) {
       if (
         !state._authConfirmed &&
@@ -149,8 +154,26 @@ function connectUpstream(state) {
         console.log(`[relay] upstream ${state.name} status:`, msg.message || JSON.stringify(msg));
       }
 
-      broadcast(raw);
+      forwardFrame = true;
     }
+
+    // ── Broadcast ONCE per upstream frame ────────────────────────────────────
+    // This call used to sit inside the loop above, passing `raw` — the ENTIRE
+    // frame — once per message in that frame. A frame of N messages was
+    // therefore delivered N times, each copy containing all N: browsers
+    // received N² messages (N=10 → 100, N=20 → 400, N=50 → 2,500).
+    //
+    // It was invisible because the browser bus dedupes on `ev:sym:t` within a
+    // 2s window — every duplicate was discarded, but only AFTER paying full
+    // network and JSON.parse cost. That load is a direct cause of browser
+    // clients failing to answer the relay's 30s heartbeat ping (81% of all
+    // measured disconnects), and is a plausible trigger for Massive's
+    // slow-consumer disconnects upstream.
+    //
+    // The wire format is unchanged: browsers still receive exactly the raw
+    // frame string, just once instead of N times. Nothing frontend-side needs
+    // to change.
+    if (forwardFrame) broadcast(raw);
   });
 
   ws.on('close', (code, reason) => {
