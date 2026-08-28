@@ -19,8 +19,13 @@
  *
  * Options side:
  *   Options T/Q subscriptions are managed here alongside stock subscriptions.
- *   The budgetManager in massiveBus enforces the 1,000-contract Q cap.
  *   Caller must supply current underlying price when subscribing options.
+ *
+ *   NOTE (server-side): the budget claim that used to sit on this line —
+ *   "the budgetManager in massiveBus enforces the 1,000-contract Q cap" — is
+ *   no longer true and has been removed rather than left to mislead. The
+ *   in-process bus does not consult a budget; see engine/bus.ts
+ *   subscribeOption for why that is correct here.
  */
 
 import { massiveBus, type WSMessageWithCT } from '../bus.ts';

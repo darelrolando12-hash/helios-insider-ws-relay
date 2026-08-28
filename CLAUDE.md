@@ -101,6 +101,20 @@ The browser still writes during migration. Running both live would guarantee dup
 
 **Do not edit `src/{engines,stores,ledger,state,lib}` believing it's live.** It is scheduled for deletion at Shadow Mode cutover — the same step browser writes are disabled per the section above.
 
+**`relay/engine/lib/massive/websocket.ts` was deleted (2026-08-27).** It was the browser bus — four outbound WebSockets to the relay, `document` access, and an import of a `config` module that does not exist server-side. It would have crashed on import. `engine/bus.ts` replaces it in-process. The original is preserved at `src/lib/massive/websocket.ts` and in git history.
+
+---
+
+## OPTIONS SUBSCRIPTION BUDGET — RELAY-OWNED, SETTLED
+
+The engine does **not** enforce the 1,000-contract options Q cap and does not subscribe to option channels of its own. This is settled, not deferred:
+
+- The cap is **per-connection**, and the relay owns the connection. A second budget in the engine would double-count contracts the browser already subscribed to over the same relay.
+- **Layer 1 sources chain data over REST**, not the options WebSocket — the engine does not need its own option Q subscriptions to compute.
+- The relay's subscription set is **shared**, so option messages the browser subscribed to reach the engine in-process regardless.
+
+`engine/bus.ts` `subscribeOption()` therefore registers without consulting a budget, and `rolloverExpiredOptions()` is a no-op that says so in the logs. `lib/massive/budgetManager.ts` has had no importer since `websocket.ts` was deleted — it is reference material, not live code.
+
 ---
 
 ## KEY ARCHITECTURE FACTS

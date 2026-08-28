@@ -184,13 +184,25 @@ export class EngineBus {
   /**
    * Options subscribe.
    *
-   * NOTE: the browser bus consulted an OptionSubscriptionBudgetManager here to
+   * The browser bus consulted an OptionSubscriptionBudgetManager here to
    * enforce Massive's hard 1,000-contract Q cap, evicting the furthest-OTM
-   * contract when full. That budget is intentionally NOT wired in this step —
-   * the cap is per-connection, the relay owns the connection, and enforcing it
-   * from the engine while the browser is also subscribing would double-count.
-   * Ownership of that budget is a Step 3 decision; until then only the relay's
-   * own subscription set is authoritative.
+   * contract when full. That budget is deliberately NOT wired here, and this
+   * is a settled decision rather than a deferral:
+   *
+   *   - The cap is per-CONNECTION, and the relay owns the connection. Enforcing
+   *     a second budget from the engine, while the browser is also subscribing
+   *     over the same relay, would double-count the same contracts.
+   *   - Layer 1 sources chain data over REST, not the options WebSocket, so
+   *     the engine does not depend on holding option Q subscriptions of its
+   *     own to compute.
+   *   - The relay's subscription set is shared. Option messages the browser
+   *     subscribed to are broadcast in-process to the engine anyway, so the
+   *     engine receives them without ever subscribing itself.
+   *
+   * The relay's own subscription set therefore stays the single authority.
+   * lib/massive/budgetManager.ts is left in place, but has no importer since
+   * lib/massive/websocket.ts was deleted — it is reference material for
+   * whenever subscription ownership does move server-side, not live code.
    */
   public subscribeOption(channel: OptionChannel, ticker: string, _underlyingPrice = 0) {
     const key = `${channel}.${ticker}`;
@@ -234,11 +246,13 @@ export class EngineBus {
 
   /**
    * Present so callers of the browser bus's rolloverExpiredOptions() do not
-   * break. It is a no-op while the options budget is unowned (see
-   * subscribeOption above) — and says so, rather than appearing to do work.
+   * break. A no-op by design: the engine holds no option subscriptions to
+   * evict, because it does not own the options budget (see subscribeOption).
+   * It logs rather than silently doing nothing, so a reader of the logs never
+   * mistakes this for work that happened.
    */
   public rolloverExpiredOptions(_currentUtcMs: number) {
-    console.log('[engineBus] rolloverExpiredOptions: no-op — options budget not owned by the engine yet.');
+    console.log('[engineBus] rolloverExpiredOptions: no-op by design — the engine holds no option subscriptions (relay owns the budget).');
   }
 }
 
