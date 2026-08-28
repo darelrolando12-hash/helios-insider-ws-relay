@@ -69,6 +69,12 @@ const MAX_EPOCH_MS = 8.64e15;
  * nanosecond value to Date produces Invalid Date, and Intl then throws
  * RangeError — see the note in _dispatch for what that cost in production.
  *
+ * Do NOT resolve this by consulting the vendor docs: Massive's LULD page
+ * documents `t` as "The Timestamp in Unix MS" while the sample response on
+ * that same page shows 1764086430905642800 — nanoseconds. The documentation
+ * contradicts the wire, and the wire is what arrives.
+ * (https://massive.com/docs/websocket/stocks/luld)
+ *
  * Anything not resolvable to a real instant falls back to now(), which is the
  * same fallback the browser used for a missing `t`. Exported for testing.
  */

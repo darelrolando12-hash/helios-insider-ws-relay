@@ -18,15 +18,24 @@
  *   The DUMP/RIP detector reads isActive directly from LuldEvent — it never
  *   re-derives halt state from raw event lists.
  *
- * KNOWN LIMIT (verified 2026-08-28 against 275 live LULD messages):
- *   Every message observed on this channel is a BAND PUBLICATION — it carries
- *   both an upper and a lower band, with indicator codes 15/16/22. Not one was
- *   a halt. So isHalted() currently answers "false, and that is real data"
- *   rather than "true" or "unknown" — which is correct, but it means this
- *   store is not yet a proven halt source. Halt/resume codes stay unmapped in
- *   _normaliseEventType until they can be confirmed against real halt traffic,
- *   because inventing a halt code is strictly worse than lacking one: a false
- *   halt silently suppresses every signal for that ticker.
+ * HALT COVERAGE — a real structural limit, not a bug:
+ *   Massive states verbatim that "Halt and resumption messages (indicators 17
+ *   and 18) are only available for NASDAQ listed securities."
+ *   (https://massive.com/docs/websocket/stocks/luld)
+ *
+ *   So for a NYSE- or AMEX-listed ticker (tape z = 1 or 2), a halt can NEVER
+ *   arrive on this channel. isHalted() will answer `false` for those names no
+ *   matter what actually happens to them. That is a data-availability gap
+ *   masquerading as "not halted", which is exactly the shape of bug this repo
+ *   keeps hitting — so any consumer that treats `false` as "confirmed
+ *   trading" must first check the tape. In a 2026-08-28 capture the split was
+ *   210 Nasdaq (z=3) to 65 NYSE (z=1) messages, so this covers roughly a
+ *   quarter of observed traffic.
+ *
+ *   Every one of those 275 captured messages was a band publication
+ *   (indicators 15/16/22, both bands present); no halt appeared. The 17/18
+ *   mapping below therefore comes from Massive's published glossary rather
+ *   than from observed halt traffic, and has not yet been exercised live.
  */
 
 import { massiveBus, type WSMessageWithCT } from '../bus.ts';
@@ -199,28 +208,52 @@ function _handleLuld(msg: WSMessageWithCT) {
  * Halt/resume codes stay unmapped until they can be confirmed against real
  * halt traffic. When that happens, add them here rather than guessing.
  */
+/**
+ * LULD indicator codes, from Massive's published glossary.
+ *
+ * Source: https://massive.com/glossary/us/stocks/conditions-indicators
+ *         (LULD Indicators section), linked from
+ *         https://massive.com/docs/websocket/stocks/luld
+ *
+ *   15  Intraday Update
+ *   16  Restated Value
+ *   17  Suspended Halt Pause
+ *   18  Reopening Update
+ *   19  Outside Price Band Rule Hours
+ *   21  Price Band
+ *   22  Republished LULD Price Band
+ *
+ * 17 and 18 are the halt and resumption messages. Massive states verbatim:
+ * "Halt and resumption messages (indicators 17 and 18) are only available for
+ * NASDAQ listed securities." — see HALT COVERAGE in the module header for why
+ * that matters to isHalted().
+ */
+const INDICATOR_HALT   = 17;
+const INDICATOR_RESUME = 18;
+
+/** Every documented code that describes a band publication rather than a halt. */
+const INDICATOR_BAND = new Set([15, 16, 19, 21, 22]);
+
 function _normaliseEventType(indicators: unknown[]): LuldEventType {
   const codes = indicators
     .map((c) => (typeof c === 'number' ? c : Number(c)))
     .filter((c) => Number.isFinite(c));
 
-  // Every code seen in live traffic so far (15, 16, 22) is a band
-  // publication, so this currently has exactly one outcome. It is written as
-  // a single unconditional return rather than a switch with one reachable
-  // branch, because a switch would imply this function discriminates halts
-  // when it does not — and code that looks like it checks for something it
-  // can never find is the failure mode this repo keeps hitting.
-  //
-  // An unfamiliar code is worth surfacing: it is the signal that the halt
-  // mapping needs to be built, and it is the only way we will ever learn the
-  // real codes.
-  const KNOWN_BAND_CODES = new Set([15, 16, 22]);
-  const unknown = codes.filter((c) => !KNOWN_BAND_CODES.has(c));
+  // Halt and resume take precedence over any band code sharing the array —
+  // a message that reopens trading is a resume first and a band update second.
+  if (codes.includes(INDICATOR_HALT))   return 'halt';
+  if (codes.includes(INDICATOR_RESUME)) return 'resume';
+
+  // Anything documented as a band, plus anything undocumented, is treated as a
+  // band publication. Never as a halt: isHalted() feeds the catalyst gate, so
+  // a fabricated halt silently suppresses every signal for that ticker. A
+  // missed halt is visible in the data; an invented one is not.
+  const unknown = codes.filter((c) => !INDICATOR_BAND.has(c));
   if (unknown.length > 0) {
     console.warn(
-      `[luldStore] Unrecognised LULD indicator code(s): ${unknown.join(', ')}. ` +
-      `Treating as a band publication. If this coincides with a real halt, ` +
-      `the halt mapping needs to be added to _normaliseEventType.`
+      `[luldStore] Undocumented LULD indicator code(s): ${unknown.join(', ')}. ` +
+      `Treating as a band publication (never as a halt). Known codes are ` +
+      `15/16/19/21/22 = band, 17 = halt, 18 = resume.`
     );
   }
 

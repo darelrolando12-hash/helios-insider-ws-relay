@@ -79,12 +79,62 @@ describe('luldStore — real LULD wire format', () => {
     expect(luldStore.isHalted('GLD')).toBe(false);  // real observed data
   });
 
-  it('warns on an unrecognised indicator code without inventing a halt', () => {
+  it('warns on an undocumented indicator code without inventing a halt', () => {
     luldStore.subscribeTicker('IWM');
     massiveBus.ingestFrame([{ ...IWM, i: [99] } as never]);
     expect(warnSpy.mock.calls.map((c) => String(c[0])).join(''))
-      .toMatch(/Unrecognised LULD indicator/);
+      .toMatch(/Undocumented LULD indicator/);
     expect(luldStore.isHalted('IWM')).toBe(false);
+  });
+
+  // ── Documented indicator mapping ───────────────────────────────────────────
+  // Codes per Massive's glossary:
+  //   https://massive.com/glossary/us/stocks/conditions-indicators
+  //   15 Intraday Update · 16 Restated Value · 17 Suspended Halt Pause
+  //   18 Reopening Update · 19 Outside Price Band Rule Hours
+  //   21 Price Band · 22 Republished LULD Price Band
+
+  it.each([[15], [16], [19], [21], [22]])(
+    'indicator %i is a band publication, not a halt',
+    (code) => {
+      luldStore.subscribeTicker('MSFT');
+      massiveBus.ingestFrame([{ ...MSFT, i: [code] } as never]);
+      const res = luldStore.getResult('MSFT');
+      expect(res.status).toBe('ready');
+      if (res.status === 'ready') expect(res.data.events[0].type).toBe('luld_band');
+      expect(luldStore.isHalted('MSFT')).toBe(false);
+      expect(warnSpy.mock.calls.length).toBe(0);   // documented — no warning
+    },
+  );
+
+  it('indicator 17 (Suspended Halt Pause) sets a halt', () => {
+    luldStore.subscribeTicker('MSFT');
+    massiveBus.ingestFrame([{ ...MSFT, i: [17] } as never]);
+    const res = luldStore.getResult('MSFT');
+    expect(res.status).toBe('ready');
+    if (res.status === 'ready') {
+      expect(res.data.events[0].type).toBe('halt');
+      expect(res.data.events[0].isActive).toBe(true);
+    }
+    expect(luldStore.isHalted('MSFT')).toBe(true);
+  });
+
+  it('indicator 18 (Reopening Update) clears the halt', () => {
+    luldStore.subscribeTicker('MSFT');
+    massiveBus.ingestFrame([{ ...MSFT, i: [17] } as never]);
+    expect(luldStore.isHalted('MSFT')).toBe(true);
+    massiveBus.ingestFrame([{ ...MSFT, i: [18] } as never]);
+    expect(luldStore.isHalted('MSFT')).toBe(false);
+    const res = luldStore.getResult('MSFT');
+    if (res.status === 'ready') {
+      expect(res.data.events.map((e) => e.type)).toEqual(['halt', 'resume']);
+    }
+  });
+
+  it('a halt code wins over a band code in the same indicator array', () => {
+    luldStore.subscribeTicker('MSFT');
+    massiveBus.ingestFrame([{ ...MSFT, i: [16, 17] } as never]);
+    expect(luldStore.isHalted('MSFT')).toBe(true);
   });
 
   it('a LULD message no longer aborts the rest of its frame', () => {
