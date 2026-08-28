@@ -58,6 +58,39 @@ export type WSMessageHandler = (msg: WSMessageWithCT) => void;
 type StockChannel  = 'AM' | 'A' | 'T' | 'Q' | 'LULD';
 type OptionChannel = 'AM' | 'A' | 'T' | 'Q';
 
+/** Largest epoch value JavaScript's Date accepts (±100,000,000 days). */
+const MAX_EPOCH_MS = 8.64e15;
+
+/**
+ * Coerce a Massive `t` field into a valid epoch-millisecond value.
+ *
+ * Channels are not consistent about units. Q and T send milliseconds (~1.7e12),
+ * LULD sends NANOSECONDS (~1.7e18), and AM omits `t` entirely. Feeding the
+ * nanosecond value to Date produces Invalid Date, and Intl then throws
+ * RangeError — see the note in _dispatch for what that cost in production.
+ *
+ * Anything not resolvable to a real instant falls back to now(), which is the
+ * same fallback the browser used for a missing `t`. Exported for testing.
+ */
+export function normaliseTimestamp(t: unknown, now: number = Date.now()): number {
+  if (typeof t !== 'number' || !Number.isFinite(t) || t <= 0) return now;
+
+  // Plausibility, not mere Date-validity, decides the unit. Date accepts
+  // anything up to 8.64e15, so dividing nanoseconds by 1e3 yields a
+  // *technically valid* date in the year 58627 — a silently wrong timestamp is
+  // worse than a rejected one. Only a value landing in a realistic market-data
+  // window is accepted.
+  const MIN_PLAUSIBLE = Date.UTC(2000, 0, 1);   // 9.46e11
+  const MAX_PLAUSIBLE = Date.UTC(2100, 0, 1);   // 4.10e12
+
+  for (const divisor of [1, 1e3, 1e6, 1e9]) {   // ms, µs, ns, ps
+    const candidate = t / divisor;
+    if (candidate >= MIN_PLAUSIBLE && candidate <= MAX_PLAUSIBLE) return candidate;
+  }
+
+  return now;
+}
+
 /**
  * The subscribe/unsubscribe surface the engine needs from the relay.
  * relay/index.js supplies this at boot (see engine/index.ts). Keeping it as an
@@ -154,13 +187,35 @@ export class EngineBus {
 
     for (const msg of sorted) {
       if (!msg || !msg.ev || msg.ev === 'status') continue;
-      this._dispatch(msg);
+      // Per-MESSAGE isolation, not just per-handler. The browser bus wrapped
+      // its handler calls but not the _ct conversion above them, so one bad
+      // timestamp aborted the entire remaining frame. Whatever goes wrong with
+      // a single message, the rest of the frame must still be delivered.
+      try {
+        this._dispatch(msg);
+      } catch (e) {
+        console.error(`[engineBus] Dispatch error (${msg.ev} ${msg.sym ?? msg.T ?? '?'}) — frame continues:`, e);
+      }
     }
   }
 
   private _dispatch(raw: BaseWSMessage) {
     // Single CT conversion point for the entire engine.
-    const _ct = toCentralTime(typeof raw.t === 'number' ? raw.t : Date.now());
+    //
+    // normaliseTimestamp() is NOT optional defensiveness. The browser bus
+    // called toCentralTime here unguarded, and it threw for real, in
+    // production, on 2026-08-28: every LULD message carries `t` in
+    // NANOSECONDS (e.g. 1787924309993088500), which is far past the maximum
+    // valid Date epoch of 8.64e15. new Date() yields Invalid Date and
+    // Intl.DateTimeFormat.formatToParts() raises "RangeError: Invalid time
+    // value". Because the call sat outside any try/catch, that exception
+    // escaped _dispatchMessage -> _onRawMessage -> onmessage and ABORTED THE
+    // WHOLE FRAME, silently discarding every message ordered after the LULD
+    // one. 253 such RangeErrors were captured in a 27-minute session.
+    //
+    // typeof raw.t === 'number' does not catch this: NaN and 1.7e18 are both
+    // numbers. The guard has to be on the VALUE.
+    const _ct = toCentralTime(normaliseTimestamp(raw.t));
     const msg: WSMessageWithCT = { ...raw, _ct };
 
     const evHandlers = this._handlers.get(msg.ev);

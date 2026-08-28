@@ -7,7 +7,7 @@
  * executes, and an empty credential producing a client that returns nothing.
  */
 import { describe, it, expect, vi } from 'vitest';
-import { EngineBus, type WSMessageWithCT } from '../bus.ts';
+import { EngineBus, normaliseTimestamp, type WSMessageWithCT } from '../bus.ts';
 import { wrapForEngineMode, ENGINE_MODE, IS_SHADOW, IS_ENABLED, parseEngineMode } from '../mode.ts';
 
 describe('EngineBus — frame ordering', () => {
@@ -214,5 +214,68 @@ describe('config — fail-fast on missing credentials', () => {
     vi.resetModules();
     const mod = await import('../../config.ts?all-present');
     expect(() => mod.assertConfig()).not.toThrow();
+  });
+});
+
+describe('EngineBus — malformed timestamps (production RangeError, 2026-08-28)', () => {
+  it('normalises LULD nanosecond timestamps instead of throwing', () => {
+    // Verbatim from the captured HAR.
+    const nanos = 1787924309993088500;
+    const ms = normaliseTimestamp(nanos);
+    expect(ms).toBeLessThanOrEqual(8.64e15);
+    expect(new Date(ms).toISOString()).toBe('2026-08-28T13:38:29.993Z');
+  });
+
+  it.each([
+    ['NaN',            NaN],
+    ['Infinity',       Infinity],
+    ['negative',       -1],
+    ['zero',           0],
+    ['a string',       '1787924309993' as unknown],
+    ['undefined',      undefined],
+    ['absurdly large', 1e30],
+  ])('falls back to now() for %s rather than producing an Invalid Date', (_label, bad) => {
+    const now = Date.UTC(2026, 7, 28, 12, 0, 0);
+    const out = normaliseTimestamp(bad, now);
+    expect(Number.isFinite(out)).toBe(true);
+    expect(new Date(out).toString()).not.toBe('Invalid Date');
+  });
+
+  it('leaves ordinary millisecond timestamps untouched', () => {
+    const ms = Date.UTC(2026, 7, 28, 13, 38, 29, 993);
+    expect(normaliseTimestamp(ms)).toBe(ms);
+  });
+
+  it('a message with a nanosecond t does NOT abort the rest of the frame', () => {
+    const bus = new EngineBus();
+    const seen: string[] = [];
+    bus.on('LULD', () => seen.push('LULD'));
+    bus.on('T',    (m) => seen.push('T:' + m.sym));
+
+    // LULD sorts after Q but before/among T. Previously the RangeError it
+    // raised escaped the loop and every message after it was lost.
+    bus.ingestFrame([
+      { ev: 'T',    sym: 'SPY', t: 1787924309993 },
+      { ev: 'LULD', sym: 'IWM', t: 1787924309993088500 },
+      { ev: 'T',    sym: 'QQQ', t: 1787924309994 },
+    ]);
+
+    expect(seen).toContain('T:SPY');
+    expect(seen).toContain('LULD');
+    expect(seen).toContain('T:QQQ');   // the one that used to be dropped
+    expect(seen.length).toBe(3);
+  });
+
+  it('survives a message that cannot be stamped at all, without losing others', () => {
+    const bus = new EngineBus();
+    const spy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const seen: string[] = [];
+    bus.on('T', (m) => seen.push('T:' + m.sym));
+    bus.ingestFrame([
+      { ev: 'T', sym: 'A', t: NaN },
+      { ev: 'T', sym: 'B', t: 1787924309994 },
+    ]);
+    expect(seen).toEqual(['T:A', 'T:B']);
+    spy.mockRestore();
   });
 });
