@@ -23,7 +23,7 @@
  *   Caller must supply current underlying price when subscribing options.
  */
 
-import { massiveBus, type WSMessageWithCT } from '../lib/massive/websocket';
+import { massiveBus, type WSMessageWithCT } from '../bus.ts';
 import * as cvdStore from '../stores/cvdStore';
 import type { CvdTick, AssetClass, TradeSide } from '../stores/types';
 

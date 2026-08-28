@@ -15,7 +15,7 @@
  *   A ticker that just connected but has only one bar stays 'loading'.
  */
 
-import { massiveBus, type WSMessageWithCT } from '../lib/massive/websocket';
+import { massiveBus, type WSMessageWithCT } from '../bus.ts';
 import { MassiveRestClient }                from '../lib/massive/api';
 import { type Bar, type Result, ready, loading, error } from './types';
 

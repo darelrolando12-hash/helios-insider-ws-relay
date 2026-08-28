@@ -16,7 +16,6 @@
 
 import type { Bar, MarketStatus } from '../../stores/types';
 import { toCentralTime } from '../time';
-import { RELAY_REST_URL } from '../../config';
 
 // ── Internal types ────────────────────────────────────────────────────────────
 
@@ -308,18 +307,31 @@ export interface MassiveDailyBarResponse {
 
 // ── MassiveRestClient ─────────────────────────────────────────────────────────
 
-// Derives the relay's REST origin from the same relay address configured
-// for the WebSocket connection (RELAY_REST_URL in src/config.ts), so both
-// stay in sync automatically.
-function _defaultRelayRestUrl(): string {
-  return `${RELAY_REST_URL}/rest`;
-}
-
 export class MassiveRestClient {
   private readonly _baseUrl: string;
+  private readonly _apiKey:  string;
 
-  constructor(baseUrl = _defaultRelayRestUrl()) {
+  /**
+   * @param baseUrl  Request origin. Server-side this MUST be the direct
+   *                 Massive origin (https://api.massive.com) — routing
+   *                 through the relay's own /rest/ proxy would be a loopback
+   *                 to itself. See relay/config.ts MASSIVE_REST_BASE_URL.
+   * @param apiKey   Massive API key, attached to every outgoing request.
+   *
+   *                 This parameter did not previously exist: in the browser
+   *                 the client deliberately sent NO key, because it talked to
+   *                 the relay's /rest/ proxy, which attached the key
+   *                 server-side (relay/index.js). Talking direct to Massive,
+   *                 that proxy is gone — so without a key here every single
+   *                 REST call would come back 401. Both call sites that build
+   *                 URLs (_url and _relayUrl) attach it.
+   *
+   *                 Defaults to '' so browser/proxy usage keeps its old
+   *                 behaviour of sending nothing.
+   */
+  constructor(baseUrl: string, apiKey = '') {
     this._baseUrl = baseUrl;
+    this._apiKey  = apiKey;
   }
 
   // ── Bars ───────────────────────────────────────────────────────────────────
@@ -777,18 +789,24 @@ export class MassiveRestClient {
 
   private _url(path: string, params: Record<string, string> = {}): string {
     const qs = new URLSearchParams(params);
+    if (this._apiKey) qs.set('apiKey', this._apiKey);
     return `${this._baseUrl}${path}?${qs.toString()}`;
   }
 
   /**
    * Rewrites a Massive-issued `next_url` (real api.massive.com cursor link)
-   * into a relay-routed URL, stripping any apiKey it carries. The relay
-   * attaches apiKey server-side on every request — the client never sends
-   * or forwards one, on the first page or any subsequent page.
+   * onto this client's own base origin.
+   *
+   * The inbound cursor's apiKey is always stripped first, then this client's
+   * own key is re-attached if it has one. That ordering matters in both
+   * directions: against the relay proxy the key must NOT be forwarded (the
+   * proxy adds its own), and against Massive direct the cursor's key must be
+   * replaced rather than trusted.
    */
   private _relayUrl(rawNextUrl: string): string {
     const parsed = new URL(rawNextUrl);
     parsed.searchParams.delete('apiKey');
+    if (this._apiKey) parsed.searchParams.set('apiKey', this._apiKey);
     const search = parsed.searchParams.toString();
     return `${this._baseUrl}${parsed.pathname}${search ? '?' + search : ''}`;
   }

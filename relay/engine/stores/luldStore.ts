@@ -19,7 +19,7 @@
  *   re-derives halt state from raw event lists.
  */
 
-import { massiveBus, type WSMessageWithCT } from '../lib/massive/websocket';
+import { massiveBus, type WSMessageWithCT } from '../bus.ts';
 import { type LuldEvent, type LuldEventType, type Result, ready, loading } from './types';
 
 // ── Extended LuldEvent for store consumers ────────────────────────────────────

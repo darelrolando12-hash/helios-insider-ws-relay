@@ -8,9 +8,14 @@
   },
   "scripts": {
     "start": "node index.js",
-    "dev": "node --watch index.js"
+    "dev": "node --watch index.js",
+    "test": "vitest run --reporter=verbose"
   },
   "dependencies": {
+    "@supabase/supabase-js": "^2.49.8",
     "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "vitest": "^2.1.8"
   }
 }

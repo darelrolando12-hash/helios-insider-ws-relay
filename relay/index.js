@@ -59,6 +59,99 @@ function makeUpstreamState(name) {
   };
 }
 
+// ─── In-process listener registry ────────────────────────────────────────────
+// How the engine receives market data: it registers a listener here and is
+// called with each already-parsed frame. No WebSocket, no network hop, no
+// second upstream connection.
+//
+// This registry is deliberately one-directional: index.js knows nothing about
+// the engine and never imports it. The relay holds the market-data connection,
+// which is the scarce, slow-to-recover resource (one per cluster per account,
+// 10-30s server-side cleanup). An engine crash must never be able to take that
+// down, so nothing engine-side is on this file's import graph.
+//
+// Note the shape difference from broadcast(): browsers receive the raw frame
+// STRING (unchanged wire format), while listeners receive the PARSED array,
+// once per frame. Listeners get the whole frame rather than a message at a
+// time because the engine's quote-before-trade ordering guarantee is
+// frame-scoped and cannot be reconstructed from a flat message stream.
+
+const frameListeners = new Set();
+
+/** Register an in-process consumer of upstream frames. Returns an unsubscribe. */
+export function onFrame(listener) {
+  frameListeners.add(listener);
+  return () => frameListeners.delete(listener);
+}
+
+/** Register a consumer notified when an upstream re-authenticates. */
+const reconnectListeners = new Set();
+export function onUpstreamReconnect(listener) {
+  reconnectListeners.add(listener);
+  return () => reconnectListeners.delete(listener);
+}
+
+function emitFrame(messages) {
+  for (const listener of frameListeners) {
+    // Per-listener isolation. A throwing listener must not break this loop —
+    // the same loop's caller also feeds every browser client.
+    try {
+      listener(messages);
+    } catch (err) {
+      console.error('[relay] frame listener error:', err && err.message ? err.message : err);
+    }
+  }
+}
+
+function emitUpstreamReconnect(name) {
+  for (const listener of reconnectListeners) {
+    try {
+      listener(name);
+    } catch (err) {
+      console.error('[relay] reconnect listener error:', err && err.message ? err.message : err);
+    }
+  }
+}
+
+/**
+ * Channel subscription surface handed to the engine at boot.
+ *
+ * Routes through the same per-upstream subscriptions Set and safeSend() path
+ * the browser clients use, so engine and browser share one subscription
+ * registry rather than competing over it.
+ */
+export const relayControl = {
+  subscribe(channels) {
+    routeChannels(channels, (state, chans) => {
+      const fresh = chans.filter((c) => !state.subscriptions.has(c));
+      if (fresh.length === 0) return;
+      for (const c of fresh) state.subscriptions.add(c);
+      safeSend(state, JSON.stringify({ action: 'subscribe', params: fresh.join(',') }));
+      console.log(`[relay] engine subscribed ${fresh.length} channel(s) on ${state.name}`);
+    });
+  },
+  unsubscribe(channels) {
+    routeChannels(channels, (state, chans) => {
+      const known = chans.filter((c) => state.subscriptions.has(c));
+      if (known.length === 0) return;
+      for (const c of known) state.subscriptions.delete(c);
+      safeSend(state, JSON.stringify({ action: 'unsubscribe', params: known.join(',') }));
+      console.log(`[relay] engine unsubscribed ${known.length} channel(s) on ${state.name}`);
+    });
+  },
+};
+
+function routeChannels(channels, fn) {
+  const grouped = { stocks: [], options: [], indices: [] };
+  for (const ch of channels) {
+    const name = upstreamForChannel(ch);
+    if (name) grouped[name].push(ch);
+  }
+  for (const [name, chans] of Object.entries(grouped)) {
+    if (chans.length > 0) fn(upstream[name], chans);
+  }
+}
+
 // ─── Upstream management ──────────────────────────────────────────────────────
 
 function connectUpstream(state) {
@@ -134,6 +227,9 @@ function connectUpstream(state) {
       ) {
         state._authConfirmed = true;
         console.log(`[relay] auth confirmed: ${state.name}`);
+        // Engine-side gap-fill hook (barsStore backfills tickers whose last
+        // bar is stale). Fires after every re-auth, not just the first.
+        emitUpstreamReconnect(state.name);
 
         for (const queued of state.sendQueue) {
           if (ws.readyState === WebSocket.OPEN) ws.send(queued);
@@ -174,6 +270,11 @@ function connectUpstream(state) {
     // frame string, just once instead of N times. Nothing frontend-side needs
     // to change.
     if (forwardFrame) broadcast(raw);
+
+    // In-process engine delivery. Runs after the browser fan-out so a slow or
+    // throwing engine listener can never delay a browser's frame, and gets the
+    // PARSED array rather than the raw string (see the registry above).
+    if (forwardFrame && frameListeners.size > 0) emitFrame(arr);
   });
 
   ws.on('close', (code, reason) => {
