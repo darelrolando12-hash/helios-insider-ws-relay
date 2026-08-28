@@ -54,6 +54,21 @@ Do not patch around a problem. Trace it to the mechanism, prove the mechanism, t
 
 **Every factor must distinguish "genuinely nothing" from "data unavailable."** Use the `dataQuality: 'real' | 'absent' | 'stale'` shape.
 
+### Removing a redundancy can expose a fault the redundancy was hiding
+
+**Real example, 2026-08-28.** Every LULD message carries `t` in **nanoseconds** (`1787924309993088500`, 207× JavaScript's maximum Date value). `toCentralTime` threw `RangeError: Invalid time value`, and because the call sat outside the try/catch that wrapped handler invocation, the throw escaped `onmessage` and aborted the whole frame — every message ordered after the LULD one was silently discarded.
+
+That bug was present for days and invisible, because the **N² broadcast amplification was accidentally acting as a retry**. Each frame arrived N times. Delivery #1 threw at the LULD message and dropped the rest; delivery #2 saw that same message as a duplicate (the dedup map records a key *before* dispatch), skipped it, and processed everything after it. Fixing the amplification made delivery exactly-once — and the drop permanent.
+
+**We did not cause the bug. We removed the accident that was hiding it.**
+
+The general rule: **when you remove a redundancy, retry, or duplicate path, expect a latent fault to surface.** Before landing that kind of change, ask what the redundancy might have been silently absorbing. Deduplication, retries, N-times delivery, and fallbacks all mask upstream faults — and the masking is invisible precisely because it works.
+
+Two corollaries from the same incident:
+
+- **Guard the value, not the type.** `typeof t === 'number'` passes for both `NaN` and `1.7e18`.
+- **Plausibility beats validity.** The first fix divided nanoseconds by `1e3` and got a *technically valid* `Date` in the year 58627. Its own test caught it. A silently wrong timestamp is worse than a rejected one — validate into a realistic range, not merely a parseable one.
+
 ---
 
 ## HARD ENVIRONMENT CONSTRAINTS

@@ -17,6 +17,16 @@
  *   subsequent 'resume' event means the ticker is currently halted.
  *   The DUMP/RIP detector reads isActive directly from LuldEvent — it never
  *   re-derives halt state from raw event lists.
+ *
+ * KNOWN LIMIT (verified 2026-08-28 against 275 live LULD messages):
+ *   Every message observed on this channel is a BAND PUBLICATION — it carries
+ *   both an upper and a lower band, with indicator codes 15/16/22. Not one was
+ *   a halt. So isHalted() currently answers "false, and that is real data"
+ *   rather than "true" or "unknown" — which is correct, but it means this
+ *   store is not yet a proven halt source. Halt/resume codes stay unmapped in
+ *   _normaliseEventType until they can be confirmed against real halt traffic,
+ *   because inventing a halt code is strictly worse than lacking one: a false
+ *   halt silently suppresses every signal for that ticker.
  */
 
 import { massiveBus, type WSMessageWithCT } from '../bus.ts';
@@ -110,17 +120,32 @@ export function subscribe(listener: () => void): () => void {
 // ── Message handler ───────────────────────────────────────────────────────────
 
 function _handleLuld(msg: WSMessageWithCT) {
-  const ticker = msg.sym;
+  // Real Massive LULD payload, verbatim from a captured session:
+  //   {"ev":"LULD","h":314.7,"l":284.72,"i":[22],"z":1,"T":"IWM",
+  //    "t":1787924309993088500,"q":39563}
+  //
+  //   T = TICKER  (not an event type — see below)
+  //   h = upper (limit-up) band price
+  //   l = lower (limit-down) band price
+  //   i = indicator code ARRAY
+  //   z = tape (1 = NYSE, 3 = Nasdaq)
+  //   q = sequence number
+  //   t = timestamp in NANOSECONDS (normalised upstream in bus.ts)
+  //
+  // There is NO `sym` field: across 275 captured LULD messages, zero had one.
+  // This handler previously read `msg.sym`, so `ticker` was always undefined,
+  // `_state.get(undefined)` always missed, and the function returned before
+  // storing anything. Every LULD event since the channel was routed has been
+  // discarded here — a silent zero that reads as "no halts today".
+  //
+  // `sym` is kept as a fallback purely so a future payload that does carry it
+  // still works; `T` is the observed reality.
+  const ticker = (msg.T as string) ?? (msg.sym as string) ?? '';
   const state  = _state.get(ticker);
   if (!state) return;
 
-  // Massive LULD fields:
-  //   T = event type string (not to be confused with trades 'T' channel)
-  //   h = high band price
-  //   l = low band price
-  //   i = indicator code
-  const rawType    = (msg.T as string) ?? '';
-  const eventType  = _normaliseEventType(rawType);
+  const indicators = Array.isArray(msg.i) ? (msg.i as unknown[]) : [];
+  const eventType  = _normaliseEventType(indicators);
   const upperBand  = (msg.h as number) ?? undefined;
   const lowerBand  = (msg.l as number) ?? undefined;
 
@@ -151,34 +176,55 @@ function _handleLuld(msg: WSMessageWithCT) {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-function _normaliseEventType(rawType: string): LuldEventType {
-  // Massive LULD indicator codes — normalise to app union
-  switch (rawType.toUpperCase()) {
-    case 'H':
-    case 'HALT':
-    case 'T1':  // regulatory halt
-    case 'T2':  // non-regulatory halt
-    case 'T6':  // extraordinary market activity
-    case 'T12': // additional regulatory halt
-      return 'halt';
+/**
+ * Map Massive's LULD indicator array to the app's event union.
+ *
+ * The previous implementation took a STRING and switched on codes like 'H',
+ * 'T1', 'R'. The wire format carries no such field — it sends `i` as an array
+ * of numeric indicator codes. Because the old code was handed `msg.T` (the
+ * ticker, e.g. "IWM"), every lookup fell through to `default` and returned
+ * 'luld_band'. It produced a plausible answer for entirely the wrong reason.
+ *
+ * Observed codes across 275 captured messages: 16 (206x), 22 (65x), 15 (4x).
+ * All 275 carried BOTH an upper and lower band, which is what a band
+ * publication looks like — none were halts.
+ *
+ * DELIBERATELY CONSERVATIVE: the authoritative SIP indicator table is not
+ * something this codebase has verified, so an unrecognised code returns
+ * 'luld_band', never 'halt'. That direction matters. isHalted() feeds the
+ * catalyst gate, and a false 'halt' silently suppresses every signal for that
+ * ticker — the exact failure this repo has already been bitten by. A missed
+ * halt is visible in the data; a fabricated one is not.
+ *
+ * Halt/resume codes stay unmapped until they can be confirmed against real
+ * halt traffic. When that happens, add them here rather than guessing.
+ */
+function _normaliseEventType(indicators: unknown[]): LuldEventType {
+  const codes = indicators
+    .map((c) => (typeof c === 'number' ? c : Number(c)))
+    .filter((c) => Number.isFinite(c));
 
-    case 'R':
-    case 'RESUME':
-    case 'T3':  // resume after T1
-    case 'T7':  // resume after T6
-      return 'resume';
-
-    case 'P':
-    case 'LULD_PAUSE':
-    case 'LUDP':
-      return 'luld_pause';
-
-    case 'B':
-    case 'LULD_BAND':
-    case 'LUDB':
-    default:
-      return 'luld_band';
+  // Every code seen in live traffic so far (15, 16, 22) is a band
+  // publication, so this currently has exactly one outcome. It is written as
+  // a single unconditional return rather than a switch with one reachable
+  // branch, because a switch would imply this function discriminates halts
+  // when it does not — and code that looks like it checks for something it
+  // can never find is the failure mode this repo keeps hitting.
+  //
+  // An unfamiliar code is worth surfacing: it is the signal that the halt
+  // mapping needs to be built, and it is the only way we will ever learn the
+  // real codes.
+  const KNOWN_BAND_CODES = new Set([15, 16, 22]);
+  const unknown = codes.filter((c) => !KNOWN_BAND_CODES.has(c));
+  if (unknown.length > 0) {
+    console.warn(
+      `[luldStore] Unrecognised LULD indicator code(s): ${unknown.join(', ')}. ` +
+      `Treating as a band publication. If this coincides with a real halt, ` +
+      `the halt mapping needs to be added to _normaliseEventType.`
+    );
   }
+
+  return 'luld_band';
 }
 
 function _notify() {
