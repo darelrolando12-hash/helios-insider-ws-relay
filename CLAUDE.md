@@ -69,6 +69,14 @@ Two corollaries from the same incident:
 - **Guard the value, not the type.** `typeof t === 'number'` passes for both `NaN` and `1.7e18`.
 - **Plausibility beats validity.** The first fix divided nanoseconds by `1e3` and got a *technically valid* `Date` in the year 58627. Its own test caught it. A silently wrong timestamp is worse than a rejected one — validate into a realistic range, not merely a parseable one.
 
+### When docs and captured wire data disagree, the wire wins
+
+Massive's LULD page documents `t` as **"The Timestamp in Unix MS"** — and the sample response *on that same page* is `1764086430905642800`, which is nanoseconds. The vendor's own example contradicts the vendor's own prose.
+
+Had the fix been written from the documentation rather than from a captured frame, it would have been wrong. **Verify field units, field names, and field presence against real captured traffic before trusting a spec.** The same session proved the point twice: `luldStore` read `msg.sym` for the ticker, and no LULD message carries `sym` at all — the ticker is in `T`.
+
+Docs are a hypothesis. A captured frame is evidence.
+
 ---
 
 ## HARD ENVIRONMENT CONSTRAINTS
