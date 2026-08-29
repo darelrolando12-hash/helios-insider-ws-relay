@@ -102,9 +102,40 @@ export function logModeBanner(): void {
 // ── Shadow interception ──────────────────────────────────────────────────────
 
 /**
+ * Tables whose shadow log line must NOT be truncated.
+ *
+ * The 300-char sample below exists so a bars_1m upsert (hundreds of rows per
+ * call, none of them individually interesting) doesn't flood the log. That
+ * same truncation silently cuts off exactly the fields the shadow-mode diff
+ * needs to compare: a `signals` row's `factors` blob (catalyst tags, luld
+ * sub-object, gexRegime, vixBucket, tradeType) runs well past 300 characters
+ * on its own. Add a table here only when something reads its shadow log
+ * programmatically — it is not a general "important table" list.
+ */
+const UNTRUNCATED_TABLES = new Set(['signals']);
+
+/**
+ * Emits the complete row(s) as a single-line JSON object under a stable,
+ * grep-able marker, so `railway logs --json` yields one parseable record per
+ * write with nothing clipped. Used only for UNTRUNCATED_TABLES.
+ */
+function _logUntruncated(table: string, op: string, payload: unknown): void {
+  const rows = Array.isArray(payload) ? payload : payload === undefined || payload === null ? [] : [payload];
+  console.log(JSON.stringify({
+    marker: 'shadow-signal',
+    table,
+    op,
+    rowCount: rows.length,
+    rows,
+    loggedAt: new Date().toISOString(),
+  }));
+}
+
+/**
  * Summarises what a write WOULD have done, without dumping whole payloads.
  * Row count plus one sampled row is enough to diff against browser output
- * while keeping the logs readable at ingestion volumes.
+ * while keeping the logs readable at ingestion volumes. NOT used for
+ * UNTRUNCATED_TABLES — see _logUntruncated.
  */
 function _describePayload(payload: unknown): string {
   if (payload === undefined || payload === null) return 'no payload';
@@ -170,11 +201,15 @@ export function wrapForEngineMode<T extends object>(client: T): T {
               return Reflect.get(bTarget, bProp, bReceiver);
             }
             return (payload: unknown, ...rest: unknown[]) => {
-              console.log(
-                `[shadow] WOULD ${String(bProp).toUpperCase()} ${table} — ` +
-                `${_describePayload(payload)}` +
-                (rest.length > 0 && rest[0] !== undefined ? ` opts=${JSON.stringify(rest[0])}` : '')
-              );
+              if (UNTRUNCATED_TABLES.has(table)) {
+                _logUntruncated(table, String(bProp), payload);
+              } else {
+                console.log(
+                  `[shadow] WOULD ${String(bProp).toUpperCase()} ${table} — ` +
+                  `${_describePayload(payload)}` +
+                  (rest.length > 0 && rest[0] !== undefined ? ` opts=${JSON.stringify(rest[0])}` : '')
+                );
+              }
               return _shadowBuilder(table, String(bProp), payload);
             };
           },

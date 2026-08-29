@@ -167,12 +167,15 @@ describe('ENGINE_MODE — shadow write gate', () => {
     const spy = vi.spyOn(console, 'log').mockImplementation(() => {});
     const wrapped = wrapForEngineMode(fake);
 
-    const res = await (wrapped as any).from('signals').upsert([{ id: 'a' }, { id: 'b' }]);
+    // A non-signals table exercises the standard truncated-summary log path.
+    // signals has its own dedicated, untruncated format — see the describe
+    // block below.
+    const res = await (wrapped as any).from('bars_1m').upsert([{ id: 'a' }, { id: 'b' }]);
 
     expect(realCalled).toBe(false);
     expect(res.error).toBeNull();
     const logged = spy.mock.calls.map((c) => String(c[0])).join('\n');
-    expect(logged).toContain('WOULD UPSERT signals');
+    expect(logged).toContain('WOULD UPSERT bars_1m');
     expect(logged).toContain('2 row(s)');
     spy.mockRestore();
   });
@@ -193,6 +196,89 @@ describe('ENGINE_MODE — shadow write gate', () => {
     const spy = vi.spyOn(console, 'log').mockImplementation(() => {});
     const wrapped = wrapForEngineMode(fake);
     const res = await (wrapped as any).from('short_interest').delete().lt('date', '2026-01-01');
+    expect(res.error).toBeNull();
+    spy.mockRestore();
+  });
+});
+
+describe('shadow mode — signals gets an untruncated log line', () => {
+  // A full FactorsBlob (catalyst tags, luld sub-object, gexRegime, vixBucket,
+  // tradeType) comfortably exceeds the 300-char truncation used for
+  // high-volume tables. The shadow-mode diff needs every field intact.
+  const bigRow = {
+    id: 'sig_1_SPY_1787945733901',
+    ticker: 'SPY',
+    direction: 'call',
+    signal_type: 'REVERSAL',
+    conviction: 65,
+    entry_price: 645.12,
+    entry_tct: 1787945733000,
+    entry_utc: 1787945733901,
+    status: 'pending',
+    factors: {
+      catalystTags: { earningsPending: false, materialEvent: true, insiderBuy: false, insiderSell: false },
+      catalystDataQuality: 'real',
+      luld: { isHalted: false, upperBand: 650.1, lowerBand: 610.4 },
+      vixBucket: '15-20',
+      tradeType: null,
+      gexRegime: 'negative',
+      sessionBias: 'bullish',
+      // Padding well past 300 chars to prove nothing gets clipped.
+      note: 'x'.repeat(400),
+    },
+  };
+
+  it('logs the complete row as single-line JSON under the shadow-signal marker', async () => {
+    const fake = { from: () => ({ upsert: () => Promise.resolve({ data: [bigRow], error: null }) }) };
+    const spy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const wrapped = wrapForEngineMode(fake);
+
+    await (wrapped as any).from('signals').upsert([bigRow], { onConflict: 'id' });
+
+    const lines = spy.mock.calls.map((c) => String(c[0]));
+    const parsed = lines.map((l) => { try { return JSON.parse(l); } catch { return null; } })
+                         .find((j) => j && j.marker === 'shadow-signal');
+
+    expect(parsed).toBeTruthy();
+    expect(parsed.table).toBe('signals');
+    expect(parsed.op).toBe('upsert');
+    expect(parsed.rowCount).toBe(1);
+    // The note field alone is 400 chars — if truncation were still applied
+    // to this table, it would be cut and this would fail.
+    expect(parsed.rows[0].factors.note.length).toBe(400);
+    expect(parsed.rows[0].factors.luld).toEqual(bigRow.factors.luld);
+    expect(parsed.rows[0].id).toBe(bigRow.id);
+    spy.mockRestore();
+  });
+
+  it('never uses the truncated [shadow] WOULD format for signals', async () => {
+    const fake = { from: () => ({ upsert: () => Promise.resolve({ data: [bigRow], error: null }) }) };
+    const spy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const wrapped = wrapForEngineMode(fake);
+    await (wrapped as any).from('signals').upsert([bigRow]);
+    const logged = spy.mock.calls.map((c) => String(c[0])).join('\n');
+    expect(logged).not.toContain('[shadow] WOULD');
+    spy.mockRestore();
+  });
+
+  it('bars_1m (high-volume) still uses the truncated summary format', async () => {
+    const manyRows = Array.from({ length: 200 }, (_, i) => ({ ticker: 'SPY', t_utc: i, c: 100 + i }));
+    const fake = { from: () => ({ upsert: () => Promise.resolve({ data: manyRows, error: null }) }) };
+    const spy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const wrapped = wrapForEngineMode(fake);
+    await (wrapped as any).from('bars_1m').upsert(manyRows);
+    const logged = spy.mock.calls.map((c) => String(c[0])).join('\n');
+    expect(logged).toContain('WOULD UPSERT bars_1m');
+    expect(logged).toContain('200 row(s)');
+    expect(logged).not.toContain('"marker":"shadow-signal"');
+    spy.mockRestore();
+  });
+
+  it('still returns a chainable, success-shaped result for signals writes', async () => {
+    const fake = { from: () => ({ upsert: () => { throw new Error('must not run'); } }) };
+    const spy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const wrapped = wrapForEngineMode(fake);
+    const res = await (wrapped as any).from('signals').upsert([bigRow], { onConflict: 'id' });
     expect(res.error).toBeNull();
     spy.mockRestore();
   });
