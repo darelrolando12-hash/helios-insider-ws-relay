@@ -247,10 +247,23 @@ function runForcedCloseSequence({ entryPrice, peakPrice }) {
   const clockSteps = [14 * 60 + 15, 14 * 60 + 29, 14 * 60 + 30, 14 * 60 + 37, 14 * 60 + 40];
   const gainPct = ((peakPrice - entryPrice) / entryPrice) * 100;
   log.push(`  position unrealised gain: +${gainPct.toFixed(0)}% (peak $${peakPrice.toFixed(2)} vs entry $${entryPrice.toFixed(2)})`);
+
+  // Contrast, at the exact same clock: SPX/NDX are cash-settled — no shares
+  // ever change hands on exercise, so the assignment risk this rule exists
+  // for is structurally absent. Confirmed against the real, pre-existing
+  // CASH_SETTLED_TICKERS set in state/directionState.ts, which this harness
+  // does not import (forcedClose.ts stays dependency-free) but which is the
+  // authoritative source for which tickers this applies to.
+  const spxCheck = evaluateForcedClose({
+    position: { expiryDate: TODAY_CT, isOpen: true, settlementType: 'cash' },
+    todayCT: TODAY_CT, minuteOfDayCT: 14 * 60 + 40, schedule: DEFAULT_FORCED_CLOSE,
+  });
+  log.push(`  [contrast] SPX (cash-settled) at 14:40 CT -> urgency=${spxCheck.urgency} mustClose=${spxCheck.mustClose} — ${spxCheck.reason}`);
+
   let closedAt = null;
   for (const minute of clockSteps) {
     const fc = evaluateForcedClose({
-      position: { expiryDate: TODAY_CT, isOpen: true },
+      position: { expiryDate: TODAY_CT, isOpen: true, settlementType: 'physical' },
       todayCT: TODAY_CT, minuteOfDayCT: minute, schedule: DEFAULT_FORCED_CLOSE,
     });
     const hh = String(Math.floor(minute / 60)).padStart(2, '0');

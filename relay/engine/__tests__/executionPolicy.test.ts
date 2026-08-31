@@ -170,7 +170,7 @@ describe('evaluateConfirmation — pullback vs reversal', () => {
 // ── 11. Forced close ─────────────────────────────────────────────────────────
 
 describe('evaluateForcedClose — outranks everything, survives a restart', () => {
-  const open = { expiryDate: '2026-08-30', isOpen: true };
+  const open = { expiryDate: '2026-08-30', isOpen: true, settlementType: 'physical' as const };
 
   it('is inactive before the deadline', () => {
     const r = evaluateForcedClose({
@@ -218,11 +218,44 @@ describe('evaluateForcedClose — outranks everything, survives a restart', () =
 
   it('ignores a later expiry — no assignment risk today', () => {
     const r = evaluateForcedClose({
-      position: { expiryDate: '2026-09-19', isOpen: true }, todayCT: '2026-08-30',
+      position: { expiryDate: '2026-09-19', isOpen: true, settlementType: 'physical' }, todayCT: '2026-08-30',
       minuteOfDayCT: 14 * 60 + 35, schedule: DEFAULT_FORCED_CLOSE,
     });
     expect(r.mustClose).toBe(false);
     expect(r.expiresToday).toBe(false);
+  });
+
+  // ── Settlement type: SPX/NDX have no share-assignment risk at all ─────────
+
+  it('a cash-settled 0DTE position (SPX/NDX) is exempt even past the deadline', () => {
+    const r = evaluateForcedClose({
+      position: { expiryDate: '2026-08-30', isOpen: true, settlementType: 'cash' },
+      todayCT: '2026-08-30', minuteOfDayCT: 14 * 60 + 40, schedule: DEFAULT_FORCED_CLOSE,
+    });
+    expect(r.mustClose).toBe(false);
+    expect(r.urgency).toBe('none');
+    expect(r.reason).toMatch(/cash-settled/i);
+  });
+
+  it('a physically-settled 0DTE position (SPY/single-stock) is NOT exempt at the same time', () => {
+    // Same clock, same expiry, only settlementType differs — isolates the
+    // exemption to the one thing that should control it.
+    const r = evaluateForcedClose({
+      position: { expiryDate: '2026-08-30', isOpen: true, settlementType: 'physical' },
+      todayCT: '2026-08-30', minuteOfDayCT: 14 * 60 + 40, schedule: DEFAULT_FORCED_CLOSE,
+    });
+    expect(r.mustClose).toBe(true);
+    expect(r.urgency).toBe('immediate');
+  });
+
+  it('fails toward protection on an unrecognised settlementType, never toward skipping the check', () => {
+    const r = evaluateForcedClose({
+      // @ts-expect-error — deliberately malformed to prove the runtime guard,
+      // not just the type, is what protects a real caller from a bad value.
+      position: { expiryDate: '2026-08-30', isOpen: true, settlementType: 'unknown' },
+      todayCT: '2026-08-30', minuteOfDayCT: 14 * 60 + 40, schedule: DEFAULT_FORCED_CLOSE,
+    });
+    expect(r.mustClose).toBe(true);
   });
 
   it('is a pure function of state — a restart mid-session changes nothing', () => {
@@ -238,7 +271,7 @@ describe('evaluateForcedClose — outranks everything, survives a restart', () =
 
   it('closes on an unparseable expiry rather than assuming it is safe', () => {
     const r = evaluateForcedClose({
-      position: { expiryDate: 'not-a-date', isOpen: true }, todayCT: '2026-08-30',
+      position: { expiryDate: 'not-a-date', isOpen: true, settlementType: 'physical' }, todayCT: '2026-08-30',
       minuteOfDayCT: 10 * 60, schedule: DEFAULT_FORCED_CLOSE,
     });
     expect(r.mustClose).toBe(true);
@@ -254,7 +287,7 @@ describe('evaluateForcedClose — outranks everything, survives a restart', () =
 
   it('ignores closed positions', () => {
     const r = evaluateForcedClose({
-      position: { expiryDate: '2026-08-30', isOpen: false }, todayCT: '2026-08-30',
+      position: { expiryDate: '2026-08-30', isOpen: false, settlementType: 'physical' }, todayCT: '2026-08-30',
       minuteOfDayCT: 15 * 60 + 50, schedule: DEFAULT_FORCED_CLOSE,
     });
     expect(r.mustClose).toBe(false);

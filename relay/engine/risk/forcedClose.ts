@@ -3,10 +3,20 @@
  *
  * ── Why this is not optional ──────────────────────────────────────────────
  *
- * OCC auto-exercises any option that finishes $0.01 in the money. A forgotten
+ * OCC auto-exercises any option that finishes $0.01 in the money. Verified
+ * against OCC's 2008 rule change filing, SEC documentation, and multiple CBOE
+ * regulatory circulars, 2026-08-31 — real, multiply-sourced. A forgotten
  * $1.00 SPY call closing ITM becomes an obligation to buy 100 shares — roughly
  * $65,000 — on an account that may hold $1,000. The risk being managed here is
  * NOT "giving back a winner". It is an assignment the account cannot fund.
+ *
+ * ASSUMPTION, not independently confirmed: $0.01 is OCC's baseline
+ * "ex-by-exception" threshold, but several sources note a member firm may set
+ * a different threshold for its own customers. Webull's specific threshold has
+ * not been confirmed. Building the deadline around the OCC baseline is the
+ * right default — it is the more conservative (lower) of the two plausible
+ * values — but this should be verified against Webull's actual exercise
+ * policy before this module governs a real account.
  *
  * That is why this outranks conviction, the trailing stop, partial-profit
  * state and the daily limits. The case where you least want to close is
@@ -23,6 +33,29 @@
  * Railway runs UTC, the market runs Central, and this is a DST-sensitive
  * wall-clock deadline that `new Date().getHours()` would get wrong for half
  * the year.
+ *
+ * ── Cash-settled index options are exempt, and this is a fact, not a policy call ──
+ *
+ * The entire rationale above is share assignment: OCC auto-exercises an ITM
+ * option and PHYSICALLY-settled names (every single-stock option, and SPY/QQQ/
+ * IWM, which are ETF shares) hand out or demand real shares. SPX and NDX are
+ * CASH-settled index options — exercise credits or debits a dollar amount,
+ * never shares. There is no assignment to prevent on them, so applying this
+ * rule there would not be "more cautious" — it would exit a position for a
+ * risk that is structurally absent from the product, on the same un-overridable
+ * footing as a real assignment threat.
+ *
+ * `settlementType` is therefore a required INPUT, not something this module
+ * looks up — importing engine/state/directionState.ts's CASH_SETTLED_TICKERS
+ * here would pull in the store layer (barsStore, marketStore, cvdStore,
+ * confluenceEngine) transitively, destroying the zero-dependency purity that
+ * makes this function trivially testable. The caller decides, the same way
+ * sizePosition takes `delta` as an input rather than fetching it. Prefer the
+ * broker's own instrument data when available — Webull's sandbox
+ * /openapi/instrument/option/contracts response carries a real
+ * `settlement_method: "PHYSICAL"` field per contract, confirmed live
+ * 2026-08-31 — and fall back to CASH_SETTLED_TICKERS only when that field is
+ * absent.
  */
 
 export type ForcedCloseUrgency =
@@ -40,11 +73,22 @@ export interface ForcedCloseSchedule {
   immediateAfterMin: number;
 }
 
+export type SettlementType = 'physical' | 'cash';
+
 export interface PositionExpiry {
   /** Contract expiry date, YYYY-MM-DD. */
   expiryDate: string;
   /** Whether the position is currently open. */
   isOpen: boolean;
+  /**
+   * 'physical' (every single-stock option, SPY/QQQ/IWM) carries real
+   * assignment risk and is what this whole module exists to protect against.
+   * 'cash' (SPX, NDX) settles in dollars — there are no shares to be
+   * assigned, so the deadline below does not apply to it at all. Required,
+   * not optional: an unset settlement type must not silently default to the
+   * side that skips protection.
+   */
+  settlementType: SettlementType;
 }
 
 export interface ForcedCloseResult {
@@ -77,6 +121,14 @@ export function evaluateForcedClose(args: {
 
   if (!position || position.isOpen !== true) {
     return none('position is not open');
+  }
+  // Cash-settled index options (SPX, NDX) have no assignment to prevent —
+  // exercise settles in dollars, never shares. Anything other than the
+  // literal string 'cash' is treated as physically-settled, deliberately:
+  // a missing, malformed, or unrecognised settlementType must fail toward
+  // the protective behaviour, never toward silently skipping the check.
+  if (position.settlementType === 'cash') {
+    return none('cash-settled index option — no share assignment risk, forced-close rule does not apply');
   }
   if (typeof position.expiryDate !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(position.expiryDate)) {
     // An unparseable expiry cannot be cleared as safe. Treat it as due: the
