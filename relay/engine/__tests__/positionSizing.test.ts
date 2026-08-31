@@ -78,7 +78,10 @@ describe('sizePosition — zero cases (must never round up to 1)', () => {
     // The single most important assertion in this file: rounding this to 1
     // would turn a 2% risk into an 80%+ risk on a small account.
     expect(r.contracts).not.toBe(1);
-    expect(['budget-below-one-contract', 'equity-below-options-viable']).toContain(r.reason);
+    // $100 equity: capital cap $20, flexed $30, contract costs $200 -> capital
+    // cannot fund one either. Which limit reports first is less important than
+    // the count being 0.
+    expect(['budget-below-one-contract', 'equity-below-options-viable', 'capped-by-capital']).toContain(r.reason);
   });
 
   it('returns 0 below minimum equity, with a distinct reason', () => {
@@ -224,5 +227,160 @@ describe('affordablePremiumBand — inverting the question', () => {
   it('refuses on unusable equity rather than returning a band', () => {
     expect(affordablePremiumBand({ equity: NaN, riskPct: 0.02, maxPremiumLossPct: 0.5, caps }).reason)
       .toBe('equity-unavailable');
+  });
+});
+
+// ── Capital cap ──────────────────────────────────────────────────────────────
+// Fixtures below are REAL contracts pulled from a captured Massive options
+// snapshot (132,823 quoted contracts in the session HAR), not invented numbers.
+//   $0.35  O:AAPL261016P00245000  bid 0.32 / ask 0.38  delta -0.0206  OI 5152
+//   $0.45  O:AMZN270115P00150000  bid 0.42 / ask 0.48  delta -0.0156  OI 11989
+//   $1.30  O:NFLX260911C00082000  bid 1.28 / ask 1.32  delta  0.4067  OI 1279
+
+import {
+  BASE_CAPITAL_CAP_PCT,
+  MAX_FLEXED_CAPITAL_CAP_PCT,
+  CAPITAL_CAP_EQUITY_THRESHOLD,
+} from '../risk/positionSizing.ts';
+
+describe('capital cap — riskBudget bounds loss, but a contract costs full premium', () => {
+  const smallCaps: SizingCaps = {
+    maxContractsPerPosition: 50,
+    maxPositionPctOfEquity: 1.0,   // let the capital cap be the binding one
+    minEquityToTrade: 100,
+  };
+  const small = {
+    equity: 300,
+    riskPct: 0.02,
+    maxPremiumLossPct: 0.50,
+    stopDistance: 5.00,
+    caps: smallCaps,
+  };
+
+  it('the $300 / $0.35 case: capital affords exactly 1 contract', () => {
+    // capital cap = 300 * 0.20 = $60 ; contract cost = $35 -> 1
+    const r = sizePosition({ ...small, premium: 0.35, delta: -0.0206 });
+    expect(r.capitalCapActive).toBe(true);
+    expect(r.capitalCap).toBeCloseTo(60, 6);
+    expect(r.contractsFromCapital).toBe(1);
+    expect(r.contracts).toBe(1);
+  });
+
+  it('the $300 / $0.45 case: capital affords exactly 1 contract', () => {
+    // $60 cap / $45 cost -> 1
+    const r = sizePosition({ ...small, premium: 0.45, delta: -0.0156 });
+    expect(r.contractsFromCapital).toBe(1);
+    expect(r.contracts).toBe(1);
+    expect(r.reason).toBe('capital-governed-risk-exceeded');
+  });
+
+  it('the $300 / $1.30 case: $130 exceeds even the flexed $90 ceiling -> 0', () => {
+    // base cap $60, flexed ceiling 300*0.30 = $90, contract costs $130.
+    const r = sizePosition({ ...small, premium: 1.30, delta: 0.4067 });
+    expect(r.contracts).toBe(0);
+    expect(r.reason).toBe('capped-by-capital');
+    expect(r.capitalFlexed).toBe(false);
+  });
+
+  it('flexes toward 30% ONLY to afford a single contract', () => {
+    // $300 equity, $0.70 contract = $70. Base cap $60 affords 0; flexed $90
+    // affords 1.
+    const r = sizePosition({ ...small, premium: 0.70, delta: 0.10 });
+    expect(r.capitalFlexed).toBe(true);
+    expect(r.contracts).toBe(1);
+    // risk returns 0 at this equity, so the capital-governed reason wins over
+    // the flex reason — both are true, and risk-exceeded is the more important
+    // one to surface.
+    expect(r.reason).toBe('capital-governed-risk-exceeded');
+    expect(r.capitalCap).toBeCloseTo(90, 6);
+  });
+
+  it('flexing never buys a SECOND contract — it is affordability, not leverage', () => {
+    // $1000 equity, $0.25 contract = $25. Base cap $200 already affords 8, so
+    // no flex occurs; and the flex path can only ever yield exactly 1.
+    const r = sizePosition({ ...small, equity: 1000, premium: 0.25, delta: 0.10 });
+    expect(r.capitalFlexed).toBe(false);
+    expect(r.capitalCap).toBeCloseTo(200, 6);
+  });
+
+  it('final count is min(capital, risk) — risk can still bind below capital', () => {
+    // $1500 equity: capital cap $300 -> 8 contracts of a $0.35 contract.
+    // Risk: budget $30, premium bound = 0.35*100*0.5 = $17.50 -> 1 contract.
+    const r = sizePosition({ ...small, equity: 1500, premium: 0.35, delta: -0.0206 });
+    expect(r.contractsFromCapital).toBe(8);
+    expect(r.contractsFromRisk).toBe(2);
+    expect(r.contracts).toBe(2);
+    expect(r.reason).toBe('capped-by-risk');
+  });
+
+  it('the arithmetic that started this: floor(16.50 / 17.50) === 0', () => {
+    // $825 equity at 2% = $16.50 budget; a $0.35 contract's premium bound is
+    // $17.50. Risk alone permits nothing — which is exactly why the capital
+    // cap exists as a separate stage rather than the risk budget flexing.
+    const r = sizePosition({ ...small, equity: 825, premium: 0.35, delta: -0.0206 });
+    expect(r.riskBudget).toBeCloseTo(16.50, 6);
+    // With the REAL AAPL delta of -0.0206 the delta bound ($10.30) is tighter
+    // than the premium bound ($17.50) — the hand-worked example assumed the
+    // premium bound. floor(16.50/10.30) is still 1, not 0.
+    expect(r.riskPerContract).toBeCloseTo(10.30, 6);
+    expect(r.contractsFromRisk).toBe(1);
+    // Capital cap is active at $825, so the trade proceeds at 1 contract.
+    // The original hand-worked claim (0 contracts) came from assuming the
+    // premium bound; the real delta makes the risk bound tighter, not looser.
+    expect(r.contracts).toBe(1);
+  });
+});
+
+describe('capital cap — crossover at the named threshold', () => {
+  const caps2: SizingCaps = {
+    maxContractsPerPosition: 999,
+    maxPositionPctOfEquity: 1.0,
+    minEquityToTrade: 100,
+  };
+  const at = (equity: number) => sizePosition({
+    equity, riskPct: 0.02, premium: 0.35, maxPremiumLossPct: 0.50,
+    stopDistance: 5.00, delta: -0.0206, caps: caps2,
+  });
+
+  it('is active just below the threshold and inactive at it', () => {
+    expect(at(CAPITAL_CAP_EQUITY_THRESHOLD - 1).capitalCapActive).toBe(true);
+    expect(at(CAPITAL_CAP_EQUITY_THRESHOLD).capitalCapActive).toBe(false);
+    expect(at(CAPITAL_CAP_EQUITY_THRESHOLD + 1).capitalCapActive).toBe(false);
+  });
+
+  it('above the threshold, capital no longer constrains — risk alone decides', () => {
+    const r = at(10_000);
+    expect(r.capitalCapActive).toBe(false);
+    expect(r.contractsFromCapital).toBe(Number.POSITIVE_INFINITY);
+    // 20% of $10,000 would be $2,000 into one 0DTE trade — the accommodation
+    // must not survive past the point where it is needed.
+    expect(r.contracts).toBe(r.contractsFromRisk);
+  });
+
+  it('the constants are the documented values', () => {
+    expect(BASE_CAPITAL_CAP_PCT).toBe(0.20);
+    expect(MAX_FLEXED_CAPITAL_CAP_PCT).toBe(0.30);
+    expect(CAPITAL_CAP_EQUITY_THRESHOLD).toBe(2_000);
+  });
+});
+
+describe('capital cap — the 4-loss survival table that justifies 20%', () => {
+  // Guards the constant against being quietly retuned upward. If someone
+  // raises BASE_CAPITAL_CAP_PCT toward 0.50, these numbers move and this
+  // fails, forcing them to confront the ruin math in the module header.
+  const survive = (cap: number, losses: number) => Math.pow(1 - cap, losses);
+
+  it.each([
+    [0.50, 2, 0.25],
+    [0.30, 2, 0.49],
+    [0.20, 2, 0.64],
+    [0.20, 4, 0.4096],
+  ])('cap %d after %d total losses leaves %d of the account', (cap, n, expected) => {
+    expect(survive(cap as number, n as number)).toBeCloseTo(expected as number, 4);
+  });
+
+  it('two consecutive total losses leave a recoverable account at the chosen cap', () => {
+    const remaining = survive(BASE_CAPITAL_CAP_PCT, 2);
+    expect(remaining).toBeGreaterThan(0.60);   // 50% cap would leave 0.25
   });
 });

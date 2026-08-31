@@ -43,11 +43,63 @@ export type SizingReason =
   | 'capped-by-max-contracts'
   | 'capped-by-pct-of-equity'
   | 'capped-by-liquidity'
+  | 'capped-by-capital'
+  | 'capped-by-risk'
+  | 'capital-flexed-for-quality-floor'
+  | 'capital-governed-risk-exceeded'
   | 'invalid-inputs'
   | 'equity-unavailable';
 
 /** US equity options: 100 shares per contract. */
 export const CONTRACT_MULTIPLIER = 100;
+
+// ── Capital cap (small accounts) ─────────────────────────────────────────────
+//
+// riskBudget bounds the acceptable LOSS. A contract costs the full PREMIUM.
+// Those are different numbers, and on a small account the gap decides whether
+// anything is tradeable at all: at $300 equity and 2% risk the budget is $6,
+// while the cheapest quality-passing contract costs $35. Risk-based sizing
+// alone returns 0 forever — not because the trade is bad, but because the
+// wrong question is being asked.
+//
+// So capital and risk are separated. Capital answers "how many can I buy",
+// risk answers "how many should I hold", and the result is the min().
+//
+// ── Why 20%, and why it must not drift upward ──────────────────────────────
+//
+// A long option going to zero is a routine 0DTE outcome, not a tail event.
+// Account remaining after N consecutive total losses, by capital cap:
+//
+//   cap/trade │ 1 loss │ 2 losses │ 3 losses │ 4 losses
+//   ──────────┼────────┼──────────┼──────────┼──────────
+//      50%    │  50%   │   25%    │   12%    │    6%
+//      30%    │  70%   │   49%    │   34%    │   24%
+//      20%    │  80%   │   64%    │   51%    │   41%
+//      15%    │  85%   │   72%    │   61%    │   52%
+//
+// Two losses in a row is ordinary variance. At 50% that leaves a quarter of
+// the account; at 20% it leaves 64% — painful and fully recoverable. 20% is
+// the point where the "can't afford anything" problem is solved without
+// taking on ruin risk. Anyone raising this toward 50% should have to read
+// this table first.
+export const BASE_CAPITAL_CAP_PCT = 0.20;
+
+/**
+ * The cap may stretch to here, and ONLY to afford a single contract that has
+ * already passed the quality gate. It never buys a second contract.
+ */
+export const MAX_FLEXED_CAPITAL_CAP_PCT = 0.30;
+
+/**
+ * Equity above which the capital cap stops applying entirely.
+ *
+ * The cap is an accommodation for accounts too small for risk-based sizing to
+ * clear the contract-price floor. Above roughly this level, 2% risk already
+ * affords quality contracts on its own, and continuing to allow 20% of equity
+ * into one position would be indefensible — 20% of $10,000 is $2,000 in a
+ * single 0DTE trade. Named rather than implicit so the crossover is visible.
+ */
+export const CAPITAL_CAP_EQUITY_THRESHOLD = 2_000;
 
 export interface SizingCaps {
   /** Absolute ceiling on contracts, regardless of what the formula says. */
@@ -88,13 +140,23 @@ export interface SizingResult {
   contracts: number;
   reason: SizingReason;
   /** Which cap bound the result, when a cap was the binding constraint. */
-  appliedCap: 'none' | 'max-contracts' | 'pct-of-equity' | 'liquidity';
+  appliedCap: 'none' | 'max-contracts' | 'pct-of-equity' | 'liquidity' | 'capital';
   /** Dollars of equity this trade is permitted to risk. */
   riskBudget: number;
   /** Modelled dollar loss per contract if stopped out. */
   riskPerContract: number;
   /** Which bound was tighter — useful for understanding a surprising size. */
   bindingRisk: 'premium' | 'delta' | 'premium-only-no-delta' | 'none';
+  /** Dollars of capital this position may consume. 0 when the cap is inactive. */
+  capitalCap: number;
+  /** Contracts affordable from capital alone. Infinity when the cap is inactive. */
+  contractsFromCapital: number;
+  /** Contracts permitted by the risk formula alone. */
+  contractsFromRisk: number;
+  /** True when the cap stretched past BASE to afford one quality contract. */
+  capitalFlexed: boolean;
+  /** False above CAPITAL_CAP_EQUITY_THRESHOLD — pure risk sizing applies. */
+  capitalCapActive: boolean;
 }
 
 function _fail(reason: SizingReason): SizingResult {
@@ -105,6 +167,11 @@ function _fail(reason: SizingReason): SizingResult {
     riskBudget: 0,
     riskPerContract: 0,
     bindingRisk: 'none',
+    capitalCap: 0,
+    contractsFromCapital: 0,
+    contractsFromRisk: 0,
+    capitalFlexed: false,
+    capitalCapActive: false,
   };
 }
 
@@ -165,32 +232,113 @@ export function sizePosition(input: SizingInput): SizingResult {
   // stopDistance of 0, or a delta of 0, walks straight into.
   if (!Number.isFinite(riskPerContract) || riskPerContract <= 0) return _fail('invalid-inputs');
 
-  // ── Raw size. floor, never round — rounding up over-risks by construction.
-  const rawContracts = Math.floor(riskBudget / riskPerContract);
+  // ── Stage 1: risk. How many SHOULD be held?
+  // floor, never round — rounding up over-risks by construction.
+  const contractsFromRisk = Math.floor(riskBudget / riskPerContract);
 
-  if (rawContracts < 1) {
-    // Distinguish "this account cannot trade options at all at this risk
-    // level" from "this particular contract is too expensive for the budget".
-    // Both yield 0, but they mean different things and need different fixes.
-    const cheapestViableRisk = premium * CONTRACT_MULTIPLIER * maxPremiumLossPct;
-    return {
-      ..._fail(riskBudget < cheapestViableRisk && equity < caps.minEquityToTrade * 2
-        ? 'equity-below-options-viable'
-        : 'budget-below-one-contract'),
-      riskBudget,
-      riskPerContract,
-      bindingRisk,
-    };
+  // ── Stage 2: capital. How many can actually be BOUGHT?
+  // Only applies while the account is small enough to need the accommodation.
+  const contractCost = premium * CONTRACT_MULTIPLIER;
+  const capitalCapActive = equity < CAPITAL_CAP_EQUITY_THRESHOLD;
+
+  let capitalCap = 0;
+  let contractsFromCapital = Number.POSITIVE_INFINITY;
+  let capitalFlexed = false;
+
+  if (capitalCapActive) {
+    capitalCap = equity * BASE_CAPITAL_CAP_PCT;
+    contractsFromCapital = Math.floor(capitalCap / contractCost);
+
+    // Flex toward the ceiling ONLY to afford a single contract. Flexing to buy
+    // a second would convert an affordability accommodation into leverage.
+    //
+    // Deliberately NOT conditional on contractsFromRisk >= 1: on a small
+    // account the risk stage routinely returns 0 (see the reconciliation note
+    // below), and gating the flex on it would make the flex unreachable in
+    // exactly the situation it exists for.
+    if (contractsFromCapital < 1) {
+      const flexedCap = equity * MAX_FLEXED_CAPITAL_CAP_PCT;
+      if (flexedCap >= contractCost) {
+        capitalCap = flexedCap;
+        contractsFromCapital = 1;
+        capitalFlexed = true;
+      }
+    }
+  }
+
+  const partial = { riskBudget, riskPerContract, bindingRisk, capitalCap, contractsFromCapital, contractsFromRisk, capitalCapActive, capitalFlexed };
+
+  if (contractsFromCapital < 1) {
+    // Cannot fund one contract even at the flexed ceiling. When the capital
+    // cap is inactive this is Infinity, so this only fires on small accounts.
+    return { ..._fail('capped-by-capital'), ...partial };
+  }
+
+  // ── Reconciling the two stages.
+  //
+  // On a small account these disagree in a way that has to be decided, not
+  // averaged. At $300 equity and 2% risk the budget is $6, while a real
+  // $0.35 contract (AAPL 245P, delta -0.021, from a captured chain) has a
+  // risk-per-contract of $10.30. Risk says 0. Capital says 1.
+  //
+  // Deferring to risk means never trading a small account — the problem the
+  // capital cap exists to solve. So while the cap is active, the CAPITAL CAP
+  // IS the risk control: max loss on a long option is the premium paid, which
+  // is exactly the capital deployed, so a 20% capital cap is a 20% worst-case
+  // loss cap. That is precisely what the survival table in the header prices,
+  // and why the cap is bounded at 20% rather than 50%.
+  //
+  // The consequence is explicit and must not be hidden: per-trade risk on a
+  // small account is governed by the capital cap (up to 20%), NOT by riskPct
+  // (2%). It is reported as its own reason code so this never looks like
+  // ordinary 2% sizing in a log.
+  //
+  // Above the threshold the cap is inactive, riskPct governs alone, and this
+  // branch cannot be reached.
+  let rawContracts: number;
+  let riskExceeded = false;
+
+  if (contractsFromRisk < 1) {
+    if (!capitalCapActive) {
+      // Large account: risk genuinely forbids it. No capital accommodation.
+      return {
+        ..._fail(equity < caps.minEquityToTrade * 2
+          ? 'equity-below-options-viable'
+          : 'budget-below-one-contract'),
+        ...partial,
+      };
+    }
+    // Small account: take the single contract capital can fund.
+    rawContracts = 1;
+    riskExceeded = true;
+  } else {
+    rawContracts = Math.min(contractsFromRisk, contractsFromCapital);
   }
 
   // ── Hard caps, applied AFTER the formula and independently of it. These are
   // the circuit breaker for the case where the formula itself is wrong.
   let contracts = rawContracts;
   let appliedCap: SizingResult['appliedCap'] = 'none';
+
+  // Which stage bound the result.
+  //
+  // The capital-vs-risk distinction is only meaningful while the capital cap
+  // is ACTIVE. Above the threshold contractsFromCapital is Infinity, so risk
+  // is trivially the tighter bound — reporting 'capped-by-risk' there would
+  // imply a constraint was hit when this is simply ordinary sizing.
   let reason: SizingReason = 'ok';
+  if (capitalCapActive) {
+    if (riskExceeded) reason = 'capital-governed-risk-exceeded';
+    else if (capitalFlexed) reason = 'capital-flexed-for-quality-floor';
+    else if (contractsFromCapital < contractsFromRisk) reason = 'capped-by-capital';
+    else if (contractsFromRisk < contractsFromCapital) reason = 'capped-by-risk';
+    if (contractsFromCapital <= contractsFromRisk) appliedCap = 'capital';
+  }
 
   // Notional cap: a wide stop can pass the risk check while consuming most of
   // the account in premium. Risk and capital-at-stake are different questions.
+  // While the capital cap is active it is the tighter of the two by design, so
+  // this mainly binds on larger accounts.
   const maxByNotional = Math.floor(
     (equity * caps.maxPositionPctOfEquity) / (premium * CONTRACT_MULTIPLIER),
   );
@@ -214,10 +362,10 @@ export function sizePosition(input: SizingInput): SizingResult {
   }
 
   if (contracts < 1) {
-    return { ..._fail('budget-below-one-contract'), riskBudget, riskPerContract, bindingRisk };
+    return { ..._fail('budget-below-one-contract'), ...partial };
   }
 
-  return { contracts, reason, appliedCap, riskBudget, riskPerContract, bindingRisk };
+  return { contracts, reason, appliedCap, ...partial };
 }
 
 // ── Affordable premium band ──────────────────────────────────────────────────
