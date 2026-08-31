@@ -24,6 +24,8 @@ import {
   sizePosition,
   affordablePremiumBand,
   CONTRACT_MULTIPLIER,
+  CAPITAL_CAP_EQUITY_THRESHOLD,
+  MAX_FLEXED_CAPITAL_CAP_PCT,
 } from '../risk/positionSizing.ts';
 import { assessContractQuality } from '../risk/contractQuality.ts';
 import { checkExposure } from '../risk/exposure.ts';
@@ -45,7 +47,7 @@ const TIERS = {
   breakevenAt: 0.30, trailTier1At: 0.80, trailTier1Pct: 0.25,
   trailTier2At: 1.50, trailTier2Pct: 0.20, initialStopLossPct: 0.50,
 };
-const DAILY = { maxDailyLossPct: 0.06, winSoftTargetPct: 0.05, winHardTargetPct: 0.10, elevatedConvictionMin: 80 };
+const DAILY = { maxDailyLossPct: 0.06 };
 const RISK_PCT = 0.02;
 const MAX_PREMIUM_LOSS = 0.50;
 const STOP_DISTANCE = 5.00;
@@ -166,7 +168,27 @@ for (const startEquity of [300, 500, 1000, 2000, 3000]) {
   let dayPnl = 0;
 
   for (const [i, scenario] of SCENARIOS.entries()) {
-    const contract = REAL_CONTRACTS[i === 0 ? 0 : 3];   // cheap first, expensive second
+    // Selection happens INSIDE the affordable band, which is the whole point
+    // of computing the band before choosing a contract. Recomputed each trade
+    // against CURRENT equity, so a win widens the band for the next setup —
+    // that is the compounding mechanism, visible rather than asserted.
+    const liveBand = affordablePremiumBand({
+      equity, riskPct: RISK_PCT, maxPremiumLossPct: MAX_PREMIUM_LOSS, caps: CAPS,
+    });
+    // The selection ceiling differs by regime, and getting this wrong is a
+    // real failure mode the harness caught: below the capital-cap threshold
+    // affordability governs (a contract simply has to be fundable), but ABOVE
+    // it the capital cap is inactive and the RISK band governs instead.
+    // Selecting on capital above the threshold picks contracts that risk-based
+    // sizing then rejects, and every trade skips.
+    const ceiling = equity < CAPITAL_CAP_EQUITY_THRESHOLD
+      ? equity * MAX_FLEXED_CAPITAL_CAP_PCT          // flexed capital cap
+      : liveBand.maxPremium * CONTRACT_MULTIPLIER;   // risk band
+    const affordable = REAL_CONTRACTS
+      .filter((c) => c.ask * CONTRACT_MULTIPLIER <= ceiling)
+      .sort((a, b) => b.ask - a.ask);      // richest the account can actually fund
+
+    const contract = affordable[0] ?? REAL_CONTRACTS[0];
     const res = runOneTrade({ equity, contract, scenario, dayPnl });
 
     console.log(`  [${scenario.name}] ${contract.label} ask $${contract.ask.toFixed(2)}`);

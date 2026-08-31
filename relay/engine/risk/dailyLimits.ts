@@ -1,19 +1,49 @@
 /**
- * Daily circuit breakers — loss AND win side.
+ * Daily circuit breaker — loss side only, deliberately.
  *
- * The loss breaker is obvious: stop before a bad day compounds into a
- * catastrophic one.
+ * ── Why a loss stop exists ────────────────────────────────────────────────
  *
- * The win breaker is the one people leave out, and it protects against a real
- * and specific failure: after a strong day, the temptation is to keep trading
- * on a smaller edge, and giving back a +5% day is both financially and
- * behaviourally worse than stopping at +5%. It is deliberately the mirror
- * image of the loss rule rather than an afterthought.
+ * Losses compound against an account faster than equal-sized wins compound
+ * for it. Recovery required, by drawdown:
  *
- * The win side has two stages because "stop entirely" is too blunt at the
- * first threshold — a genuinely excellent setup after a good morning is still
- * worth taking. Raising the conviction bar keeps that possible while
- * filtering everything marginal.
+ *     10% loss  ->  11% gain to recover
+ *     20% loss  ->  25% gain
+ *     30% loss  ->  43% gain
+ *     50% loss  -> 100% gain
+ *
+ * That asymmetry is real and quantifiable, and it is what justifies halting a
+ * day that has gone badly: each further loss makes the hole disproportionately
+ * harder to climb out of.
+ *
+ * ── Why there is NO win-side cap ──────────────────────────────────────────
+ *
+ * There was one, and it was a design bug — removed deliberately, so it should
+ * not be reintroduced without reading this.
+ *
+ * A daily win target is real advice for a human trader. It defends against the
+ * house-money effect: sizing up after a win because the gains feel like the
+ * market's money rather than your own. That is a PSYCHOLOGICAL failure mode.
+ *
+ * This system has no psychology. Position size is fixed by the capital cap and
+ * the risk formula on every single trade, computed from current equity and the
+ * contract in front of it — never from how the day has gone. It is structurally
+ * incapable of getting overconfident and sizing up after a win. Importing a
+ * human safeguard into code that cannot exhibit the behaviour it guards against
+ * added no protection and actively defeated compounding: a win raises equity,
+ * which raises the capital cap, which sizes the next trade larger. That IS the
+ * compounding mechanism, and halting on it caps the thing the system exists to
+ * do.
+ *
+ * There is no win-side equivalent of the recovery asymmetry above. A win simply
+ * raises the base.
+ *
+ * ── What actually does the protective work ────────────────────────────────
+ *
+ * All of it is P&L-independent and applies identically whether the day is up
+ * or down: the exposure caps (70% deployed / 10% aggregate risk / position
+ * count), the contract-quality gate, the conviction threshold, and the
+ * per-trade capital cap. Those are the real brakes. The win cap sat on top of
+ * them and contributed nothing.
  *
  * Pure: takes starting equity and realised day P&L, returns what is allowed.
  * No clock read — the caller supplies the day boundary, so this is
@@ -23,28 +53,18 @@
 
 export type TradingAllowed =
   | 'normal'              // trade as usual
-  | 'elevated-bar'        // only higher-conviction entries
   | 'halted-daily-loss'   // no new entries — loss limit hit
-  | 'halted-daily-win'    // no new entries — win target hit
   | 'unknown';            // inputs unusable; treat as halted
 
 export interface DailyLimitConfig {
   /** Realised loss, as a fraction of starting equity, that halts (e.g. 0.06). */
   maxDailyLossPct: number;
-  /** Gain fraction at which the conviction bar rises (e.g. 0.05). */
-  winSoftTargetPct: number;
-  /** Gain fraction at which new entries stop entirely (e.g. 0.10). */
-  winHardTargetPct: number;
-  /** Conviction score required while in 'elevated-bar'. */
-  elevatedConvictionMin: number;
 }
 
 export interface DailyLimitResult {
   status: TradingAllowed;
   /** True only when a new entry may be opened at all. */
   canOpenNewPosition: boolean;
-  /** Minimum conviction for a new entry; null when none may open. */
-  requiredConviction: number | null;
   dayPnlPct: number;
   reason: string;
 }
@@ -53,7 +73,8 @@ export interface DailyLimitResult {
  * Existing positions are NEVER force-closed by this function. A daily limit
  * governs whether new risk may be TAKEN; exiting an open position is the
  * trailing stop's and the forced-close scheduler's job. Conflating the two
- * would liquidate a winning runner because the day's target was reached.
+ * would liquidate a winning runner because the day's loss limit was reached
+ * on a different position.
  */
 export function evaluateDailyLimits(args: {
   startingEquity: number;
@@ -65,7 +86,6 @@ export function evaluateDailyLimits(args: {
   const unusable = (reason: string): DailyLimitResult => ({
     status: 'unknown',
     canOpenNewPosition: false,     // fail closed
-    requiredConviction: null,
     dayPnlPct: 0,
     reason,
   });
@@ -76,48 +96,30 @@ export function evaluateDailyLimits(args: {
   if (!Number.isFinite(currentDayPnl)) {
     return unusable('day P&L unavailable — refusing new entries rather than assuming zero');
   }
-  if (!Number.isFinite(config.maxDailyLossPct) || config.maxDailyLossPct <= 0) return unusable('invalid maxDailyLossPct');
-  if (!Number.isFinite(config.winSoftTargetPct) || config.winSoftTargetPct <= 0) return unusable('invalid winSoftTargetPct');
-  if (!Number.isFinite(config.winHardTargetPct) || config.winHardTargetPct <= 0) return unusable('invalid winHardTargetPct');
+  if (!Number.isFinite(config.maxDailyLossPct) || config.maxDailyLossPct <= 0) {
+    return unusable('invalid maxDailyLossPct');
+  }
 
   const dayPnlPct = currentDayPnl / startingEquity;
 
-  // Loss side first: it outranks every other state.
   if (dayPnlPct <= -Math.abs(config.maxDailyLossPct)) {
     return {
       status: 'halted-daily-loss',
       canOpenNewPosition: false,
-      requiredConviction: null,
       dayPnlPct,
       reason: `daily loss limit reached (${(dayPnlPct * 100).toFixed(2)}% <= -${(config.maxDailyLossPct * 100).toFixed(2)}%)`,
     };
   }
 
-  if (dayPnlPct >= config.winHardTargetPct) {
-    return {
-      status: 'halted-daily-win',
-      canOpenNewPosition: false,
-      requiredConviction: null,
-      dayPnlPct,
-      reason: `daily win target reached (${(dayPnlPct * 100).toFixed(2)}% >= ${(config.winHardTargetPct * 100).toFixed(2)}%) — protecting the day`,
-    };
-  }
-
-  if (dayPnlPct >= config.winSoftTargetPct) {
-    return {
-      status: 'elevated-bar',
-      canOpenNewPosition: true,
-      requiredConviction: config.elevatedConvictionMin,
-      dayPnlPct,
-      reason: `up ${(dayPnlPct * 100).toFixed(2)}% — only conviction >= ${config.elevatedConvictionMin} accepted`,
-    };
-  }
-
+  // Everything else — including a very large winning day — is normal. A
+  // qualifying signal is taken regardless of running P&L, gated only by the
+  // P&L-independent controls listed in the module header.
   return {
     status: 'normal',
     canOpenNewPosition: true,
-    requiredConviction: null,
     dayPnlPct,
-    reason: 'within daily limits',
+    reason: dayPnlPct > 0
+      ? `up ${(dayPnlPct * 100).toFixed(2)}% — no win-side cap by design; compounding continues`
+      : 'within daily limits',
   };
 }

@@ -148,19 +148,13 @@ describe('checkExposure — the portfolio check the sizer cannot make', () => {
 
 // ── Daily limits ─────────────────────────────────────────────────────────────
 
-const dl: DailyLimitConfig = {
-  maxDailyLossPct: 0.06,
-  winSoftTargetPct: 0.05,
-  winHardTargetPct: 0.10,
-  elevatedConvictionMin: 80,
-};
+const dl: DailyLimitConfig = { maxDailyLossPct: 0.06 };
 
-describe('evaluateDailyLimits — loss and win are mirror images', () => {
+describe('evaluateDailyLimits — loss stop only, no win cap', () => {
   it('is normal inside the band', () => {
     const r = evaluateDailyLimits({ startingEquity: 10_000, currentDayPnl: 100, config: dl });
     expect(r.status).toBe('normal');
     expect(r.canOpenNewPosition).toBe(true);
-    expect(r.requiredConviction).toBeNull();
   });
 
   it('halts at the daily loss limit', () => {
@@ -169,25 +163,32 @@ describe('evaluateDailyLimits — loss and win are mirror images', () => {
     expect(r.canOpenNewPosition).toBe(false);
   });
 
-  it('raises the bar at the soft win target rather than stopping', () => {
-    const r = evaluateDailyLimits({ startingEquity: 10_000, currentDayPnl: 500, config: dl });
-    expect(r.status).toBe('elevated-bar');
-    expect(r.canOpenNewPosition).toBe(true);
-    expect(r.requiredConviction).toBe(80);
+  it.each([0.05, 0.10, 0.50, 2.00])(
+    'a +%d fraction winning day does NOT halt — there is no win cap by design',
+    (gain) => {
+      const r = evaluateDailyLimits({
+        startingEquity: 10_000, currentDayPnl: 10_000 * (gain as number), config: dl,
+      });
+      expect(r.status).toBe('normal');
+      expect(r.canOpenNewPosition).toBe(true);
+    },
+  );
+
+  it('a large win does not raise any conviction bar — sizing is P&L-independent', () => {
+    const flat = evaluateDailyLimits({ startingEquity: 10_000, currentDayPnl: 0, config: dl });
+    const up   = evaluateDailyLimits({ startingEquity: 10_000, currentDayPnl: 5_000, config: dl });
+    // Same permission in both states: the only thing that changes is equity,
+    // which the capital cap scales against automatically.
+    expect(up.canOpenNewPosition).toBe(flat.canOpenNewPosition);
+    expect(up.status).toBe(flat.status);
   });
 
-  it('stops entirely at the hard win target', () => {
-    const r = evaluateDailyLimits({ startingEquity: 10_000, currentDayPnl: 1_000, config: dl });
-    expect(r.status).toBe('halted-daily-win');
-    expect(r.canOpenNewPosition).toBe(false);
-  });
-
-  it('loss outranks win when config would allow both readings', () => {
-    const r = evaluateDailyLimits({
-      startingEquity: 10_000, currentDayPnl: -600,
-      config: { ...dl, winSoftTargetPct: 0.001, winHardTargetPct: 0.002 },
-    });
-    expect(r.status).toBe('halted-daily-loss');
+  it('the recovery asymmetry that justifies the loss stop', () => {
+    // A loss needs a larger gain to recover. No win-side equivalent exists.
+    const recover = (loss: number) => (1 / (1 - loss)) - 1;
+    expect(recover(0.10)).toBeCloseTo(0.1111, 4);
+    expect(recover(0.20)).toBeCloseTo(0.25, 4);
+    expect(recover(0.50)).toBeCloseTo(1.00, 4);
   });
 
   it.each([
