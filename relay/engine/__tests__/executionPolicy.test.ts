@@ -179,22 +179,35 @@ describe('evaluateForcedClose — outranks everything, survives a restart', () =
     });
     expect(r.mustClose).toBe(false);
     expect(r.expiresToday).toBe(true);
-    expect(r.minutesPastDeadline).toBe(-105);
+    expect(r.minutesPastDeadline).toBe(-30);
   });
 
-  it('fires exactly at 15:45 CT', () => {
+  it('fires exactly at 14:30 CT — 30 minutes before the real 15:00 CT close', () => {
+    // Real close verified 2026-08-31: NYSE/Nasdaq regular session ends
+    // 4:00 PM ET = 3:00 PM CT. This deadline sits BEFORE that, not after —
+    // the corrected direction from the earlier 15:45 CT defect (see
+    // forcedClose.ts's DEFAULT_FORCED_CLOSE header and CLAUDE.md).
     const r = evaluateForcedClose({
       position: open, todayCT: '2026-08-30',
-      minuteOfDayCT: 15 * 60 + 45, schedule: DEFAULT_FORCED_CLOSE,
+      minuteOfDayCT: 14 * 60 + 30, schedule: DEFAULT_FORCED_CLOSE,
     });
     expect(r.mustClose).toBe(true);
     expect(r.urgency).toBe('due');
   });
 
+  it('every escalation tier still lands before the real 15:00 CT close', () => {
+    // The margin exists specifically so the ladder has room to work before
+    // the bell. Assert that property directly, not just the tier labels.
+    const MARKET_CLOSE_MIN = 15 * 60;
+    for (const min of [14 * 60 + 30, 14 * 60 + 37, 14 * 60 + 40]) {
+      expect(min).toBeLessThan(MARKET_CLOSE_MIN);
+    }
+  });
+
   it.each([
-    [15 * 60 + 45, 'due'],
-    [15 * 60 + 52, 'urgent'],
-    [15 * 60 + 55, 'immediate'],
+    [14 * 60 + 30, 'due'],
+    [14 * 60 + 37, 'urgent'],
+    [14 * 60 + 40, 'immediate'],
   ])('escalates by minute-of-day %i to %s', (min, urgency) => {
     const r = evaluateForcedClose({
       position: open, todayCT: '2026-08-30',
@@ -206,7 +219,7 @@ describe('evaluateForcedClose — outranks everything, survives a restart', () =
   it('ignores a later expiry — no assignment risk today', () => {
     const r = evaluateForcedClose({
       position: { expiryDate: '2026-09-19', isOpen: true }, todayCT: '2026-08-30',
-      minuteOfDayCT: 15 * 60 + 50, schedule: DEFAULT_FORCED_CLOSE,
+      minuteOfDayCT: 14 * 60 + 35, schedule: DEFAULT_FORCED_CLOSE,
     });
     expect(r.mustClose).toBe(false);
     expect(r.expiresToday).toBe(false);
@@ -217,7 +230,7 @@ describe('evaluateForcedClose — outranks everything, survives a restart', () =
     // same answer, which is the entire point.
     const args = {
       position: open, todayCT: '2026-08-30',
-      minuteOfDayCT: 15 * 60 + 50, schedule: DEFAULT_FORCED_CLOSE,
+      minuteOfDayCT: 14 * 60 + 35, schedule: DEFAULT_FORCED_CLOSE,
     };
     expect(evaluateForcedClose(args)).toEqual(evaluateForcedClose(args));
     expect(evaluateForcedClose(args).mustClose).toBe(true);

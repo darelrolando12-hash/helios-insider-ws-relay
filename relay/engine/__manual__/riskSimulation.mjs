@@ -238,7 +238,13 @@ function runHardStopBypass({ entryPrice, currentPrice, peak }) {
 
 function runForcedCloseSequence({ entryPrice, peakPrice }) {
   const log = [];
-  const clockSteps = [15 * 60 + 30, 15 * 60 + 44, 15 * 60 + 45, 15 * 60 + 52, 15 * 60 + 55];
+  // Real close verified 2026-08-31: NYSE/Nasdaq regular session ends
+  // 4:00 PM ET = 3:00 PM CT (15:00 CT). DEFAULT_FORCED_CLOSE fires at 14:30
+  // CT — 30 minutes BEFORE that close, giving the ladder real room to work.
+  // An earlier version of this harness (and of the constant it reads)
+  // scripted 15:45, which is 45 minutes AFTER the market shuts — the defect
+  // documented in forcedClose.ts and CLAUDE.md.
+  const clockSteps = [14 * 60 + 15, 14 * 60 + 29, 14 * 60 + 30, 14 * 60 + 37, 14 * 60 + 40];
   const gainPct = ((peakPrice - entryPrice) / entryPrice) * 100;
   log.push(`  position unrealised gain: +${gainPct.toFixed(0)}% (peak $${peakPrice.toFixed(2)} vs entry $${entryPrice.toFixed(2)})`);
   let closedAt = null;
@@ -327,7 +333,7 @@ for (const startEquity of [300, 500, 1000, 2000, 3000]) {
   dStopHit.log.forEach((l) => console.log('     ' + l));
 
   // ── E: 0DTE forced close, un-overridable by a large unrealised gain
-  console.log(`  [E: 0DTE forced close at 15:45 CT]`);
+  console.log(`  [E: 0DTE forced close at 14:30 CT — 30min before the real 15:00 CT close]`);
   const eContract = pickContract(equity);
   const eEntry = eContract.ask;
   const ePeak = +(eEntry * 2.20).toFixed(4);   // +120% unrealised — a real reason to want to hold
@@ -340,7 +346,7 @@ for (const startEquity of [300, 500, 1000, 2000, 3000]) {
     });
     if (sized.contracts >= 1) {
       const pnl = sized.contracts * (ePeak - eEntry) * CONTRACT_MULTIPLIER;
-      console.log(`      forced-closed ${sized.contracts}x @ $${ePeak.toFixed(2)} at ${forced.closedAt.minute === 15*60+45 ? '15:45' : 'escalated'} CT`);
+      console.log(`      forced-closed ${sized.contracts}x @ $${ePeak.toFixed(2)} at ${forced.closedAt.minute === 14*60+30 ? '14:30' : 'escalated'} CT`);
       equity += pnl; dayPnl += pnl;
       console.log(`      P&L $${pnl >= 0 ? '+' : ''}${pnl.toFixed(2)} -> equity $${equity.toFixed(2)}`);
     }

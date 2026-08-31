@@ -17,7 +17,7 @@
  * A setTimeout scheduled at position open dies with the process, and Railway
  * restarts on every deploy — the same lesson the CVD rebuild taught. So the
  * deadline lives on the POSITION and is re-evaluated on every tick against the
- * current time. A restart at 15:40 still closes at 15:45.
+ * current time. A restart at 14:25 CT still closes at 14:30 CT.
  *
  * Central Time is supplied by the caller via lib/time.ts, never computed here:
  * Railway runs UTC, the market runs Central, and this is a DST-sensitive
@@ -137,9 +137,37 @@ export function evaluateForcedClose(args: {
   };
 }
 
-/** 15:45 CT default, with escalation at +7 and +10 minutes. */
+/**
+ * SOURCE, VERIFIED — do not change this without re-verifying against the
+ * exchange, not against memory or a prior version of this comment.
+ *
+ *   NYSE/Nasdaq regular session close: 4:00 PM ET = 3:00 PM CT (15:00 CT).
+ *   Eastern and Central observe the same DST transitions, so the ET->CT
+ *   offset is a constant 1 hour year-round — this is not a DST edge case.
+ *   Verified 2026-08-31.
+ *
+ * The deadline below is 14:30 CT — 30 minutes BEFORE that close, not after
+ * it. An earlier version of this constant was 15:45 CT: 45 minutes AFTER
+ * the market had already shut, at which point there is no exchange left to
+ * submit an order to. That number was never checked against the real close
+ * time by anyone across four rounds of design, code, tests, and a
+ * simulation harness — all of which correctly verified the system did
+ * exactly what was specified. The specification was wrong at the source.
+ * See CLAUDE.md, "A wall-clock deadline is only as correct as its source."
+ *
+ * The 30-minute margin is deliberate, not arbitrary: it gives the
+ * escalating order ladder genuine room to work before the bell, and it
+ * keeps the urgency tiers below inside the session too — due at 14:30,
+ * urgent at 14:37, immediate at 14:40, all at least 20 minutes before the
+ * 15:00 close even in the worst case.
+ *
+ * NOT handled here: early closes (e.g. the day after Thanksgiving, 1:00 PM
+ * ET). This default is the regular-session schedule; a caller trading on a
+ * known early-close day must supply its own ForcedCloseSchedule rather than
+ * rely on this constant.
+ */
 export const DEFAULT_FORCED_CLOSE: ForcedCloseSchedule = {
-  closeAtMinuteCT: 15 * 60 + 45,
+  closeAtMinuteCT: 14 * 60 + 30,
   urgentAfterMin: 7,
   immediateAfterMin: 10,
 };

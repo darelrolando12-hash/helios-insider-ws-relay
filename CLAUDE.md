@@ -77,6 +77,14 @@ Had the fix been written from the documentation rather than from a captured fram
 
 Docs are a hypothesis. A captured frame is evidence.
 
+### A wall-clock deadline is only as correct as its source
+
+**Real example, 2026-08-31.** The forced-close deadline for same-day-expiry options was specified as **15:45 CT**. Real NYSE/Nasdaq close is **15:00 CT** (4:00 PM ET — Eastern and Central share DST transitions, so the offset is a constant 1 hour, not a DST edge case). 15:45 CT is 45 minutes *after* the market shuts, not before it — at that moment there is no exchange left to submit an order to, which defeats the entire purpose of the rule: preventing an unfunded ~$65,000 assignment from a forgotten ITM position.
+
+This was not a computation bug. `lib/time.ts`'s `America/Chicago` handling is correct and DST-aware, and it computed exactly the wrong number it was asked to compute. The 15:45 figure was simply never checked against the real close time — not by the person who specified it, not during code review, not by any of the tests written against it, not by the end-to-end simulation harness built specifically to catch integration bugs. All of those correctly verified that the system did exactly what was specified. **The specification was the bug, and nothing downstream of a spec can catch an error in the spec itself** — only re-deriving the number from its actual source can.
+
+**Every safety-critical wall-clock constant must cite its source directly in the code** — not "3pm-ish," but *"NYSE regular session close, 4:00 PM ET = 3:00 PM CT, verified 2026-08-31"* — so the next person (or the next model) can check the citation instead of inheriting the number on trust. See `DEFAULT_FORCED_CLOSE` in `relay/engine/risk/forcedClose.ts` for the corrected form.
+
 ---
 
 ## HARD ENVIRONMENT CONSTRAINTS
