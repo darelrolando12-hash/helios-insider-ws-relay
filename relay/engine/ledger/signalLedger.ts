@@ -32,7 +32,7 @@ import { getDirectionState, computeTradeType } from '../state/directionState.ts'
 import type { TradeType }              from '../state/directionState.ts';
 import { vixBucket }                   from '../ledger/brainStore.ts';
 import type { VixBucket }              from '../ledger/brainStore.ts';
-import type { Signal, SignalType }     from '../stores/types.ts';
+import type { Signal, SignalType, SourceEngine } from '../stores/types.ts';
 
 // ── Exported types ─────────────────────────────────────────────────────────────
 
@@ -75,6 +75,20 @@ export interface SignalFactors {
   };
   /** VIX bucket at signal-fire time, from the real I:VIX feed. */
   vixBucket:    VixBucket | null;
+  /**
+   * Which generator produced this signal — carried from Signal.sourceEngine.
+   *
+   * Stored inside `factors` rather than as a top-level column so no migration
+   * is needed, matching how luld/vixBucket/tradeType already live here. It is
+   * NOT part of the Brain fingerprint (ticker + direction + gexRegime +
+   * vixBucket + timeOfDay + tradeType), so adding it cannot re-bucket
+   * historical rows.
+   *
+   * `null` means unattributed — a row written before tagging existed. It must
+   * never be folded into one of the real generators, or the pooling problem
+   * this field exists to solve reappears inside the field itself.
+   */
+  sourceEngine: SourceEngine | null;
   /**
    * Trade type relative to session bias at signal-fire time.
    * NOTE: computed with priorDirection/priorResolvedAt = null/null — see
@@ -153,6 +167,12 @@ async function _onSignal(signal: Signal): Promise<void> {
   // wired anywhere yet (see TODO on computeTradeType in directionState.ts).
   const sessionBias = getDirectionState(signal.ticker)?.sessionBias ?? 'neutral';
   factors.tradeType = computeTradeType(direction, sessionBias, null, null);
+
+  // Carried straight from the emitting engine. `?? null` rather than a default
+  // generator: an untagged signal is unattributed, and guessing which engine
+  // produced it would silently corrupt the per-generator comparison this field
+  // exists to make possible.
+  factors.sourceEngine = signal.sourceEngine ?? null;
 
   const row = {
     id:          signal.id,
@@ -274,6 +294,11 @@ function _captureFactors(ticker: string): SignalFactors {
     vixBucket: vixBucketVal,
     // tradeType is filled in by _onSignal after direction is inferred.
     tradeType: null,
+    // sourceEngine is filled in by _onSignal from the emitting engine.
+    // Initialised here so the field is always present on the written row —
+    // an absent key and an explicit null are different things to a consumer
+    // querying factors->>'sourceEngine'.
+    sourceEngine: null,
   };
 }
 

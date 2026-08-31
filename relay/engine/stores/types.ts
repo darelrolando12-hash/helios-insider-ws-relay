@@ -293,7 +293,31 @@ export interface Signal {
    * touches catalyst scoring).
    */
   catalystDataQuality?: 'real' | 'absent';
+
+  /**
+   * Which generator produced this signal.
+   *
+   * Recorded at write time so paper results can be judged PER GENERATOR
+   * rather than pooled. Scanner, Swing and 0DTE are different strategies with
+   * different holding periods and different real win rates; pooling them
+   * produces a blended number that describes none of them and hides which one
+   * actually works. A generator that loses money can be masked indefinitely by
+   * one that makes it.
+   *
+   * Optional so historical rows written before this existed keep parsing —
+   * consumers must treat `undefined` as "unattributed", never silently fold it
+   * into one of the known buckets.
+   */
+  sourceEngine?: SourceEngine;
 }
+
+/**
+ * The signal generators. `dumpRip` is listed separately from `scanner`
+ * because it bypasses scoreConfluence entirely and fires off LULD events —
+ * its outcomes describe a different mechanism and must not be pooled with
+ * scored signals.
+ */
+export type SourceEngine = 'scanner' | 'swing' | 'zerodte' | 'dumpRip';
 
 export interface SignalOutcome {
   signalId: string;

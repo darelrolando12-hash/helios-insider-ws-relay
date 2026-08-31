@@ -237,6 +237,9 @@ function _scoreTicker(ticker: string) {
     firedAtCT:    barsResult.asOf,
     sources,
     catalystDataQuality,
+    // Tagged so paper results can be judged per generator rather than pooled
+    // with DUMP/RIP, which fires on an entirely different mechanism.
+    sourceEngine: 'scanner',
   });
 }
 
@@ -256,6 +259,9 @@ function _onDumpRip(event: DumpRipEvent) {
     firedAt:      event.detectedAt,
     firedAtCT:    event.detectedAt,
     sources:      ['dumpRipDetector', `luld:${event.luldEvent.type}`],
+    // Bypasses scoreConfluence entirely — these outcomes describe a different
+    // mechanism and must not be pooled with scored signals.
+    sourceEngine: 'dumpRip',
   });
 }
 

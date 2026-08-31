@@ -365,3 +365,32 @@ describe('EngineBus — malformed timestamps (production RangeError, 2026-08-28)
     spy.mockRestore();
   });
 });
+
+describe('sourceEngine tagging — per-generator attribution', () => {
+  it('confluenceEngine tags scored signals as scanner and DUMP/RIP as dumpRip', async () => {
+    const src = await import('node:fs').then((fs) =>
+      fs.readFileSync(new URL('../engines/confluenceEngine.ts', import.meta.url), 'utf8'));
+    // Both emit sites must be tagged. An untagged emitter would write
+    // unattributed rows and silently re-pool the generators.
+    expect(src).toContain("sourceEngine: 'scanner'");
+    expect(src).toContain("sourceEngine: 'dumpRip'");
+    expect((src.match(/sourceEngine:/g) || []).length).toBe(2);
+  });
+
+  it('signalLedger carries it through without inventing a default', async () => {
+    const src = await import('node:fs').then((fs) =>
+      fs.readFileSync(new URL('../ledger/signalLedger.ts', import.meta.url), 'utf8'));
+    // `?? null`, never `?? 'scanner'` — guessing the generator would corrupt
+    // exactly the comparison this field exists to enable.
+    expect(src).toContain('factors.sourceEngine = signal.sourceEngine ?? null');
+    expect(src).not.toMatch(/sourceEngine\s*\?\?\s*'(scanner|swing|zerodte|dumpRip)'/);
+  });
+
+  it('the factors blob always carries the key, even when unattributed', async () => {
+    const src = await import('node:fs').then((fs) =>
+      fs.readFileSync(new URL('../ledger/signalLedger.ts', import.meta.url), 'utf8'));
+    // An absent key and an explicit null are different to a consumer querying
+    // factors->>'sourceEngine'.
+    expect(src).toContain('sourceEngine: null');
+  });
+});
