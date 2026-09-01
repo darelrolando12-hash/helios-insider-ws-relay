@@ -187,6 +187,16 @@ const MIN_DAYS_OUT_DEFAULT = 14; // avoid 0DTE/weekly noise unless --expiry over
   const right = (args.right ?? 'CALL').toUpperCase();
   const wantExpiry = typeof args.expiry === 'string' ? args.expiry : null;
   const wantStrike = args.strike != null && args.strike !== true ? Number(args.strike) : null;
+  // Every real attempt so far was a marketable LIMIT — order type itself was
+  // never isolated as a variable. --order-type MARKET tests whether the
+  // sandbox's matching engine crosses market orders when it hasn't crossed
+  // marketable limits. This is a paper account: a market order costs nothing
+  // to test here, unlike in production where it would be a live-risk decision.
+  const orderType = (args['order-type'] ?? 'LIMIT').toUpperCase();
+  if (orderType !== 'LIMIT' && orderType !== 'MARKET') {
+    console.error(`Unknown --order-type "${orderType}" — must be LIMIT or MARKET.`);
+    process.exit(1);
+  }
 
   console.log(`endpoint: ${sandboxBaseUrl()}  (PaperTrade — production host is unreachable from this file)`);
 
@@ -375,14 +385,16 @@ const MIN_DAYS_OUT_DEFAULT = 14; // avoid 0DTE/weekly noise unless --expiry over
 
   // Marketable BUY limit: priced at the ask, so it should fill immediately if
   // the sandbox models a real book. Where it actually fills is the answer.
-  const limitPrice = ask.toFixed(2);
+  // A MARKET order carries no limit_price at all — Webull's schema has no
+  // "market" price field, the field is simply absent for this order_type.
+  const limitPrice = orderType === 'LIMIT' ? ask.toFixed(2) : null;
   const clientOrderId = crypto.randomUUID().replace(/-/g, '');
   const newOrders = [{
     client_order_id: clientOrderId,
     combo_type: 'NORMAL',
-    order_type: 'LIMIT',
+    order_type: orderType,
     quantity: '1',
-    limit_price: limitPrice,
+    ...(limitPrice != null ? { limit_price: limitPrice } : {}),
     option_strategy: 'SINGLE',
     side: 'BUY',
     time_in_force: 'DAY',
@@ -446,7 +458,7 @@ const MIN_DAYS_OUT_DEFAULT = 14; // avoid 0DTE/weekly noise unless --expiry over
     if (status && /FILLED|CANCEL|REJECT|FAILED/i.test(String(status))) {
       const avg = Number(o?.avg_filled_price ?? o?.avg_fill_price ?? NaN);
       console.log('\n=== RESULT ===');
-      console.log(`submitted limit : ${limitPrice} (at ask)`);
+      console.log(`order type      : ${orderType}${limitPrice != null ? ` (limit ${limitPrice}, at ask)` : ''}`);
       console.log(`filled at       : ${avg}`);
       console.log(`bid/ask/last    : ${bid} / ${ask} / ${last}`);
       if (Number.isFinite(avg)) {
