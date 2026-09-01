@@ -454,18 +454,25 @@ const MIN_DAYS_OUT_DEFAULT = 14; // avoid 0DTE/weekly noise unless --expiry over
             : Array.isArray(det.body) ? det.body[0]
             : det.body;
     const status = o?.status ?? o?.order_status;
-    console.log(`poll ${i + 1}: status=${status} filled=${o?.filled_quantity ?? '?'} avg=${o?.avg_filled_price ?? o?.avg_fill_price ?? '?'}`);
+    // Real verified field is filled_price (a real fill, 2026-09-01) — the
+    // avg_filled_price/avg_fill_price names were never confirmed and were
+    // silently returning undefined on every fill until now.
+    console.log(`poll ${i + 1}: status=${status} filled=${o?.filled_quantity ?? '?'} price=${o?.filled_price ?? o?.avg_filled_price ?? o?.avg_fill_price ?? '?'}`);
     if (status && /FILLED|CANCEL|REJECT|FAILED/i.test(String(status))) {
-      const avg = Number(o?.avg_filled_price ?? o?.avg_fill_price ?? NaN);
+      const avg = Number(o?.filled_price ?? o?.avg_filled_price ?? o?.avg_fill_price ?? NaN);
+      const latencyMs = Number(o?.filled_time) && Number(o?.place_time)
+        ? Number(o.filled_time) - Number(o.place_time) : null;
       console.log('\n=== RESULT ===');
       console.log(`order type      : ${orderType}${limitPrice != null ? ` (limit ${limitPrice}, at ask)` : ''}`);
       console.log(`filled at       : ${avg}`);
       console.log(`bid/ask/last    : ${bid} / ${ask} / ${last}`);
+      if (latencyMs != null) console.log(`latency         : ${latencyMs}ms (place -> fill)`);
       if (Number.isFinite(avg)) {
         if (Math.abs(avg - ask) < 1e-6) console.log('-> filled AT THE ASK — consistent with a real marketable buy.');
         else if (Math.abs(avg - (bid + ask) / 2) < 1e-6) console.log('-> filled AT THE MID — simulator, NOT realistic. This is the outcome that invalidates the premise.');
         else if (Math.abs(avg - last) < 1e-6) console.log('-> filled AT LAST PRICE — matches consumer paperTrade rules, not a real book.');
-        else console.log('-> filled elsewhere; record and compare against the spread.');
+        else if (avg < bid || avg > ask) console.log(`-> filled OUTSIDE the live bid/ask entirely — the fill price does not track the quote fetched moments before submission.`);
+        else console.log('-> filled inside the spread but not at ask/mid/last; record and compare.');
       }
       break;
     }
