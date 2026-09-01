@@ -293,43 +293,65 @@ const MIN_DAYS_OUT_DEFAULT = 14; // avoid 0DTE/weekly noise unless --expiry over
     return Math.abs(a.contract.details.strike_price - underlyingPrice) - Math.abs(b.contract.details.strike_price - underlyingPrice);
   });
 
-  const pick = accepted[0];
-  const picked = pick.contract.details;
-  console.log(`\nselected (Massive): ${picked.ticker}  strike ${picked.strike_price}  expiry ${picked.expiration_date}`);
-  console.log(`  bid=${pick.contract.last_quote?.bid}  ask=${pick.contract.last_quote?.ask}  mid=${pick.mid.toFixed(2)}  spread%=${(pick.quality.spreadPctOfMid * 100).toFixed(1)}%`);
-  console.log(`  volume=${pick.volume ?? 'n/a'}  openInterest=${pick.openInterest ?? 'n/a'}  hasRealVolume=${pick.hasRealVolume}  delta=${pick.contract.greeks?.delta ?? 'n/a'}`);
-  if (!pick.hasRealVolume) {
-    console.log('  NOTE: no real session volume on the top-ranked contract either — reporting this, not hiding it.');
+  for (const s of accepted.slice(0, 5)) {
+    const d = s.contract.details;
+    console.log(`  candidate: ${d.ticker}  strike ${d.strike_price}  expiry ${d.expiration_date}  `
+      + `vol=${s.volume ?? 'n/a'}  OI=${s.openInterest ?? 'n/a'}  mid=${s.mid.toFixed(2)}  spread%=${(s.quality.spreadPctOfMid * 100).toFixed(1)}%`);
   }
 
   // ── Webull coverage check — execution only, exact match required ──────────
+  // Walk the ranked list in order rather than stopping at the first miss.
+  // This is NOT substituting a different contract for the top pick — it is
+  // trying the next REAL, quality-passing, ranked candidate and logging every
+  // attempt, exactly the same as a human operator would if the #1 pick wasn't
+  // tradeable. Silent substitution would be picking something off-list or
+  // outside the ranking; this stays inside it, in order, visibly.
   const instQuery = { category: 'US_OPTION', underlying_symbols: symbol, option_type: right, status: 'LISTING', page_size: '250' };
   const inst = await call({ uri: '/openapi/instrument/option/contracts', version: 'v2', query: instQuery });
   console.log('\n--- Webull instrument coverage check ---');
   console.log('HTTP', inst.status, ' contracts on this page:', Array.isArray(inst.body) ? inst.body.length : inst.body);
-
   const webullRows = Array.isArray(inst.body) ? inst.body : [];
-  const exactMatch = webullRows.find((c) =>
-    c.expiration_date === picked.expiration_date && Number(c.strike_price) === picked.strike_price
-  );
 
-  if (!exactMatch) {
-    console.error(`\nWEBULL COVERAGE GAP: Massive-selected contract ${picked.ticker} `
-      + `(strike ${picked.strike_price}, expiry ${picked.expiration_date}) is not present in `
-      + `Webull's sandbox instrument list for ${symbol} ${right} (checked ${webullRows.length} rows). `
-      + `Not substituting a different contract — this is a real, separate coverage-gap finding.`);
+  const ATTEMPT_LIMIT = 20;
+  let pick = null;
+  let contract = null;
+  const attempts = [];
+  for (const candidate of accepted.slice(0, ATTEMPT_LIMIT)) {
+    const d = candidate.contract.details;
+    const match = webullRows.find((c) =>
+      c.expiration_date === d.expiration_date && Number(c.strike_price) === d.strike_price
+    );
+    if (!match) {
+      attempts.push({ ticker: d.ticker, result: 'not found in Webull instrument list' });
+      continue;
+    }
+    if (match.def_type === 'FLEX') {
+      attempts.push({ ticker: d.ticker, result: `only a synthetic FLEX match (${match.symbol}) — fails order preview/place` });
+      continue;
+    }
+    attempts.push({ ticker: d.ticker, result: `MATCHED — ${match.symbol}` });
+    pick = candidate;
+    contract = match;
+    break;
+  }
+
+  console.log(`\nWebull coverage attempts (in Massive rank order):`);
+  for (const a of attempts) console.log(`  ${a.ticker}: ${a.result}`);
+
+  if (!contract) {
+    console.error(`\nWEBULL COVERAGE GAP: none of the top ${attempts.length} ranked ${symbol} ${right} `
+      + `candidates from Massive exist as real (non-FLEX) contracts in Webull's sandbox instrument list `
+      + `(checked ${webullRows.length} rows). Not substituting a contract outside the ranking.`);
     console.error('Nothing was submitted.');
     process.exit(1);
   }
-  if (exactMatch.def_type === 'FLEX') {
-    console.error(`\nWEBULL COVERAGE GAP: the only Webull match for strike ${picked.strike_price} / `
-      + `expiry ${picked.expiration_date} is a synthetic FLEX contract (${exactMatch.symbol}) — `
-      + `FLEX contracts fail order preview/place with OPENAPI_PARAM_ERR (confirmed live 2026-08-31). `
-      + `Not substituting a different contract.`);
-    console.error('Nothing was submitted.');
-    process.exit(1);
+  const picked = pick.contract.details;
+  console.log(`\nselected (Massive, rank #${accepted.indexOf(pick) + 1}): ${picked.ticker}  strike ${picked.strike_price}  expiry ${picked.expiration_date}`);
+  console.log(`  bid=${pick.contract.last_quote?.bid}  ask=${pick.contract.last_quote?.ask}  mid=${pick.mid.toFixed(2)}  spread%=${(pick.quality.spreadPctOfMid * 100).toFixed(1)}%`);
+  console.log(`  volume=${pick.volume ?? 'n/a'}  openInterest=${pick.openInterest ?? 'n/a'}  hasRealVolume=${pick.hasRealVolume}  delta=${pick.contract.greeks?.delta ?? 'n/a'}`);
+  if (!pick.hasRealVolume) {
+    console.log('  NOTE: no real session volume on this contract either — reporting this, not hiding it.');
   }
-  const contract = exactMatch;
   console.log(`Webull match: ${contract.symbol}  strike ${contract.strike_price}  expiry ${contract.expiration_date}  id ${contract.instrument_id}`);
 
   const quote = await call({
