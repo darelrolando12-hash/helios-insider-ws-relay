@@ -19,12 +19,6 @@
  * explicit deprecation notice pointing at the current one. The signing
  * algorithm (HMAC-SHA1, canonical-string construction) is byte-identical
  * between the two repos — only the URIs, versions, and body shapes moved.
- * Verified against the live sandbox before this file was updated:
- *   /openapi/assets/balance                 -> 200, real balance
- *   /openapi/instrument/option/contracts    -> 200, real contracts
- *   /openapi/trade/option/order/preview     -> 200, {"estimated_cost":"50",...}
- * The preview call exercised the exact order body and category-header logic
- * used below, with zero side effects, before this file ever submits for real.
  *
  * NOTE: the current repo's signature composer contains a line that
  * unconditionally overrides the signer to SHA-256
@@ -37,16 +31,44 @@
  * enforces that override, every call in this file starts failing signature
  * verification, and the fix is to switch the algorithm/header to SHA-256.
  *
+ * ── Contract selection comes from Massive, not Webull (2026-09-01) ────────
+ * A prior version of this file asked Webull's own
+ * /openapi/instrument/option/contracts for a contract to trade. That endpoint
+ * is not a real chain: near-dated real (non-FLEX) contracts are frequently
+ * absent, and where present, checked live across six underlyings
+ * (SPY/AAPL/QQQ/TSLA/MSFT/NVDA), every available near-dated strike was deep
+ * ITM (delta >= 0.975) — the strike ladder simply doesn't reach current
+ * price. A naive pick from that list landed on QQQ260918C00615000, volume=3
+ * for the entire session against 6,726 open interest — dead by construction,
+ * not a meaningful fill-realism test.
+ *
+ * Discovery now happens against Massive's real, complete, live chain
+ * (engine/lib/massive/api.ts, direct REST, already used in production),
+ * filtered through the same risk modules a real trade would clear —
+ * contractQuality.ts (spread, liquidity) and positionSizing.ts's
+ * affordablePremiumBand() (what premium this account can actually afford).
+ * Webull is used for EXECUTION ONLY: once Massive names a real, liquid,
+ * near-the-money contract, this file looks that EXACT strike+expiry up in
+ * Webull's instrument list and submits it. If Webull doesn't carry that
+ * specific contract, that is reported as its own coverage-gap finding —
+ * never silently swapped for a different one.
+ *
  * ── Safety ────────────────────────────────────────────────────────────────
- * Every request routes through ../webullEndpoint.ts, so the production host is
- * unreachable: assertSandboxHost() runs on the base URL and again on the final
- * URL, and assertSafeToSubmit() re-checks the endpoint plus the account id
- * immediately before the order goes out. It also refuses to run unless
- * --i-understand-this-places-an-order is passed.
+ * Every Webull request routes through ../webullEndpoint.ts, so the production
+ * host is unreachable: assertSandboxHost() runs on the base URL and again on
+ * the final URL, and assertSafeToSubmit() re-checks the endpoint plus the
+ * account id immediately before the order goes out. It also refuses to run
+ * unless --i-understand-this-places-an-order is passed. Massive access is
+ * read-only (chain snapshot) — no orders are ever placed against Massive.
  *
  * ── Usage ─────────────────────────────────────────────────────────────────
- *   WEBULL_SANDBOX_APP_KEY=...  WEBULL_SANDBOX_APP_SECRET=... \
+ *   WEBULL_SANDBOX_APP_KEY=... WEBULL_SANDBOX_APP_SECRET=... MASSIVE_API_KEY=... \
  *   node fillTest.mjs --symbol SPY --right CALL --i-understand-this-places-an-order
+ *
+ * --strike/--expiry pin discovery to an exact contract instead of ranking the
+ * chain (still validated for a real quote and looked up in Webull the same
+ * way — this is an override of WHICH contract to pick, not a bypass of the
+ * Webull-coverage check).
  *
  * Add --dry-run to do everything up to and including PREVIEW (no side
  * effects) and stop before the real submission. Run that first, always.
@@ -57,6 +79,10 @@ import {
   assertSandboxHost,
   assertSafeToSubmit,
 } from '../webullEndpoint.ts';
+import { MassiveRestClient } from '../../lib/massive/api.ts';
+import { MASSIVE_REST_BASE_URL, MASSIVE_API_KEY } from '../../../config.ts';
+import { assessContractQuality } from '../../risk/contractQuality.ts';
+import { affordablePremiumBand } from '../../risk/positionSizing.ts';
 
 const APP_KEY = process.env.WEBULL_SANDBOX_APP_KEY;
 const APP_SECRET = process.env.WEBULL_SANDBOX_APP_SECRET;
@@ -72,6 +98,10 @@ const DRY = args['dry-run'] === true;
 
 if (!APP_KEY || !APP_SECRET) {
   console.error('Missing WEBULL_SANDBOX_APP_KEY / WEBULL_SANDBOX_APP_SECRET.');
+  process.exit(1);
+}
+if (!MASSIVE_API_KEY) {
+  console.error('Missing MASSIVE_API_KEY — contract discovery requires real chain data.');
   process.exit(1);
 }
 if (!ARMED && !DRY) {
@@ -133,18 +163,34 @@ async function call({ uri, method = 'GET', version = 'v2', query = null, body = 
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// Reference risk parameters. No real production caller of affordablePremiumBand
+// exists yet server-side (grepped 2026-09-01, execution wiring is still pending
+// Gate 1) — these are the same values the module's own test suite treats as a
+// representative account, used here only to bound contract discovery, not as a
+// claim about this specific account's real risk settings.
+const REFERENCE_RISK_PCT = 0.02;
+const REFERENCE_MAX_PREMIUM_LOSS_PCT = 0.50;
+const REFERENCE_CAPS = {
+  maxContractsPerPosition: 50,
+  maxPositionPctOfEquity: 0.30,
+  minEquityToTrade: 100,
+};
+// Matches BestContractsCockpit's own spread criterion (src/cockpits/
+// BestContractsCockpit.tsx, SPREAD_MAX_PCT) — the only concrete spread
+// threshold that exists anywhere in this codebase.
+const MAX_SPREAD_PCT_OF_MID = 0.08;
+const MIN_DAYS_OUT_DEFAULT = 14; // avoid 0DTE/weekly noise unless --expiry overrides
+
 // ── Test ────────────────────────────────────────────────────────────────────
 (async () => {
   const symbol = args.symbol ?? 'SPY';
   const right = (args.right ?? 'CALL').toUpperCase();
-  // --expiry/--strike were previously parsed into `args` but never consulted
-  // by the contract-selection logic below — silently ignored, not honored.
   const wantExpiry = typeof args.expiry === 'string' ? args.expiry : null;
   const wantStrike = args.strike != null && args.strike !== true ? Number(args.strike) : null;
-  const minStrikeDays = 14;   // only applied when no explicit --expiry is given
 
   console.log(`endpoint: ${sandboxBaseUrl()}  (PaperTrade — production host is unreachable from this file)`);
 
+  // ── Real account, real equity (Webull) ─────────────────────────────────────
   const accounts = await call({ uri: '/openapi/account/list' });
   if (accounts.status !== 200 || !Array.isArray(accounts.body)) {
     console.error('account/list failed:', accounts.status, accounts.body); process.exit(1);
@@ -154,46 +200,143 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
             ?? accounts.body.find((a) => a.account_class === 'INDIVIDUAL_CASH');
   console.log(`account : ${acct.account_label} (${acct.account_id})`);
 
-  // ── Resolve a real, STANDARD (non-FLEX), near-dated contract ──────────────
-  // The contract list mixes ordinary listed options with synthetic multi-year
-  // FLEX contracts (def_type: "FLEX", symbol prefixed e.g. "2SPY..."). A FLEX
-  // pick fails order preview/place with OPENAPI_PARAM_ERR — confirmed live.
-  // The un-scoped 250-row page is an unstable sample, not a complete listing
-  // — confirmed live: the same query returned different expiry subsets on
-  // different calls. Passing expire_date server-side when known avoids
-  // relying on client-side filtering over whatever page happened to come back.
-  const instQuery = { category: 'US_OPTION', underlying_symbols: symbol, option_type: right, status: 'LISTING', page_size: '250' };
-  if (wantExpiry) instQuery.expire_date = wantExpiry;
-  const inst = await call({ uri: '/openapi/instrument/option/contracts', version: 'v2', query: instQuery });
-  console.log('\n--- instrument lookup ---');
-  console.log('HTTP', inst.status, ' contracts:', Array.isArray(inst.body) ? inst.body.length : inst.body);
-
-  const now = Date.now();
-  let candidates = Array.isArray(inst.body) ? inst.body.filter((c) => c.def_type !== 'FLEX') : [];
-  if (wantExpiry) candidates = candidates.filter((c) => c.expiration_date === wantExpiry);
-  if (wantStrike != null) candidates = candidates.filter((c) => Number(c.strike_price) === wantStrike);
-  // The minStrikeDays floor only makes sense as a default when the caller
-  // didn't name an exact expiry — an explicit --expiry is the caller's
-  // decision to make, not something this script should second-guess.
-  if (!wantExpiry) candidates = candidates.filter((c) => (new Date(c.expiration_date) - now) / 86_400_000 >= minStrikeDays);
-  const contract = candidates.sort((a, b) => new Date(a.expiration_date) - new Date(b.expiration_date))[0] ?? null;
-  if (!contract) {
-    console.error('\nCould not resolve a standard contract matching the given --symbol/--right' +
-      (wantExpiry ? `/--expiry ${wantExpiry}` : '') + (wantStrike != null ? `/--strike ${wantStrike}` : '') + '.');
-    console.error('Nothing was submitted. Available (non-FLEX) contracts:');
-    console.error(JSON.stringify(
-      (Array.isArray(inst.body) ? inst.body : []).filter((c) => c.def_type !== 'FLEX')
-        .map((c) => ({ strike: c.strike_price, expiry: c.expiration_date })).slice(0, 40)
-    ));
+  const balance = await call({ uri: '/openapi/assets/balance', query: { account_id: acct.account_id } });
+  const balRow = Array.isArray(balance.body) ? balance.body[0] : balance.body;
+  const equity = Number(balRow?.total_net_liquidation_value ?? balRow?.net_liq ?? balRow?.total_equity ?? NaN);
+  if (!Number.isFinite(equity) || equity <= 0) {
+    console.error('Could not read real equity from assets/balance — cannot compute an affordable premium band.');
+    console.error(JSON.stringify(balance.body).slice(0, 500));
     process.exit(1);
   }
-  console.log(`using contract: ${contract.symbol}  strike ${contract.strike_price}  expiry ${contract.expiration_date}  id ${contract.instrument_id}`);
+  console.log(`equity  : $${equity.toFixed(2)} (real, from assets/balance)`);
+
+  // ── Contract discovery — Massive's real chain, not Webull's instrument list ─
+  console.log(`\n--- Massive chain: ${symbol} ${right} ---`);
+  const massive = new MassiveRestClient(MASSIVE_REST_BASE_URL, MASSIVE_API_KEY);
+  // fetchOptionsSnapshot sorts nearest-expiry-first; a name like QQQ/SPY lists
+  // a same-day/weekly expiry for nearly every session, so 2000 (the module's
+  // own default) exhausts itself inside the first ~5 expiries and never
+  // reaches anything 14+ days out. Confirmed live: QQQ needed ~11,200
+  // contracts across 32 expiries to reach a 14-day-out one.
+  const snapshot = await massive.fetchOptionsSnapshot(symbol, 20000);
+  const wantType = right === 'CALL' ? 'call' : 'put';
+  const chain = snapshot.filter((c) => c.details?.contract_type === wantType);
+  console.log(`fetched ${snapshot.length} total contracts, ${chain.length} ${wantType}s`);
+
+  if (chain.length === 0) {
+    console.error(`\nMassive returned zero ${wantType} contracts for ${symbol} — nothing to select from.`);
+    console.error('Nothing was submitted.');
+    process.exit(1);
+  }
+
+  const underlyingPrice = chain.map((c) => c.underlying_asset?.price ?? c.underlying_asset?.value)
+    .find((v) => Number.isFinite(v)) ?? null;
+  console.log(`underlying price (Massive): ${underlyingPrice ?? 'unavailable'}`);
+
+  const band = affordablePremiumBand({
+    equity,
+    riskPct: REFERENCE_RISK_PCT,
+    maxPremiumLossPct: REFERENCE_MAX_PREMIUM_LOSS_PCT,
+    caps: REFERENCE_CAPS,
+  });
+  console.log(`affordable premium band: $${band.minPremium.toFixed(2)} - $${band.maxPremium.toFixed(2)} (tradeable=${band.tradeable}, reason=${band.reason})`);
+  if (!band.tradeable) {
+    console.error('\nAccount cannot afford any contract worth trading under the reference risk parameters.');
+    console.error('Nothing was submitted.');
+    process.exit(1);
+  }
+
+  const now = Date.now();
+  let pool = chain;
+  if (wantExpiry) {
+    pool = pool.filter((c) => c.details.expiration_date === wantExpiry);
+  } else {
+    pool = pool.filter((c) => (new Date(c.details.expiration_date) - now) / 86_400_000 >= MIN_DAYS_OUT_DEFAULT);
+  }
+  if (wantStrike != null) pool = pool.filter((c) => c.details.strike_price === wantStrike);
+
+  // Score every candidate through the same quality gate a real trade would
+  // clear, and record WHY each one was rejected — never silently drop rows.
+  const scored = pool.map((c) => {
+    const bid = c.last_quote?.bid;
+    const ask = c.last_quote?.ask;
+    const volume = c.day?.volume;
+    const openInterest = c.open_interest;
+    const quality = assessContractQuality(
+      { bid, ask, openInterest, volume },
+      { maxSpreadPctOfMid: MAX_SPREAD_PCT_OF_MID, minPremium: band.minPremium },
+    );
+    const mid = quality.mid;
+    const withinBand = quality.acceptable && mid <= band.maxPremium;
+    const hasRealVolume = Number.isFinite(volume) && volume > 0;
+    return { contract: c, quality, mid, withinBand, hasRealVolume, volume, openInterest };
+  });
+
+  const accepted = scored.filter((s) => s.withinBand);
+  console.log(`\n${pool.length} candidates in window, ${accepted.length} pass contractQuality + affordable band`);
+
+  if (accepted.length === 0) {
+    console.error('\nNo contract passed contractQuality/affordablePremiumBand. Rejection reasons seen:');
+    const reasonCounts = {};
+    for (const s of scored) reasonCounts[s.quality.reason] = (reasonCounts[s.quality.reason] ?? 0) + 1;
+    console.error(JSON.stringify(reasonCounts));
+    console.error('Nothing was submitted.');
+    process.exit(1);
+  }
+
+  // Prefer real traded volume first (the exact thing that made the last real
+  // run a dead test), then nearest-to-the-money as the tiebreak.
+  accepted.sort((a, b) => {
+    if (a.hasRealVolume !== b.hasRealVolume) return a.hasRealVolume ? -1 : 1;
+    if (b.volume !== a.volume && Number.isFinite(a.volume) && Number.isFinite(b.volume)) return b.volume - a.volume;
+    if (underlyingPrice == null) return 0;
+    return Math.abs(a.contract.details.strike_price - underlyingPrice) - Math.abs(b.contract.details.strike_price - underlyingPrice);
+  });
+
+  const pick = accepted[0];
+  const picked = pick.contract.details;
+  console.log(`\nselected (Massive): ${picked.ticker}  strike ${picked.strike_price}  expiry ${picked.expiration_date}`);
+  console.log(`  bid=${pick.contract.last_quote?.bid}  ask=${pick.contract.last_quote?.ask}  mid=${pick.mid.toFixed(2)}  spread%=${(pick.quality.spreadPctOfMid * 100).toFixed(1)}%`);
+  console.log(`  volume=${pick.volume ?? 'n/a'}  openInterest=${pick.openInterest ?? 'n/a'}  hasRealVolume=${pick.hasRealVolume}  delta=${pick.contract.greeks?.delta ?? 'n/a'}`);
+  if (!pick.hasRealVolume) {
+    console.log('  NOTE: no real session volume on the top-ranked contract either — reporting this, not hiding it.');
+  }
+
+  // ── Webull coverage check — execution only, exact match required ──────────
+  const instQuery = { category: 'US_OPTION', underlying_symbols: symbol, option_type: right, status: 'LISTING', page_size: '250' };
+  const inst = await call({ uri: '/openapi/instrument/option/contracts', version: 'v2', query: instQuery });
+  console.log('\n--- Webull instrument coverage check ---');
+  console.log('HTTP', inst.status, ' contracts on this page:', Array.isArray(inst.body) ? inst.body.length : inst.body);
+
+  const webullRows = Array.isArray(inst.body) ? inst.body : [];
+  const exactMatch = webullRows.find((c) =>
+    c.expiration_date === picked.expiration_date && Number(c.strike_price) === picked.strike_price
+  );
+
+  if (!exactMatch) {
+    console.error(`\nWEBULL COVERAGE GAP: Massive-selected contract ${picked.ticker} `
+      + `(strike ${picked.strike_price}, expiry ${picked.expiration_date}) is not present in `
+      + `Webull's sandbox instrument list for ${symbol} ${right} (checked ${webullRows.length} rows). `
+      + `Not substituting a different contract — this is a real, separate coverage-gap finding.`);
+    console.error('Nothing was submitted.');
+    process.exit(1);
+  }
+  if (exactMatch.def_type === 'FLEX') {
+    console.error(`\nWEBULL COVERAGE GAP: the only Webull match for strike ${picked.strike_price} / `
+      + `expiry ${picked.expiration_date} is a synthetic FLEX contract (${exactMatch.symbol}) — `
+      + `FLEX contracts fail order preview/place with OPENAPI_PARAM_ERR (confirmed live 2026-08-31). `
+      + `Not substituting a different contract.`);
+    console.error('Nothing was submitted.');
+    process.exit(1);
+  }
+  const contract = exactMatch;
+  console.log(`Webull match: ${contract.symbol}  strike ${contract.strike_price}  expiry ${contract.expiration_date}  id ${contract.instrument_id}`);
 
   const quote = await call({
     uri: '/openapi/market-data/option/snapshot', version: 'v2',
     query: { symbols: contract.symbol, category: 'US_OPTION' },
   });
-  console.log('\n--- pre-order quote ---');
+  console.log('\n--- pre-order quote (Webull) ---');
   console.log(JSON.stringify(quote.body, null, 2).slice(0, 1200));
 
   const q = Array.isArray(quote.body) ? quote.body[0] : quote.body;
@@ -201,7 +344,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   const ask = Number(q?.ask ?? q?.ask_price ?? q?.askPrice ?? NaN);
   const last = Number(q?.last ?? q?.close ?? q?.latest_price ?? NaN);
   if (!Number.isFinite(bid) || !Number.isFinite(ask)) {
-    console.error('\nNo usable bid/ask in the snapshot response — cannot pick a marketable price.');
+    console.error('\nNo usable bid/ask in the Webull snapshot response — cannot pick a marketable price.');
     console.error('Nothing was submitted. Response:', JSON.stringify(q).slice(0, 400));
     process.exit(1);
   }
