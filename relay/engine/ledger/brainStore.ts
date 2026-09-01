@@ -297,17 +297,43 @@ function _fingerprintKey(fp: SetupFingerprint): string {
 // ── Time-of-day bucketing ──────────────────────────────────────────────────────
 
 /**
- * Bucket a CT epoch ms into a trading session period.
+ * Bucket a signal's timestamp into a trading session period.
  *
- * open:    9:30–10:30 CT  (first hour — highest volatility, gap fills, catalysts)
- * midday: 10:30–14:00 CT  (digestion phase — lower volatility, range-bound)
- * close:  14:00–16:00 CT  (closing imbalance, MOC prints, option expiry pressure)
+ * WHAT THIS ACTUALLY DOES (corrected 2026-08-31 — the previous comment
+ * described boundaries the code does not implement):
+ *
+ *   open:   anything BEFORE 10:30 CT — there is NO lower bound
+ *   midday: 10:30 CT to before 14:00 CT
+ *   close:  14:00 CT onward — there is NO upper bound
+ *
+ * The old comment claimed "open: 9:30–10:30 CT" and "close: 14:00–16:00 CT".
+ * Both were wrong twice over: the real regular session is 8:30–15:00 CT
+ * (9:30–16:00 ET; see forcedClose.ts's DEFAULT_FORCED_CLOSE for the verified
+ * source), and the code has never had either outer bound anyway.
+ *
+ * KNOWN GAP, deliberately not fixed here: because 'open' has no lower bound,
+ * a genuinely pre-market timestamp would silently bucket as 'open'. That is
+ * currently unreachable for live signals — confluenceEngine gates on real
+ * market status — but replayTodaySession reads barsStore, which is not
+ * gated by market hours, so a backtest path could reach it. Adding a naive
+ * `>= 8:30 CT` lower bound would be WRONG: 3,426 of 29,294 real rows in the
+ * signals table carry entry_tct = 08:29 CT, one minute before the open,
+ * because entry_tct is the BAR START timestamp and the opening bar is
+ * labelled 08:29. Those are legitimate opening signals, not pre-market ones.
+ * Any lower bound must account for that convention.
+ *
+ * PARAMETER NAMING, verified against real data: despite the name `ctMs` and
+ * the column name `entry_tct`, the value passed here is a REAL UTC epoch
+ * (barsStore's `asOf`, which is the bar's `tUtc`). Confirmed by querying live
+ * rows: entry_tct and entry_utc differ by 0.0 hours. That makes the
+ * toCentralTime() call below correct — it expects UTC — but the names are
+ * actively misleading and should not be trusted over this note.
  */
 export function timeOfDayBucket(ctMs: number): TimeOfDayBucket {
   const { hour, minute } = toCentralTime(ctMs);
   const minutesSinceMidnight = hour * 60 + minute;
 
-  // 9:30 = 570, 10:30 = 630, 14:00 = 840, 16:00 = 960
+  // 10:30 = 630, 14:00 = 840.
   if (minutesSinceMidnight < 630)  return 'open';
   if (minutesSinceMidnight < 840)  return 'midday';
   return 'close';

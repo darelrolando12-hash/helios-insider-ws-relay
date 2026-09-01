@@ -85,6 +85,21 @@ This was not a computation bug. `lib/time.ts`'s `America/Chicago` handling is co
 
 **Every safety-critical wall-clock constant must cite its source directly in the code** — not "3pm-ish," but *"NYSE regular session close, 4:00 PM ET = 3:00 PM CT, verified 2026-08-31"* — so the next person (or the next model) can check the citation instead of inheriting the number on trust. See `DEFAULT_FORCED_CLOSE` in `relay/engine/risk/forcedClose.ts` for the corrected form.
 
+### A citation can be accurate and stale at the same time
+
+**Real example, 2026-08-31.** The PDT rule was verified by pulling a direct quote from FINRA Regulatory Notice 21-13: *"a customer who executes four or more day trades within five business days."* The quote is real, correctly transcribed, from a primary regulator source.
+
+**The rule it describes had already been eliminated.** The SEC approved FINRA's amendment to Rule 4210 on 2026-04-14, effective 2026-06-04 — scrapping the pattern-day-trader designation and the $25,000 minimum entirely, replacing them with an intraday margin standard. The verification was three months out of date at the moment it was performed, and nothing about the act of verifying would have revealed that.
+
+This is a **distinct failure mode** from an unverified fact. There, nobody checked. Here, someone checked, checked correctly, quoted accurately — and was still wrong, because the ground moved after the source was written and the source was never withdrawn.
+
+Two habits that catch it:
+
+- **Date the ground truth, not just the lookup.** Ask "when was this rule last amended?", not only "what does this document say?" A regulator notice from 2021 describes 2021.
+- **Prefer a source that would have to change.** A vendor's live API response, a broker's current policy page, or an account's actual returned state reflects today. A rule notice reflects its publication date forever.
+
+Corollary, from the same incident: **phase-in periods mean the regulation and the counterparty can disagree.** Firms have until 2027-10-20 to adopt the new framework, so "the rule changed" and "our broker changed" are separate facts needing separate evidence. Check the counterparty's own current behaviour — Webull's live `assets/balance` response returning `day_trades_left: "UNLIMITED"` on a sub-$25,000 margin account is stronger evidence than any documentation about what the rule is.
+
 ---
 
 ## HARD ENVIRONMENT CONSTRAINTS
@@ -169,6 +184,22 @@ Catalyst: insiderBuy 12 + materialEvent 8 + earningsPending 5, capped at 20
 **Swing / 0DTE** — 8 weighted criteria, 128/64/32/16/8/4/2/1 = 255 total
 
 Brain self-excludes cleanly when a fingerprint has no history. **Known open issue:** the fingerprint has ~8,280 buckets and needs n≥30 — roughly 17 years to fill. A hierarchical fallback ladder is designed but not built.
+
+---
+
+## KNOWN GAPS — tracked, not silent
+
+Real gaps that are understood and deliberately not yet fixed. A gap recorded only in a code comment is invisible; this is the visible list. None are urgent, all are real.
+
+**Market holidays are not handled anywhere.** Every schedule in the system is time-of-day only — `forcedClose.ts`, `cvdRebuild.ts`'s session open, and `lib/time.ts`'s busy window all assume any weekday is a trading day. Grepped 2026-08-31: there is no holiday calendar, and no day-of-week check outside `isFeedScheduleActive`, which documents its own weekend omission as UX-scoped. The system will assume the market is open on Thanksgiving, July 4th, and Christmas. Related: `DEFAULT_FORCED_CLOSE` is the *regular*-session schedule and does not know about early closes (1:00 PM ET, e.g. the day after Thanksgiving).
+
+**`timeOfDayBucket`'s `open` bucket has no lower bound.** Anything before 10:30 CT buckets as `'open'`, including a pre-market timestamp. Unreachable for live signals (confluenceEngine gates on real market status) but reachable via `replayTodaySession`, which reads `barsStore` un-gated. **A naive `>= 8:30 CT` bound would be wrong:** 3,426 of 29,294 real `signals` rows carry `entry_tct = 08:29 CT` because that column holds the BAR START timestamp and the opening bar is labelled 08:29. Those are legitimate opening signals. Any fix must handle that convention and reconcile against stored Brain data.
+
+**`entry_tct` is misnamed.** It holds a real UTC epoch (barsStore's `asOf` = bar `tUtc`), not a CT value — verified against live rows, where `entry_tct` and `entry_utc` differ by 0.0 hours. Consumers happen to be correct because `toCentralTime()` expects UTC, but the name invites a future bug.
+
+**Cash-account settlement is not modelled.** `positionSizing.ts` and `checkExposure` treat equity as uniformly available. Under T+1 (standard since 2024-05-28), a *cash* account's proceeds are not buying power until settlement, and spending them is freeriding under Reg T — a 90-day account freeze. Irrelevant on margin; a real constraint if a cash account is ever used for execution. This is why paper validation uses **Individual Margin**, not Individual Cash.
+
+**Webull's OCC exercise threshold is assumed, not confirmed.** `$0.01` is OCC's verified baseline, but a member firm may set its own. See `forcedClose.ts`.
 
 ---
 
