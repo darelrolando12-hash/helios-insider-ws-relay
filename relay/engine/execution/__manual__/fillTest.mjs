@@ -137,7 +137,11 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 (async () => {
   const symbol = args.symbol ?? 'SPY';
   const right = (args.right ?? 'CALL').toUpperCase();
-  const minStrikeDays = 14;   // avoid 0DTE/weekly noise; avoid multi-year FLEX
+  // --expiry/--strike were previously parsed into `args` but never consulted
+  // by the contract-selection logic below — silently ignored, not honored.
+  const wantExpiry = typeof args.expiry === 'string' ? args.expiry : null;
+  const wantStrike = args.strike != null && args.strike !== true ? Number(args.strike) : null;
+  const minStrikeDays = 14;   // only applied when no explicit --expiry is given
 
   console.log(`endpoint: ${sandboxBaseUrl()}  (PaperTrade — production host is unreachable from this file)`);
 
@@ -154,24 +158,33 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   // The contract list mixes ordinary listed options with synthetic multi-year
   // FLEX contracts (def_type: "FLEX", symbol prefixed e.g. "2SPY..."). A FLEX
   // pick fails order preview/place with OPENAPI_PARAM_ERR — confirmed live.
-  const inst = await call({
-    uri: '/openapi/instrument/option/contracts', version: 'v2',
-    query: { category: 'US_OPTION', underlying_symbols: symbol, option_type: right, status: 'LISTING', page_size: '250' },
-  });
+  // The un-scoped 250-row page is an unstable sample, not a complete listing
+  // — confirmed live: the same query returned different expiry subsets on
+  // different calls. Passing expire_date server-side when known avoids
+  // relying on client-side filtering over whatever page happened to come back.
+  const instQuery = { category: 'US_OPTION', underlying_symbols: symbol, option_type: right, status: 'LISTING', page_size: '250' };
+  if (wantExpiry) instQuery.expire_date = wantExpiry;
+  const inst = await call({ uri: '/openapi/instrument/option/contracts', version: 'v2', query: instQuery });
   console.log('\n--- instrument lookup ---');
   console.log('HTTP', inst.status, ' contracts:', Array.isArray(inst.body) ? inst.body.length : inst.body);
 
   const now = Date.now();
-  const contract = Array.isArray(inst.body)
-    ? inst.body
-        .filter((c) => c.def_type !== 'FLEX')
-        .filter((c) => (new Date(c.expiration_date) - now) / 86_400_000 >= minStrikeDays)
-        .sort((a, b) => new Date(a.expiration_date) - new Date(b.expiration_date))[0]
-    : null;
+  let candidates = Array.isArray(inst.body) ? inst.body.filter((c) => c.def_type !== 'FLEX') : [];
+  if (wantExpiry) candidates = candidates.filter((c) => c.expiration_date === wantExpiry);
+  if (wantStrike != null) candidates = candidates.filter((c) => Number(c.strike_price) === wantStrike);
+  // The minStrikeDays floor only makes sense as a default when the caller
+  // didn't name an exact expiry — an explicit --expiry is the caller's
+  // decision to make, not something this script should second-guess.
+  if (!wantExpiry) candidates = candidates.filter((c) => (new Date(c.expiration_date) - now) / 86_400_000 >= minStrikeDays);
+  const contract = candidates.sort((a, b) => new Date(a.expiration_date) - new Date(b.expiration_date))[0] ?? null;
   if (!contract) {
-    console.error('\nCould not resolve a standard contract — adjust --symbol/--right, or the');
-    console.error('filters above, against the docs. Nothing was submitted.');
-    console.error(JSON.stringify(inst.body).slice(0, 800));
+    console.error('\nCould not resolve a standard contract matching the given --symbol/--right' +
+      (wantExpiry ? `/--expiry ${wantExpiry}` : '') + (wantStrike != null ? `/--strike ${wantStrike}` : '') + '.');
+    console.error('Nothing was submitted. Available (non-FLEX) contracts:');
+    console.error(JSON.stringify(
+      (Array.isArray(inst.body) ? inst.body : []).filter((c) => c.def_type !== 'FLEX')
+        .map((c) => ({ strike: c.strike_price, expiry: c.expiration_date })).slice(0, 40)
+    ));
     process.exit(1);
   }
   console.log(`using contract: ${contract.symbol}  strike ${contract.strike_price}  expiry ${contract.expiration_date}  id ${contract.instrument_id}`);
@@ -257,8 +270,13 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
       uri: '/openapi/trade/order/detail', version: 'v2',
       query: { account_id: acct.account_id, client_order_id: clientOrderId },
     });
-    const o = Array.isArray(det.body) ? det.body[0] : det.body;
-    const status = o?.order_status ?? o?.status;
+    // Real verified shape: status is nested at body.orders[0].status, not a
+    // top-level array or a flat order_status field. Fall back to the flatter
+    // shapes only if `orders` is absent, rather than assuming either one.
+    const o = Array.isArray(det.body?.orders) ? det.body.orders[0]
+            : Array.isArray(det.body) ? det.body[0]
+            : det.body;
+    const status = o?.status ?? o?.order_status;
     console.log(`poll ${i + 1}: status=${status} filled=${o?.filled_quantity ?? '?'} avg=${o?.avg_filled_price ?? o?.avg_fill_price ?? '?'}`);
     if (status && /FILLED|CANCEL|REJECT|FAILED/i.test(String(status))) {
       const avg = Number(o?.avg_filled_price ?? o?.avg_fill_price ?? NaN);
