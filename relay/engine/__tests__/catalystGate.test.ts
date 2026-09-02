@@ -37,6 +37,7 @@ function makeFund(
     shortVolume:         null,
     shortVolumeRatio:    null,
     insiderTransactions: [],
+    insiderDataQuality:  'real',
     recentDisclosures:   disclosures,
     ratios:              null,
     upcomingEarnings,

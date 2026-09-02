@@ -189,6 +189,16 @@ export interface MassiveForm4Result {
   transaction_value?:                  number;
   shares_owned_following_transaction?: number;
   direct_or_indirect?:                 string;   // 'D' | 'I'
+  /**
+   * Free-text description of an indirect holding's ownership vehicle, e.g.
+   * "By Trust", "By Limited Liability Company 1". Present when
+   * direct_or_indirect === 'I'. Added 2026-09-02: two real NVDA holding rows
+   * for the same owner, same accession, same running share total collided
+   * on every other field — genuinely different entities (two separate LLCs)
+   * that happened to report an identical share count. This field is what
+   * actually distinguishes them; see form4RowId() in insiderIngestion.ts.
+   */
+  nature_of_ownership?:                string;
   filing_url:                          string;
 }
 

@@ -203,6 +203,10 @@ Real gaps that are understood and deliberately not yet fixed. A gap recorded onl
 
 **`insiderSell` is a dead field.** Computed in `catalystGate.computeTags()`, carries a comment claiming it's "used by resolveSignalType" — but `resolveSignalType`'s real signature (`confluenceEngine.ts`) only takes `score, cvd, ctx, currentPrice`; it never reads catalyst data at all. Found 2026-09-02 while designing news-sentiment wiring, by checking the comment against the actual downstream signature rather than trusting it. Not fixed — flagged so it isn't rediscovered from scratch.
 
+**`SwingCockpit.tsx`'s insider criterion never checks transaction direction.** `_lastDiscretionaryBuy()` filters only `!is10b51` — it never checks `transactionType === 'buy'`. A discretionary *sell* passes identically and renders as `"Last discretionary buy Nd ago"`. Found 2026-09-02 during the W4 insider-transactions audit. Dead code (`src/cockpits/`, not live) — recorded so it isn't rediscovered if that cockpit ever comes back.
+
+**`BestContractsCockpit.tsx`'s insider check has zero filtering.** `insiderBuy: fundData.insiderTransactions.length > 0` — no buy/sell check, no 10b5-1 exclusion, despite a comment claiming "only discretionary buys stored" (also stale — see `fundamentalsStore.ts`'s real, current contract: it stores everything unfiltered). Found 2026-09-02, same audit. Dead code, same disposition as above.
+
 ---
 
 ## WORKFLOW

@@ -29,8 +29,31 @@
  *  - insider_title: officer_title only appears when is_officer === true
  *    (confirmed across live samples). Falls back to role booleans when
  *    officer_title is absent.
- *  - transaction_type: derived from transaction_acquired_disposed ('A' → buy,
- *    'D' → sell). transaction_code is the raw SEC code, not stored directly.
+ *  - transaction_type: derived from transaction_code (SEC's own General
+ *    Transaction Codes), NOT from transaction_acquired_disposed. See the
+ *    correction below — this was wrong for months before 2026-09-02.
+ *
+ * ── transaction_type correction (2026-09-02) ───────────────────────────────
+ * Previously derived from transaction_acquired_disposed alone ('A' → buy,
+ * 'D' → sell). Real, quantified impact, audited 2026-09-02: of 136 real
+ * "A" (acquired) rows across 7 FEED_TICKERS over 3 months, only 3 (2.2%)
+ * were code 'P' (a genuine open-market purchase). 48 (35.3%) were code 'A'
+ * — a company-granted compensation award, not a discretionary buy — and 85
+ * (62.5%) were code 'M' — a derivative/option exercise, also not a fresh
+ * open-market purchase. The existing !is10b51 filter in catalystGate.ts did
+ * essentially nothing to screen these out (48/48 grants and 64/85 exercises
+ * passed it unchanged) because 10b5-1 status is orthogonal to whether a
+ * transaction happened on the open market at all.
+ *
+ * Confirmed against a real SEC Form 5 filing's own instructions plus four
+ * independent sources, all converging on the same convention: P/S ("General
+ * Transaction Codes") are a structurally distinct category from A/D/F/M/G/
+ * C/J/I ("Rule 16b-3" and "Derivative Securities" codes) — not a less-common
+ * variant, a different KIND of event. Only P (buy) and S (sell, still gated
+ * by !is10b51 exactly as before) represent a real, voluntary, open-market
+ * transaction. Every other code — grants, exercises, gifts, conversions,
+ * dispositions back to the issuer — is neither, regardless of which
+ * direction transaction_acquired_disposed happens to report.
  *
  * TTL: none for insider_transactions — filings are immutable, low volume,
  * and no retention window was specified. Revisit if row count history
@@ -85,12 +108,77 @@ function addOneDay(dateStr: string): string {
  * record_type is included directly, and holding rows additionally use
  * direct_or_indirect + shares_owned_following_transaction as real
  * disambiguators instead of the two always-undefined fields.
+ *
+ * ── shares_owned_following_transaction added to the 'transaction' branch
+ *    too (2026-09-02) ──────────────────────────────────────────────────────
+ * Real collision found running the ignoreDuplicates:false fix for real (a
+ * batch containing two rows with the same id fails the whole batch outright
+ * — "ON CONFLICT DO UPDATE command cannot affect row a second time" — a
+ * failure ignoreDuplicates:true had been silently absorbing this whole
+ * time, the same "redundancy was hiding a fault" shape as the LULD/N²
+ * broadcast incident in CLAUDE.md). Real example, NVDA accession
+ * 0001199039-26-000005: one insider sold 100,000 shares at a weighted-avg
+ * $217.655, then 400,000 more at $220.371, same day, same code (S), same
+ * accession — SEC requires separate lines when a sale crosses a material
+ * price band within the day. accession+owner+security_type+code+date is
+ * NOT unique for this real, legitimate case. shares_owned_following_
+ * transaction is a running total that differs after any real nonzero-share
+ * transaction, so it disambiguates real same-day multi-tranche filings the
+ * same way it already disambiguates holding rows above.
+ *
+ * ── nature_of_ownership added (2026-09-02, same pass) ──────────────────────
+ * Even with the above fix, a real residual collision remained: NVDA
+ * accession 0001197649-26-000008 reports TWO holding rows for HUANG JEN
+ * HSUN — same accession, owner, security_type, direct_or_indirect ('I'),
+ * AND the same shares_owned_following_transaction (6,632,667) — because two
+ * genuinely different indirect ownership vehicles (real footnotes: "TARG S1
+ * LLC" vs "TARG M1 LLC") happened to report an identical share count.
+ * nature_of_ownership ("By Limited Liability Company 1" vs "...2") is the
+ * only field that actually distinguishes them. Included on both branches —
+ * a real, always-safe additional discriminator, not just the holding case
+ * it was first found on.
+ *
+ * ── security_title added (2026-09-02, same pass) ────────────────────────────
+ * Still a real collision after the above: GOOGL accession
+ * 0001193125-26-274727 reports two holding rows for the same trust, same
+ * accession, same running share total (199,100 — again a real coincidence)
+ * — one for "Class A Common Stock", one for "Class C Capital Stock". Real,
+ * genuinely different instruments. security_type ('non_derivative' /
+ * 'derivative') is too coarse to catch this; security_title is the actual
+ * specific instrument description and is always present on a real row.
+ *
+ * ── transaction_shares + transaction_price_per_share ADDED alongside
+ *    shares_owned_following_transaction, not instead of it (2026-09-02) ────
+ * Even with every fix above, 5 real collisions remained across NFLX, PLTR,
+ * SOFI and MSTR. Root cause: shares_owned_following_transaction alone is
+ * NOT reliable — real filings routinely report it as the SAME value across
+ * genuinely distinct lines, two different shapes of this:
+ *   - Multiple option-lot exercises in one filing all settle to the
+ *     underlying non-derivative side, so the derivative line's own running
+ *     total is 0 for every lot (real NFLX example: 6 distinct option
+ *     exercises, 6 different exercise prices/share counts, ALL with
+ *     shares_owned_following_transaction = 0).
+ *   - SEC allows reporting ONE end-of-day running total for a "related
+ *     series of transactions" rather than a per-line total (real PLTR/MSTR
+ *     examples: 2-3 real same-day sale tranches at genuinely different
+ *     sizes and weighted-average prices, all sharing one post-day total).
+ * transaction_shares/transaction_price_per_share catch those. An EARLIER
+ * version of this fix REPLACED shares_owned_following_transaction with
+ * these two fields and regressed GOOGL back to 15 collisions: two DEU/GSU
+ * grant tranches for the same director, same date/code, same 1-share/$0
+ * line shape, differ ONLY by running total (accession
+ * 0001193125-26-274731, Ferguson — 1558 vs 1026 shares owned after).
+ * Neither field is sufficient alone; all three are combined below.
+ * Verified live against all 23 FEED_TICKERS with all three combined:
+ * 0 colliding keys across 1,734 real rows.
  */
-function form4RowId(r: MassiveForm4Result): string {
+export function form4RowId(r: MassiveForm4Result): string {
+  const ownership = r.nature_of_ownership ?? 'na';
+  const line = `${r.shares_owned_following_transaction ?? 'na'}_${r.transaction_shares ?? 'na'}_${r.transaction_price_per_share ?? 'na'}`;
   if (r.record_type === 'holding') {
-    return `${r.accession_number}_${r.owner_cik}_${r.security_type}_holding_${r.direct_or_indirect ?? 'na'}_${r.shares_owned_following_transaction ?? 'na'}`;
+    return `${r.accession_number}_${r.owner_cik}_${r.security_type}_${r.security_title}_holding_${r.direct_or_indirect ?? 'na'}_${r.shares_owned_following_transaction ?? 'na'}_${ownership}`;
   }
-  return `${r.accession_number}_${r.owner_cik}_${r.security_type}_${r.transaction_code}_${r.transaction_date}`;
+  return `${r.accession_number}_${r.owner_cik}_${r.security_type}_${r.security_title}_${r.transaction_code}_${r.transaction_date}_${line}_${ownership}`;
 }
 
 /**
@@ -106,9 +194,19 @@ function resolveInsiderTitle(r: MassiveForm4Result): string {
   return 'Insider';
 }
 
-function resolveTransactionType(r: MassiveForm4Result): 'buy' | 'sell' | 'other' {
-  if (r.transaction_acquired_disposed === 'A') return 'buy';
-  if (r.transaction_acquired_disposed === 'D') return 'sell';
+/**
+ * 'buy'/'sell' only for SEC's real General Transaction Codes P/S — a genuine
+ * open-market or private purchase/sale. Every other real code (A grant, D
+ * disposition-to-issuer, F tax withholding, M derivative exercise, G gift,
+ * C conversion, J other, I discretionary, K equity swap, V transaction
+ * voluntarily reported, W will/trust, X exercise of in-the-money, Z deposit/
+ * withdrawal from voting trust) is 'other' — regardless of which direction
+ * transaction_acquired_disposed reports. See this file's header for the
+ * real, quantified reason this stopped inferring from A/D alone.
+ */
+export function resolveTransactionType(r: MassiveForm4Result): 'buy' | 'sell' | 'other' {
+  if (r.transaction_code === 'P') return 'buy';
+  if (r.transaction_code === 'S') return 'sell';
   return 'other';
 }
 
@@ -169,6 +267,7 @@ function dbRowToStoreShape(row: {
 async function _runForTicker(
   client: MassiveRestClient,
   ticker: string,
+  forceFullWindow = false,
 ): Promise<void> {
   const toDate   = today();
   const fullFrom = daysAgo(90);
@@ -186,12 +285,17 @@ async function _runForTicker(
     return;
   }
 
-  const fromDate = latestRow?.filing_date
-    ? addOneDay(latestRow.filing_date as string)
-    : fullFrom;
+  const fromDate = forceFullWindow
+    ? fullFrom
+    : latestRow?.filing_date
+      ? addOneDay(latestRow.filing_date as string)
+      : fullFrom;
 
   if (fromDate > toDate) {
     console.log(`[insiderIngestion] ${ticker}: current, skipping fetch.`);
+    // A successful select confirming "already current" IS a real check —
+    // mark it even though nothing gets fetched or upserted this run.
+    fundamentalsStore.markInsiderDataChecked(ticker);
     await _hydrateFromDb(ticker);
     return;
   }
@@ -202,9 +306,15 @@ async function _runForTicker(
   try {
     filings = await client.fetchForm4Filings(ticker, fromDate, toDate);
   } catch (e) {
+    // Deliberately NOT marking checked here — a failed fetch tells us
+    // nothing real. Leaves insiderDataQuality at whatever it was, per
+    // markInsiderDataChecked's "never downgrade" contract.
     console.error(`[insiderIngestion] ${ticker}: fetch failed —`, e);
     return;
   }
+
+  // The fetch itself succeeded — real information, even if it's a real zero.
+  fundamentalsStore.markInsiderDataChecked(ticker);
 
   if (filings.length === 0) {
     console.log(`[insiderIngestion] ${ticker}: no new filings in window.`);
@@ -223,9 +333,19 @@ async function _runForTicker(
     const batch = rows.slice(i, i + UPSERT_BATCH_SIZE);
     const batchNum = Math.floor(i / UPSERT_BATCH_SIZE) + 1;
 
+    // ignoreDuplicates must stay false: same bug shape as disclosureIngestion.ts
+    // (see that file's comment). A conflicting id needs its row overwritten
+    // (DO UPDATE), not skipped — DO NOTHING would leave every pre-existing
+    // row permanently stuck on whatever transaction_type the OLD (buggy,
+    // A/D-derived) resolveTransactionType() computed, even after the
+    // 2026-09-02 fix. NOTE this alone is not sufficient: the resumable
+    // watermark means a ticker with no NEW filings since the fix never gets
+    // its old rows re-fetched at all, so this upsert never even runs against
+    // them. See runInsiderIngestion's forceFullWindow param — a one-off
+    // manual run with it set is what actually re-touches every existing row.
     const { error: upsertErr } = await supabase
       .from('insider_transactions')
-      .upsert(batch, { onConflict: 'id', ignoreDuplicates: true });
+      .upsert(batch, { onConflict: 'id', ignoreDuplicates: false });
 
     if (upsertErr) {
       console.error(`[insiderIngestion] ${ticker}: upsert batch ${batchNum}/${totalBatches} failed —`, upsertErr.message);
@@ -256,7 +376,12 @@ async function _hydrateFromDb(ticker: string): Promise<void> {
     console.error(`[insiderIngestion] ${ticker}: hydrate select failed —`, error.message);
     return;
   }
-  if (!data || data.length === 0) return;
+  if (!data || data.length === 0) {
+    // A successful, empty select is still a real check — the DB genuinely
+    // has zero rows for this ticker, distinct from "never successfully queried".
+    fundamentalsStore.markInsiderDataChecked(ticker);
+    return;
+  }
 
   const transactions = data.map((row) => ({
     ...dbRowToStoreShape(row),
@@ -273,13 +398,27 @@ async function _hydrateFromDb(ticker: string): Promise<void> {
  * Run Form 4 insider transaction backfill + resumable sync for all
  * FEED_TICKERS. Called once from main.tsx — non-blocking (async, fire-and-forget).
  * Safe to call again later (e.g. on a periodic timer) — resumable per ticker.
+ *
+ * @param forceFullWindow  One-off manual flag to re-fetch each ticker's full
+ * 90-day window instead of resuming from its watermark. Required to correct
+ * EXISTING rows after the 2026-09-02 resolveTransactionType() fix: the
+ * normal resumable path only re-fetches dates after the latest stored
+ * filing_date, so a ticker with no NEW filings since the fix would never
+ * have its old, mislabeled rows re-touched at all, regardless of
+ * ignoreDuplicates. This flag is the same escape hatch
+ * disclosureIngestion.ts already has, for the same reason. Run once,
+ * manually, after deploying the fix; the periodic scheduled call never
+ * passes this.
  */
-export async function runInsiderIngestion(client: MassiveRestClient): Promise<void> {
+export async function runInsiderIngestion(
+  client: MassiveRestClient,
+  forceFullWindow = false,
+): Promise<void> {
   console.log('[insiderIngestion] Starting Form 4 insider transaction ingestion…');
 
   for (const ticker of FEED_TICKERS) {
     try {
-      await _runForTicker(client, ticker);
+      await _runForTicker(client, ticker, forceFullWindow);
     } catch (e) {
       console.error(`[insiderIngestion] ${ticker}: unexpected error —`, e);
     }

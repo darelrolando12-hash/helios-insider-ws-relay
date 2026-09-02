@@ -33,6 +33,18 @@ export interface CatalystTags {
   insiderSell:     boolean;
 
   /**
+   * Whether insider data was actually, successfully checked for this ticker
+   * — carried straight from fundamentalsStore.insiderDataQuality (see that
+   * field's comment). `insiderBuy`/`insiderSell` being false is ambiguous on
+   * its own: it means either "checked, genuinely nothing recent" or "never
+   * successfully fetched" — this field is what tells them apart. NOT yet
+   * folded into any aggregate score-level dataQuality (see confluenceEngine's
+   * scoreCatalyst) — that combination is a separate decision, deliberately
+   * not made here.
+   */
+  insiderDataQuality: 'real' | 'absent';
+
+  /**
    * The most recent material disclosure, if any.
    * Cockpits can surface this for display without re-querying the store.
    */
@@ -113,6 +125,7 @@ export function computeTags(
     materialEvent,
     insiderBuy,
     insiderSell,
+    insiderDataQuality: fund.insiderDataQuality,
     leadDisclosure,
     computedAt: nowMs,
   };

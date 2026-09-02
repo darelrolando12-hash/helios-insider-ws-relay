@@ -125,12 +125,28 @@ export interface FundamentalsData {
   shortVolumeRatio: number | null;
 
   /**
-   * Insider transactions from Form 4, filtered to discretionary buys only.
-   * Transactions where is10b51 === true are excluded at write time — they are
-   * scheduled sales, not discretionary signals (per spec).
+   * Insider transactions from Form 4 — ALL transaction types and both
+   * 10b5-1 states, unfiltered (see upsertInsiderTransactions below for why:
+   * an earlier version of this comment claimed write-time filtering that
+   * never actually existed — stale and corrected 2026-09-02, caught the
+   * same way `insiderSell`'s dead-code claim was, by checking the comment
+   * against the real code rather than trusting it). Filtering to
+   * discretionary buy/sell happens at READ time in catalystGate.ts.
    * Array is sorted descending by transactedAt.
    */
   insiderTransactions: InsiderTransaction[];
+
+  /**
+   * Whether insider data was actually, successfully checked for this
+   * ticker — 'real' once any fetch (even a genuine zero-result one) or DB
+   * hydrate has succeeded, 'absent' if it never has. Distinct from
+   * `insiderTransactions.length === 0`, which is ambiguous on its own: a
+   * ticker genuinely checked with no recent activity and a ticker whose
+   * Form 4 fetch has simply never succeeded both produce an empty array —
+   * this field is what tells them apart. Never downgraded by a later
+   * transient failure once 'real' — see insiderIngestion.ts.
+   */
+  insiderDataQuality: 'real' | 'absent';
 
   /**
    * Recent 8-K filings, pre-categorized using Massive taxonomy endpoint.
@@ -274,6 +290,27 @@ export function upsertInsiderTransactions(
     ...newOnes,
   ].sort((a, b) => b.transactedAt - a.transactedAt);
 
+  data.insiderDataQuality = 'real'; // a real upsert call is itself proof of a successful check
+  data.lastUpdatedAt = Date.now();
+  _state.set(ticker, data);
+  _notify();
+}
+
+/**
+ * Mark that insider data was successfully checked for `ticker`, independent
+ * of whether any transactions were found. Needed because
+ * upsertInsiderTransactions is never called on a genuine zero-result check
+ * (empty fetch, empty DB hydrate) — without this, a ticker with truly no
+ * recent insider activity is indistinguishable from one whose fetch has
+ * simply never succeeded. Only ever call with 'real' — there is
+ * deliberately no way to set 'absent' explicitly; the default already
+ * covers "never checked", and a later transient failure must not downgrade
+ * a ticker that was genuinely checked before (see insiderIngestion.ts).
+ */
+export function markInsiderDataChecked(ticker: string) {
+  const data = _getOrCreate(ticker);
+  if (data.insiderDataQuality === 'real') return; // already real — no-op, no spurious notify
+  data.insiderDataQuality = 'real';
   data.lastUpdatedAt = Date.now();
   _state.set(ticker, data);
   _notify();
@@ -345,6 +382,7 @@ function _getOrCreate(ticker: string): FundamentalsData {
     shortVolume:         null,
     shortVolumeRatio:    null,
     insiderTransactions: [],
+    insiderDataQuality:  'absent',
     recentDisclosures:   [],
     ratios:              null,
     upcomingEarnings:    null,
