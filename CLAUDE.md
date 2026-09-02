@@ -179,7 +179,7 @@ The engine does **not** enforce the 1,000-contract options Q cap and does not su
 Thresholds: EXIT 55–64 · REVERSAL 65–74 · ENTER/BREAKOUT ≥75
 
 GEX: within 0.5% of flip → 20 · negative regime → 15 · positive → 10 · neutral → 5
-Catalyst: insiderBuy 12 + materialEvent 8 + earningsPending 5, capped at 20
+Catalyst: insiderBuy 12 + materialEvent 8 + earningsPending 5 + newsSentiment (±5, decayed, `newsSentimentGate.ts`), capped at 20 (floored at 0)
 
 **Swing / 0DTE** — 8 weighted criteria, 128/64/32/16/8/4/2/1 = 255 total
 
@@ -200,6 +200,8 @@ Real gaps that are understood and deliberately not yet fixed. A gap recorded onl
 **Cash-account settlement is not modelled.** `positionSizing.ts` and `checkExposure` treat equity as uniformly available. Under T+1 (standard since 2024-05-28), a *cash* account's proceeds are not buying power until settlement, and spending them is freeriding under Reg T — a 90-day account freeze. Irrelevant on margin; a real constraint if a cash account is ever used for execution. This is why paper validation uses **Individual Margin**, not Individual Cash.
 
 **Webull's OCC exercise threshold is assumed, not confirmed.** `$0.01` is OCC's verified baseline, but a member firm may set its own. See `forcedClose.ts`.
+
+**`insiderSell` is a dead field.** Computed in `catalystGate.computeTags()`, carries a comment claiming it's "used by resolveSignalType" — but `resolveSignalType`'s real signature (`confluenceEngine.ts`) only takes `score, cvd, ctx, currentPrice`; it never reads catalyst data at all. Found 2026-09-02 while designing news-sentiment wiring, by checking the comment against the actual downstream signature rather than trusting it. Not fixed — flagged so it isn't rediscovered from scratch.
 
 ---
 

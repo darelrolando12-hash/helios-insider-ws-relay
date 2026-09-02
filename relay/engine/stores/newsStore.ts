@@ -5,10 +5,25 @@
  * Classifies impact, detects FEED_TICKERS by symbol and company-name alias,
  * deduplicates by article id, and keeps the last 200 articles in memory.
  *
+ * ── Ticker-scoped queries (2026-09-02) ──────────────────────────────────────
+ * Previously one unfiltered global call (`/v2/reference/news?limit=50`, no
+ * ticker param), relying on FEED_TICKERS mentions surviving into the top-50
+ * most-recent-across-everything window. Empirically fine for mega-caps
+ * (verified live: 9/23 FEED_TICKERS present in one real 50-article/~5-hour
+ * snapshot) but left real coverage on the table for less-covered names
+ * (COIN, PLTR, HOOD, SOFI, MSTR, SMCI, JPM, BAC, GLD — none appeared in that
+ * snapshot). Massive's endpoint supports `?ticker=X` — confirmed live,
+ * verified real, correctly-tagged results. Now one scoped call per
+ * FEED_TICKER per poll cycle, small stagger between calls (not a rate-limit
+ * requirement — Massive's real limit is 100 req/sec and this is a fraction
+ * of that — just avoiding a 23-request burst in one tick, same caution
+ * chainAggregator's boot stagger already uses for a similar reason).
+ *
  * Public API:
  *   getArticles()                   → NewsArticle[]  (newest first)
  *   getLatestHighImpact()           → NewsArticle[]  (last 3 HIGH)
  *   getArticlesForTicker(ticker)    → NewsArticle[]
+ *   isFreshForTicker(ticker)        → boolean  (real per-ticker poll freshness)
  *   subscribe(listener)             → () => void
  *   startPolling()                  → void  (call once on app init)
  *   stopPolling()                   → void
@@ -38,6 +53,16 @@ export interface NewsArticle {
 
 const POLL_INTERVAL_MS = 5 * 60 * 1000;
 const MAX_ARTICLES     = 200;
+const PER_TICKER_LIMIT = 20; // per scoped call — 23 tickers x 20 comfortably covers real per-5-min volume
+const STAGGER_MS       = 200; // gap between each ticker's call within one poll cycle — see header note
+
+/**
+ * A ticker's per-poll data is "fresh" within this many missed cycles' worth
+ * of time — generous enough that one transient failure doesn't immediately
+ * flip newsSentimentGate's dataQuality to 'absent', tight enough that a
+ * sustained outage does. 3x the poll interval = 15 minutes.
+ */
+const FRESHNESS_WINDOW_MS = POLL_INTERVAL_MS * 3;
 
 const HIGH_KEYWORDS = [
   'fed', 'fomc', 'cpi', 'ppi', 'jobs report', 'nonfarm', 'earnings',
@@ -78,6 +103,11 @@ let _articles:  NewsArticle[]            = [];
 const _listeners: Set<() => void>          = new Set();
 let _status:    'idle' | 'polling' | 'error' = 'idle';
 let _timer:     ReturnType<typeof setInterval> | null = null;
+
+/** UTC ms of each ticker's last SUCCESSFUL scoped fetch — real per-ticker freshness, not a global flag. */
+const _lastSuccessAtByTicker = new Map<string, number>();
+
+const _sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
 
@@ -233,6 +263,15 @@ function _isMarketOpen(): boolean {
 const _API_KEY = MASSIVE_API_KEY;
 const _BASE_URL = 'https://api.massive.com';
 
+/** Fetch one ticker's scoped results. Throws on any non-200 or network failure — caller handles per-ticker. */
+async function _pollTicker(ticker: string): Promise<NewsArticle[]> {
+  const url = `${_BASE_URL}/v2/reference/news?ticker=${encodeURIComponent(ticker)}&limit=${PER_TICKER_LIMIT}&order=desc&apiKey=${_API_KEY}`;
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const json: _MassiveNewsResponse = await res.json();
+  return (json.results ?? []).map(_transform);
+}
+
 async function _poll(): Promise<void> {
   if (!_isMarketOpen()) return;
 
@@ -241,27 +280,49 @@ async function _poll(): Promise<void> {
     return;
   }
 
-  try {
-    const url = `${_BASE_URL}/v2/reference/news?limit=50&order=desc&apiKey=${_API_KEY}`;
-    const res = await fetch(url);
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const existingIds = new Set(_articles.map(a => a.id));
+  const collected: NewsArticle[] = [];
+  let anySucceeded = false;
+  let anyFailed    = false;
 
-    const json: _MassiveNewsResponse = await res.json();
-    if (!json.results?.length) return;
-
-    const existingIds = new Set(_articles.map(a => a.id));
-    const newItems    = json.results
-      .filter(r => !existingIds.has(r.id))
-      .map(_transform);
-
-    if (newItems.length > 0) {
-      _articles = [...newItems, ..._articles].slice(0, MAX_ARTICLES);
-      _notify();
+  // Scoped, per-ticker — see this file's header for why the global unfiltered
+  // call was replaced. Staggered, not parallel: 23 simultaneous requests in
+  // one tick is the same burst-of-first-fetches shape that reset Massive's
+  // connections for chainAggregator at boot (engine/index.ts's own comment).
+  for (const ticker of FEED_TICKERS) {
+    try {
+      const arts = await _pollTicker(ticker);
+      for (const a of arts) {
+        if (!existingIds.has(a.id)) {
+          existingIds.add(a.id);
+          collected.push(a);
+        }
+      }
+      _lastSuccessAtByTicker.set(ticker, Date.now());
+      anySucceeded = true;
+    } catch (err) {
+      console.error(`[newsStore] Poll failed for ${ticker}:`, err);
+      anyFailed = true;
     }
+    await _sleep(STAGGER_MS);
+  }
 
+  if (collected.length > 0) {
+    // Merging 23 independently-scoped batches — sort by recency before
+    // capping, since arrival order across tickers is not time order.
+    _articles = [...collected, ..._articles]
+      .sort((a, b) => b.publishedUtc - a.publishedUtc)
+      .slice(0, MAX_ARTICLES);
+    _notify();
+  }
+
+  // Global `_status` reflects whether THIS cycle made any real progress at
+  // all — real per-ticker freshness for scoring is _lastSuccessAtByTicker /
+  // isFreshForTicker, not this field. A cycle with some failures and some
+  // successes is real partial data, not a global error.
+  if (anySucceeded) {
     _status = 'polling';
-  } catch (err) {
-    console.error('[newsStore] Poll failed:', err);
+  } else if (anyFailed) {
     _status = 'error';
     _notify();
   }
@@ -282,6 +343,21 @@ export function getLatestHighImpact(): NewsArticle[] {
 /** All articles that mention `ticker`. */
 export function getArticlesForTicker(ticker: string): NewsArticle[] {
   return _articles.filter(a => a.tickers.includes(ticker));
+}
+
+/**
+ * Real per-ticker freshness — has this ticker's scoped fetch succeeded
+ * recently? Distinct from getStatus(), which is a global summary of the
+ * last poll CYCLE (23 independent requests) and can't tell a caller whether
+ * THIS ticker's data is trustworthy right now. Consumed by
+ * newsSentimentGate.ts to decide 'real' vs 'absent' — a stale or
+ * never-polled ticker returning zero articles must never be read as a
+ * confirmed "no news".
+ */
+export function isFreshForTicker(ticker: string, maxAgeMs = FRESHNESS_WINDOW_MS): boolean {
+  const lastSuccess = _lastSuccessAtByTicker.get(ticker);
+  if (lastSuccess == null) return false;
+  return Date.now() - lastSuccess <= maxAgeMs;
 }
 
 /** Subscribe to store changes. Returns unsubscribe function. */

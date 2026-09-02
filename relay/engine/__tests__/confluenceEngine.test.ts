@@ -211,6 +211,62 @@ describe('scoreCatalyst', () => {
   });
 });
 
+// ── scoreCatalyst — news sentiment integration (2026-09-02) ─────────────────────
+
+describe('scoreCatalyst — news sentiment integration', () => {
+  const NOW = Date.now();
+  function bullishArticle() {
+    return {
+      id: 'n1', title: 't', description: '', publishedUtc: NOW, source: 's',
+      articleUrl: 'https://x', tickers: ['TEST'], impact: 'HIGH' as const,
+      sentiment: 'bullish' as const, sentimentScore: 0.6,
+    };
+  }
+  function bearishArticle() {
+    return { ...bullishArticle(), id: 'n2', sentiment: 'bearish' as const, sentimentScore: -0.6 };
+  }
+
+  it('bullish news alone (no fundamentals tags) contributes real points, dataQuality real', () => {
+    const r = scoreCatalyst(null, [bullishArticle()], true, NOW);
+    expect(r.points).toBeCloseTo(5, 5);
+    expect(r.dataQuality).toBe('real');
+  });
+
+  it('dataQuality is absent only when BOTH fundamentals tags AND news are unavailable', () => {
+    const r = scoreCatalyst(null, [], false, NOW);
+    expect(r.dataQuality).toBe('absent');
+  });
+
+  it('dataQuality is real when tags are null but news feed is fresh (even with zero articles)', () => {
+    const r = scoreCatalyst(null, [], true, NOW);
+    expect(r.dataQuality).toBe('real');
+    expect(r.points).toBe(0);
+  });
+
+  it('dataQuality is real when news is absent but fundamentals tags are present', () => {
+    const r = scoreCatalyst(makeCatalyst({ insiderBuy: true }), [], false, NOW);
+    expect(r.dataQuality).toBe('real');
+    expect(r.points).toBe(12);
+  });
+
+  it('bullish news is crowded out once insiderBuy+materialEvent already saturate the 20 cap', () => {
+    const tags = makeCatalyst({ insiderBuy: true, materialEvent: true }); // already 20
+    const r = scoreCatalyst(tags, [bullishArticle()], true, NOW);
+    expect(r.points).toBe(20); // news added nothing more room for
+  });
+
+  it('bearish news pulls the subtotal DOWN even when insiderBuy+materialEvent already maxed it — real-time bad news is not crowded out', () => {
+    const tags = makeCatalyst({ insiderBuy: true, materialEvent: true }); // 20
+    const r = scoreCatalyst(tags, [bearishArticle()], true, NOW);
+    expect(r.points).toBeCloseTo(15, 5); // 20 - 5
+  });
+
+  it('the combined catalyst subtotal is floored at 0, never negative, even with only bearish news', () => {
+    const r = scoreCatalyst(null, [bearishArticle(), { ...bearishArticle(), id: 'n3' }], true, NOW);
+    expect(r.points).toBe(0);
+  });
+});
+
 // ── scoreConfluence — aggregator ────────────────────────────────────────────────
 
 describe('scoreConfluence', () => {

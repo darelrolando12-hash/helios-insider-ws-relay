@@ -14,7 +14,10 @@
  *   CVD strength         25 pts  — netDelta direction and magnitude
  *   GEX regime alignment  20 pts  — price position relative to flip/walls
  *   EMA trend stack       20 pts  — EMA8 > EMA21 > EMA55 alignment
- *   Catalyst boost        20 pts  — insiderBuy + materialEvent modifiers
+ *   Catalyst boost        20 pts  — insiderBuy + materialEvent + earningsPending
+ *                                   + real-time news sentiment (newsSentimentGate.ts,
+ *                                   bullish adds up to +5 inside the same cap,
+ *                                   bearish subtracts directly — see that file)
  *   DUMP/RIP urgency      15 pts  — dumpRipDetector event input
  *
  * Signal thresholds:
@@ -34,11 +37,14 @@ import * as luldStore        from '../stores/luldStore.ts';
 import * as fundamentalsStore from '../stores/fundamentalsStore.ts';
 import * as directionState   from '../state/directionState.ts';
 import * as catalystGate     from './catalystGate.ts';
+import * as newsStore        from '../stores/newsStore.ts';
+import { scoreNewsSentiment } from './newsSentimentGate.ts';
 import * as dumpRipDetector  from './dumpRipDetector.ts';
 import type { Signal, SignalType, Bar, MarketStatusValue } from '../stores/types.ts';
 import type { CvdState }     from '../stores/cvdStore.ts';
 import type { MarketContext } from '../stores/marketStore.ts';
 import type { CatalystTags } from './catalystGate.ts';
+import type { NewsArticle }  from '../stores/newsStore.ts';
 import type { DumpRipEvent } from './dumpRipDetector.ts';
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -189,8 +195,12 @@ function _scoreTicker(ticker: string) {
   const catalyst = fund ? catalystGate.computeTags(ticker, fund) : null;
 
   const currentPrice = bars[bars.length - 1].close;
+  const nowMs = Date.now();
+  const newsArticles = newsStore.getArticlesForTicker(ticker);
+  const newsFresh = newsStore.isFreshForTicker(ticker);
 
-  const { score, sources, catalystDataQuality } = scoreConfluence(bars, cvd, ctx, catalyst, currentPrice);
+  const { score, sources, catalystDataQuality } =
+    scoreConfluence(bars, cvd, ctx, catalyst, currentPrice, newsArticles, newsFresh, nowMs);
 
   // SCORE-DIAG — real per-component score breakdown, gated + throttled.
   // See _isDiagEnabled / DIAG_THROTTLE_MS above for why.
@@ -202,12 +212,14 @@ function _scoreTicker(ticker: string) {
     const crossedGate    = _crossedThreshold(prevScore, score);
 
     if (crossedGate || (scoreChanged && dueForLog)) {
+      const catalystComponent = scoreCatalyst(catalyst, newsArticles, newsFresh, nowMs);
+      const newsComponent = scoreNewsSentiment(newsArticles, nowMs, newsFresh);
       console.log(
         `[SCORE-DIAG] ${ticker} total=${score} ` +
         `cvd=${scoreCvd(cvd).points}(call=${cvd.callPct.toFixed(1)},put=${cvd.putPct.toFixed(1)},cls=${cvd.classification}) ` +
         `gex=${scoreGex(ctx, currentPrice).points}(regime=${ctx.gexRegime},flipDist=${(Math.abs(currentPrice - ctx.flipLevel) / currentPrice * 100).toFixed(3)}%) ` +
         `ema=${scoreEmaTrend(bars).points} ` +
-        `catalyst=${scoreCatalyst(catalyst).points}(quality=${scoreCatalyst(catalyst).dataQuality}) ` +
+        `catalyst=${catalystComponent.points}(quality=${catalystComponent.dataQuality},news=${newsComponent.points.toFixed(1)}/${newsComponent.dataQuality}) ` +
         `sources=[${sources.join(',')}]`
       );
       _lastDiagScore.set(ticker, score);
@@ -311,6 +323,9 @@ export function scoreConfluence(
   ctx:          MarketContext,
   catalyst:     CatalystTags | null,
   currentPrice: number,
+  newsArticles: readonly NewsArticle[] = [],
+  newsFresh:    boolean = false,
+  nowMs:        number = Date.now(),
 ): ScoreResult {
   let score  = 0;
   const sources: string[] = [];
@@ -330,8 +345,8 @@ export function scoreConfluence(
   score += emaScore.points;
   if (emaScore.points > 0) sources.push('ema');
 
-  // ── Catalyst boost (20 pts) ───────────────────────────────────────────────
-  const catalystScore = scoreCatalyst(catalyst);
+  // ── Catalyst boost (20 pts, includes real-time news sentiment) ────────────
+  const catalystScore = scoreCatalyst(catalyst, newsArticles, newsFresh, nowMs);
   score += catalystScore.points;
   if (catalystScore.points > 0) sources.push('catalyst');
 
@@ -396,20 +411,53 @@ export function scoreEmaTrend(bars: Bar[]): ComponentScore {
 }
 
 /**
- * Score the catalyst component. Returns dataQuality: 'absent' when `tags`
- * is null — meaning fundamentals data wasn't loaded for this ticker at
- * scoring time, so catalyst genuinely could not be checked (distinct from
- * a real check that found no active catalyst).
+ * Score the catalyst component: fundamentals-derived tags (insiderBuy,
+ * materialEvent, earningsPending) plus real-time news sentiment
+ * (newsSentimentGate.ts), combined into one 0-20 subtotal.
+ *
+ * Two independent sources feed this, each independently checkable:
+ * `tags` (from fundamentalsStore, via catalystGate.computeTags) and
+ * `newsArticles`/`newsFresh` (from newsStore). dataQuality is 'absent'
+ * only when NEITHER could be checked — if fundamentals are absent but news
+ * is fresh (or vice versa), a real partial score is still meaningful and
+ * must not be reported as globally uncheckable.
+ *
+ * insiderBuy + materialEvent alone already sum to 20, the cap — a real,
+ * previously-undocumented property of this formula found while wiring news
+ * sentiment in (2026-09-02): earningsPending, and now bullish news, can
+ * only ever move the score when insider/material haven't already saturated
+ * it. That is intentional, not a bug: both are softer evidence (earnings
+ * proximity, journalism-derived sentiment) than a filed 8-K or a
+ * discretionary insider buy, so being crowded out first is the right
+ * ordering. Bearish news is NOT subject to that crowding — it is added
+ * (i.e. subtracted) before the floor below, so real-time bad news can still
+ * pull the subtotal down even on a day insider+material already maxed it.
  */
-export function scoreCatalyst(tags: CatalystTags | null): ComponentScore {
-  if (!tags) return { points: 0, dataQuality: 'absent' };
+export function scoreCatalyst(
+  tags:         CatalystTags | null,
+  newsArticles: readonly NewsArticle[] = [],
+  newsFresh:    boolean = false,
+  nowMs:        number = Date.now(),
+): ComponentScore {
+  const news = scoreNewsSentiment(newsArticles, nowMs, newsFresh);
 
   let points = 0;
-  if (tags.insiderBuy)     points += 12;
-  if (tags.materialEvent)  points += 8;
-  if (tags.earningsPending) points += 5;
-  // insiderSell is a negative modifier — not added here, used by resolveSignalType
-  return { points: Math.min(20, points), dataQuality: 'real' };
+  if (tags) {
+    if (tags.insiderBuy)      points += 12;
+    if (tags.materialEvent)   points += 8;
+    if (tags.earningsPending) points += 5;
+  }
+  // insiderSell is a documented dead field (see CLAUDE.md KNOWN GAPS) — not
+  // consumed here or anywhere; not copying an unverified "negative modifier"
+  // pattern that doesn't actually exist elsewhere in this file.
+  points += news.points; // signed — can pull the subtotal down before the floor
+
+  const dataQuality: 'real' | 'absent' =
+    (tags !== null || news.dataQuality === 'real') ? 'real' : 'absent';
+
+  // Floor at 0: catalyst is a boost, never a below-zero penalty on the total
+  // score, even when bearish news alone would otherwise make it negative.
+  return { points: Math.max(0, Math.min(20, points)), dataQuality };
 }
 
 /**

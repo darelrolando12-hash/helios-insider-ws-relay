@@ -518,7 +518,10 @@ async function _replayBars(
     if (emaScore.points === 0 && visibleBars.length < 55) continue;
 
     // ── Aggregate conviction ─────────────────────────────────────────────────
-    // CVD is zeroed via NEUTRAL_CVD_STUB — see module header for rationale
+    // CVD is zeroed via NEUTRAL_CVD_STUB — see module header for rationale.
+    // News args intentionally omitted (defaults: [], not fresh) — newsStore
+    // only holds a recent rolling window, not history aligned to `currentBar`'s
+    // replayed timestamp, so 'absent'/0 here is the honest answer, not a gap.
     const { score } = scoreConfluence(visibleBars, NEUTRAL_CVD_STUB, marketCtx, catalyst, currentPrice);
 
     if (score < config.minConviction) continue;
