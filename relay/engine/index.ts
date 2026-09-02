@@ -37,7 +37,11 @@ import { startResolver, setMarketOpen } from './ledger/outcomeResolver.ts';
 import { replayTodaySession } from './engines/backtestEngine.ts';
 
 import { runBarsDailyBackfill }     from './ingestion/barsIngestion.ts';
-import { runShortInterestBackfill } from './ingestion/shortInterestIngestion.ts';
+import {
+  runShortInterestBackfill,
+  runFloatBackfill,
+  hydrateFreeFloatFromDb,
+} from './ingestion/shortInterestIngestion.ts';
 import { runBars1mBackfill }        from './ingestion/bars1mIngestion.ts';
 import { runInsiderIngestion }      from './ingestion/insiderIngestion.ts';
 import { runDisclosureIngestion }   from './ingestion/disclosureIngestion.ts';
@@ -221,7 +225,22 @@ export async function startEngine(
   // latency-sensitive.
   laterOnce(() => void guarded('barsDaily',     () => runBarsDailyBackfill(rest)),      2_000);
   laterOnce(() => void guarded('shortInterest', () => runShortInterestBackfill(rest)),  4_000);
+  // Previously laterOnce-only, no periodic refresh at all — a real gap found
+  // in the W8 audit: short volume is documented as a daily metric but only
+  // ever refreshed once per process lifetime. 24h matches the tighter of
+  // the two sub-cadences (short volume, daily); short interest's own
+  // resumable watermark means most days this just no-ops quickly.
+  everyInterval(() => void guarded('shortInterest', () => runShortInterestBackfill(rest)), 24 * 60 * 60_000);
   laterOnce(() => void guarded('bars1m',        () => runBars1mBackfill(rest)),         6_000);
+
+  // Free float: own cadence, deliberately NOT bundled with shortInterest
+  // above — float changes quarterly-ish (buybacks/issuance), forcing it
+  // onto a 24h cycle would be real over-fetching. Hydrate from DB first
+  // (mirrors earningsCalendarIngestion's own pattern) so a restart doesn't
+  // lose the derived shortFloat before the first live run of the week lands.
+  laterOnce(() => void guarded('floatHydrate', hydrateFreeFloatFromDb), 7_000);
+  laterOnce(() => void guarded('float', () => runFloatBackfill(rest)), 9_000);
+  everyInterval(() => void guarded('float', () => runFloatBackfill(rest)), 7 * 24 * 60 * 60_000);
 
   laterOnce(() => void guarded('insider', () => runInsiderIngestion(rest)), 8_000);
   everyInterval(() => void guarded('insider', () => runInsiderIngestion(rest)), 30 * 60_000);

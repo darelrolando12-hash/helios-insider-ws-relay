@@ -42,6 +42,15 @@ export interface SqueezeRisk {
   shortFloatPct:     number | null;
   daysToCover:       number | null;
   shortVolumeRatio:  number | null;
+  /**
+   * Whether shortVolumeRatio's null-ness (if null) means "confirmed no data
+   * to report" or "fetch hasn't completed yet" — see fundamentalsStore's
+   * shortVolumeDataQuality. A null ratio contributes 0 points either way
+   * (scoreShortVolumeRatio can't do otherwise), but this field is what lets
+   * a caller distinguish a real 0-contribution from an unchecked one,
+   * same distinction every other factor in this codebase makes.
+   */
+  shortVolumeDataQuality: 'real' | 'absent';
   momentumScore:     number;   // 0–15
   asOf:              number;   // UTC ms of the fundamentals snapshot used
 }
@@ -122,6 +131,7 @@ function _scoreTicker(ticker: string) {
   const risk = computeSqueezeRisk(ticker, fund.shortInterest.shortFloat ?? null,
     fund.shortInterest.daysToCover ?? null,
     fund.shortVolumeRatio,
+    fund.shortVolumeDataQuality,
     bars,
     fundResult.asOf,
   );
@@ -141,12 +151,13 @@ function _notify() {
  * Pure function — no store access.
  */
 export function computeSqueezeRisk(
-  ticker:           string,
-  shortFloatPct:    number | null,
-  daysToCover:      number | null,
-  shortVolumeRatio: number | null,
-  bars:             import('../stores/types.ts').Bar[] | null,
-  asOf:             number,
+  ticker:                  string,
+  shortFloatPct:           number | null,
+  daysToCover:             number | null,
+  shortVolumeRatio:        number | null,
+  shortVolumeDataQuality:  'real' | 'absent',
+  bars:                    import('../stores/types.ts').Bar[] | null,
+  asOf:                    number,
 ): SqueezeRisk {
   const floatScore     = scoreShortFloat(shortFloatPct);
   const dtcScore       = scoreDaysToCover(daysToCover);
@@ -163,6 +174,7 @@ export function computeSqueezeRisk(
     shortFloatPct,
     daysToCover,
     shortVolumeRatio,
+    shortVolumeDataQuality,
     momentumScore,
     asOf,
   };

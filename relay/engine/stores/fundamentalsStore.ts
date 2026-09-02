@@ -101,6 +101,26 @@ export interface UpcomingEarnings {
   fetchedAt: number; // UTC ms
 }
 
+// ── Free Float ─────────────────────────────────────────────────────────────────
+
+/**
+ * Real free-float snapshot from Massive's /stocks/vX/float endpoint (2026-09-02).
+ * Distinct refresh cadence from short interest — float changes quarterly-ish
+ * (buybacks/issuance); short interest reports bi-weekly. Storing raw shares
+ * here (not a derived percentage) so short_pct_float can be recomputed
+ * whenever EITHER this or shortInterest updates, in whichever order they
+ * arrive — see upsertFreeFloat/upsertShortInterest below.
+ */
+export interface FreeFloat {
+  /** Shares freely tradable in the market. */
+  shares: number;
+  /** Massive's own float % of shares outstanding, when present — informational only, not used to derive shortFloat. */
+  percentOfOutstanding: number | null;
+  /** YYYY-MM-DD, Massive's effective_date for this snapshot. */
+  effectiveDate: string;
+  fetchedAt: number; // UTC ms
+}
+
 // ── FundamentalsData ──────────────────────────────────────────────────────────
 
 export interface FundamentalsData {
@@ -109,8 +129,22 @@ export interface FundamentalsData {
   /**
    * Most recent short interest snapshot.
    * null until the cron has run at least once for this ticker.
+   *
+   * shortFloat on this snapshot is DERIVED (short_interest / freeFloat.shares
+   * * 100) by this store, not read directly off Massive's short-interest
+   * response — that field (short_pct_float) does not exist in the real API
+   * (confirmed live and against Massive's own docs, 2026-09-02: 0/483 real
+   * reports across all FEED_TICKERS ever had it, and the endpoint's
+   * documented field list doesn't include it at all). Requires freeFloat to
+   * be known; undefined until both real inputs are available.
    */
   shortInterest: ShortInterestSnapshot | null;
+
+  /**
+   * Raw free-float shares, from a separate endpoint/cadence — see FreeFloat
+   * above. null until the float cron has run at least once for this ticker.
+   */
+  freeFloat: FreeFloat | null;
 
   /**
    * Raw short volume data — separate from shortInterest (different endpoints,
@@ -123,6 +157,17 @@ export interface FundamentalsData {
    * Derived field: shortVolume / reportedVolume * 100.
    */
   shortVolumeRatio: number | null;
+
+  /**
+   * Whether short volume was actually, successfully fetched for this ticker
+   * — 'real' once a fetch has succeeded (regardless of the computed ratio),
+   * 'absent' if it never has. shortVolumeRatio === null is ambiguous alone:
+   * it means either "fetched, genuinely nothing to report" or "the fetch
+   * hasn't completed" (a real, plausible state — short interest and short
+   * volume are two separate sequential calls per ticker). squeezeEngine
+   * must read this rather than treat a null ratio as a confirmed 0%.
+   */
+  shortVolumeDataQuality: 'real' | 'absent';
 
   /**
    * Insider transactions from Form 4 — ALL transaction types and both
@@ -216,15 +261,36 @@ export function subscribe(listener: () => void): () => void {
 // ── Write API — called by cron jobs only ─────────────────────────────────────
 
 /**
+ * short_interest / freeFloat * 100 — the real formula (Fintel/ORTEX/
+ * MarketBeat all use this), NOT read directly from Massive (there is no
+ * such field in the real short-interest response). Pure, exported for tests.
+ */
+export function computeShortPctOfFloat(shortInterestShares: number, freeFloatShares: number): number | null {
+  if (!Number.isFinite(shortInterestShares) || !Number.isFinite(freeFloatShares) || freeFloatShares <= 0) {
+    return null;
+  }
+  return (shortInterestShares / freeFloatShares) * 100;
+}
+
+/**
  * Upsert short interest snapshot for `ticker`.
  *
  * Uses an explicit conflict target (ticker) — caller must ensure only one
  * record per ticker is active. Never append without deduplicating.
  * Engineering Lesson #8.
+ *
+ * snapshot.shortFloat, if the caller set it, is IGNORED and recomputed here
+ * from the store's own freeFloat state — single source of truth for the
+ * derivation, see computeShortPctOfFloat. If freeFloat isn't known yet,
+ * shortFloat is left undefined (not a fake 0) until it arrives — see
+ * upsertFreeFloat below, which recomputes this the other direction.
  */
 export function upsertShortInterest(ticker: string, snapshot: ShortInterestSnapshot) {
   const data = _getOrCreate(ticker);
-  data.shortInterest = snapshot;
+  const shortFloat = data.freeFloat
+    ? computeShortPctOfFloat(snapshot.shortInterest, data.freeFloat.shares) ?? undefined
+    : undefined;
+  data.shortInterest = { ...snapshot, shortFloat };
 
   // Derive shortVolumeRatio if shortVolume is available
   if (snapshot.shortVolume !== undefined && snapshot.shortVolume > 0) {
@@ -239,10 +305,36 @@ export function upsertShortInterest(ticker: string, snapshot: ShortInterestSnaps
 }
 
 /**
+ * Upsert the raw free-float snapshot for `ticker` and, if a short interest
+ * snapshot already exists, recompute its shortFloat with the fresh float
+ * value. Handles arrival in either order (float-before-short-interest or
+ * the reverse) — whichever of the two updates last is what triggers the
+ * recompute using the other's already-stored value.
+ */
+export function upsertFreeFloat(ticker: string, freeFloat: FreeFloat) {
+  const data = _getOrCreate(ticker);
+  data.freeFloat = freeFloat;
+
+  if (data.shortInterest) {
+    const shortFloat = computeShortPctOfFloat(data.shortInterest.shortInterest, freeFloat.shares) ?? undefined;
+    data.shortInterest = { ...data.shortInterest, shortFloat };
+  }
+
+  data.lastUpdatedAt = Date.now();
+  _state.set(ticker, data);
+  _notify();
+}
+
+/**
  * Upsert raw short volume and compute ratio.
  *
  * `reportedVolume` is the total market volume for the reporting period,
  * used to derive shortVolumeRatio. Sourced from the short-volume endpoint.
+ *
+ * shortVolumeDataQuality is set to 'real' unconditionally on any call here
+ * — a real fetch succeeded, regardless of whether the ratio computed to a
+ * real number or null (reportedVolume <= 0 is itself real information, not
+ * an absence). Never call this on a failed fetch.
  */
 export function upsertShortVolume(
   ticker:          string,
@@ -254,6 +346,7 @@ export function upsertShortVolume(
   data.shortVolumeRatio = reportedVolume > 0
     ? (shortVolume / reportedVolume) * 100
     : null;
+  data.shortVolumeDataQuality = 'real';
   data.lastUpdatedAt    = Date.now();
   _state.set(ticker, data);
   _notify();
@@ -378,15 +471,17 @@ function _getOrCreate(ticker: string): FundamentalsData {
 
   const blank: FundamentalsData = {
     ticker,
-    shortInterest:       null,
-    shortVolume:         null,
-    shortVolumeRatio:    null,
-    insiderTransactions: [],
-    insiderDataQuality:  'absent',
-    recentDisclosures:   [],
-    ratios:              null,
-    upcomingEarnings:    null,
-    lastUpdatedAt:       0,
+    shortInterest:          null,
+    freeFloat:              null,
+    shortVolume:            null,
+    shortVolumeRatio:       null,
+    shortVolumeDataQuality: 'absent',
+    insiderTransactions:    [],
+    insiderDataQuality:     'absent',
+    recentDisclosures:      [],
+    ratios:                 null,
+    upcomingEarnings:       null,
+    lastUpdatedAt:          0,
   };
   _state.set(ticker, blank);
   return blank;

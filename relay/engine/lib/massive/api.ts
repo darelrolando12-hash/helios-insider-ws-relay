@@ -132,6 +132,31 @@ interface MassiveShortInterestResponse {
   count?:   number;
 }
 
+// ── Float types ────────────────────────────────────────────────────────────────
+
+/**
+ * Real endpoint: GET /stocks/vX/float — confirmed live 2026-09-02 against
+ * Massive's own docs and a real call. NOT a time series the way short
+ * interest is: a query with no date filter returned exactly one row per
+ * ticker (TSLA's only real record: effective_date 2026-07-24), consistent
+ * with float changing quarterly-ish (buybacks/issuance), not on a report
+ * cadence. Real, live-confirmed: an ETF (GLD) returns an empty result set —
+ * ETFs structurally have no free-float concept, same "real zero" pattern as
+ * GLD's real zero 8-K filings.
+ */
+export interface MassiveFloatResult {
+  ticker:             string;
+  effective_date:     string;   // YYYY-MM-DD
+  free_float:          number;   // shares freely tradable
+  free_float_percent?: number;   // free_float / shares outstanding * 100, rounded to 2dp
+}
+
+interface MassiveFloatResponse {
+  results:  MassiveFloatResult[];
+  status:   string;
+  next_url?: string;
+}
+
 // ── Short Volume types ────────────────────────────────────────────────────────
 
 export interface MassiveShortVolumeResult {
@@ -518,6 +543,23 @@ export class MassiveRestClient {
       },
     );
     const json = await this._get<MassiveShortInterestResponse>(url);
+    return json.results ?? [];
+  }
+
+  // ── Float ──────────────────────────────────────────────────────────────────
+
+  /**
+   * Fetch the current free-float snapshot for `ticker`.
+   *
+   * Endpoint: GET /stocks/vX/float — confirmed live 2026-09-02. Not a date-
+   * ranged history: no date-filter params exist on this endpoint (confirmed
+   * against real docs), and a real query returned exactly one row (the
+   * current snapshot). Returns [] for tickers with no real free-float
+   * concept (confirmed live: GLD, an ETF).
+   */
+  public async fetchFloat(ticker: string): Promise<MassiveFloatResult[]> {
+    const url = this._url('/stocks/vX/float', { ticker, limit: '5' });
+    const json = await this._get<MassiveFloatResponse>(url);
     return json.results ?? [];
   }
 
