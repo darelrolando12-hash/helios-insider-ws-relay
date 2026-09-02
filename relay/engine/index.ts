@@ -48,6 +48,10 @@ import {
   REFRESH_INTERVAL_MS as ALLOWLIST_REFRESH_MS,
 } from './ingestion/tickerAllowlistIngestion.ts';
 import { runDailyHighLowBackfill } from './ingestion/dailyHighLowIngestion.ts';
+import {
+  runEarningsCalendarIngestion,
+  hydrateUpcomingEarningsFromDb,
+} from './ingestion/earningsCalendarIngestion.ts';
 
 import { rebuildAll } from './session/cvdRebuild.ts';
 
@@ -227,6 +231,16 @@ export async function startEngine(
 
   laterOnce(() => void guarded('ratios', () => runRatiosIngestion(rest)), 12_000);
   everyInterval(() => void guarded('ratios', () => runRatiosIngestion(rest)), RATIOS_REFRESH_MS);
+
+  // No MassiveRestClient — this one hits Nasdaq's free public calendar
+  // directly (see earningsCalendarIngestion.ts's header for why: a real
+  // forward-looking date source, which nothing in Massive's typed surface
+  // currently provides at this account's entitlement tier). Hydrate from DB
+  // first so a restart doesn't lose calendar data before the first live run
+  // lands; daily cadence is enough — earnings dates rarely change day to day.
+  laterOnce(() => void guarded('earningsCalendarHydrate', hydrateUpcomingEarningsFromDb), 13_000);
+  laterOnce(() => void guarded('earningsCalendar', runEarningsCalendarIngestion), 15_000);
+  everyInterval(() => void guarded('earningsCalendar', runEarningsCalendarIngestion), 24 * 60 * 60_000);
 
   laterOnce(() => void guarded('breadth', () => runBreadthAllowlistChain(rest)), 14_000);
   everyInterval(() => void guarded('breadth', () => runBreadthAllowlistChain(rest)), ALLOWLIST_REFRESH_MS);

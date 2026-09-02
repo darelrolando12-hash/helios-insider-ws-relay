@@ -75,6 +75,32 @@ export interface FinancialRatios {
   periodEnd: number;
 }
 
+// ── Upcoming Earnings (forward-looking calendar) ──────────────────────────────
+
+/**
+ * A real, forward-looking earnings date from Nasdaq's public calendar API —
+ * see ingestion/earningsCalendarIngestion.ts. Distinct from EightKDisclosure
+ * above: an 8-K can only ever report something that already happened
+ * (filedAt is always a past timestamp), so it structurally cannot answer
+ * "is earnings coming up". This type exists specifically to answer that.
+ */
+export interface UpcomingEarnings {
+  /** YYYY-MM-DD — the real calendar date Nasdaq expects this ticker to report. */
+  reportDate: string;
+  timing: 'bmo' | 'amc' | 'unknown';
+  epsForecast: number | null;
+  numEstimates: number | null;
+  /**
+   * No confirmed/estimated distinction exists in this free source (unlike
+   * Benzinga's paid /benzinga/v1/earnings, which has a real date_status
+   * field) — every date here is Nasdaq's own expectation, presented flat.
+   * A cross-referenced confidence signal is a planned fast-follow, not
+   * implemented yet — do not invent a confidence field here that the
+   * ingestion code doesn't actually compute.
+   */
+  fetchedAt: number; // UTC ms
+}
+
 // ── FundamentalsData ──────────────────────────────────────────────────────────
 
 export interface FundamentalsData {
@@ -118,6 +144,17 @@ export interface FundamentalsData {
    * 0DTE cockpit must not render this field even if non-null.
    */
   ratios: FinancialRatios | null;
+
+  /**
+   * The nearest real, forward-looking earnings date, from Nasdaq's public
+   * calendar. null means no upcoming date was found within the ingestion
+   * job's scanned window (LOOKAHEAD_DAYS in earningsCalendarIngestion.ts) —
+   * that is "absent within this window", never a proven "no earnings ever".
+   * Consumers checking earnings-proximity must still apply their own window
+   * check against reportDate (see catalystGate.ts) rather than treating a
+   * non-null value alone as "soon".
+   */
+  upcomingEarnings: UpcomingEarnings | null;
 
   /** UTC ms of the most recent write to this record (any field). */
   lastUpdatedAt: number;
@@ -278,6 +315,24 @@ export function upsertRatios(ticker: string, ratios: FinancialRatios) {
   _notify();
 }
 
+/**
+ * Upsert the nearest upcoming earnings date for `ticker`.
+ *
+ * Overwrite-only, never explicitly cleared: if a later ingestion run finds
+ * nothing for this ticker within its scanned window, that is "not found in
+ * THIS window", not "confirmed no earnings" — actively nulling the field
+ * would assert something the caller never checked. A stored date past its
+ * own window simply reads as "not soon" via the caller's own date
+ * comparison (see catalystGate.ts) — no mutation needed to make that true.
+ */
+export function upsertUpcomingEarnings(ticker: string, entry: UpcomingEarnings) {
+  const data = _getOrCreate(ticker);
+  data.upcomingEarnings = entry;
+  data.lastUpdatedAt    = Date.now();
+  _state.set(ticker, data);
+  _notify();
+}
+
 // ── Internal ──────────────────────────────────────────────────────────────────
 
 function _getOrCreate(ticker: string): FundamentalsData {
@@ -292,6 +347,7 @@ function _getOrCreate(ticker: string): FundamentalsData {
     insiderTransactions: [],
     recentDisclosures:   [],
     ratios:              null,
+    upcomingEarnings:    null,
     lastUpdatedAt:       0,
   };
   _state.set(ticker, blank);

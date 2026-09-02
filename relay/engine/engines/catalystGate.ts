@@ -22,7 +22,7 @@
  * No store writes, no event emission.
  */
 
-import type { FundamentalsData, EightKDisclosure, DisclosureCategory } from '../stores/fundamentalsStore.ts';
+import type { FundamentalsData, EightKDisclosure, DisclosureCategory, UpcomingEarnings } from '../stores/fundamentalsStore.ts';
 
 // ── CatalystTags ──────────────────────────────────────────────────────────────
 
@@ -66,7 +66,8 @@ export const MATERIAL_CATEGORIES: Set<DisclosureCategory> = new Set([
 
 // ── Time windows ──────────────────────────────────────────────────────────────
 
-const EARNINGS_WINDOW_MS = 7  * 24 * 60 * 60 * 1000;  // 7 days
+const EARNINGS_WINDOW_MS   = 7  * 24 * 60 * 60 * 1000;  // 7 days (backward — an 8-K just filed)
+const EARNINGS_LOOKAHEAD_MS = 7 * 24 * 60 * 60 * 1000;  // 7 days (forward — a real calendar date coming up)
 const MATERIAL_WINDOW_MS = 3  * 24 * 60 * 60 * 1000;  // 3 days
 const INSIDER_WINDOW_MS  = 30 * 24 * 60 * 60 * 1000;  // 30 days
 
@@ -86,7 +87,16 @@ export function computeTags(
   fund:    FundamentalsData,
   nowMs  = Date.now(),
 ): CatalystTags {
-  const earningsPending = hasRecentDisclosure(fund.recentDisclosures, EARNINGS_CATEGORIES, EARNINGS_WINDOW_MS, nowMs);
+  // earningsPending is real if EITHER a real forward-looking calendar date is
+  // coming up (the case this flag is actually named for) OR an 8-K reporting
+  // earnings was just filed (catches same-day/next-day volatility even after
+  // the forward-looking date has passed or aged out of the ingestion job's
+  // scanned window). An 8-K's filedAt is always in the past by construction
+  // — see disclosureIngestion.ts — so only the calendar check can ever be
+  // genuinely forward-looking; that half was previously entirely absent.
+  const earningsPending =
+    hasRecentDisclosure(fund.recentDisclosures, EARNINGS_CATEGORIES, EARNINGS_WINDOW_MS, nowMs) ||
+    hasUpcomingEarnings(fund.upcomingEarnings, EARNINGS_LOOKAHEAD_MS, nowMs);
   const materialEvent   = hasRecentDisclosure(fund.recentDisclosures, MATERIAL_CATEGORIES, MATERIAL_WINDOW_MS, nowMs);
 
   const recentInsider = fund.insiderTransactions.filter(
@@ -121,6 +131,26 @@ export function hasRecentDisclosure(
   return disclosures.some(
     (d) => categories.has(d.category) && nowMs - d.filedAt <= windowMs
   );
+}
+
+/**
+ * Real, forward-looking check — is a real calendar earnings date within
+ * `windowMs` ahead of now? Source: earningsCalendarIngestion.ts (Nasdaq's
+ * public calendar). Distinct from hasRecentDisclosure, which can only ever
+ * look backward because an 8-K's filedAt is always a past timestamp.
+ *
+ * A stored date that has already passed reads as false here without any
+ * store-side mutation — the comparison does the work, not a cleared field.
+ */
+export function hasUpcomingEarnings(
+  upcoming: UpcomingEarnings | null,
+  windowMs: number,
+  nowMs:    number,
+): boolean {
+  if (!upcoming) return false;
+  const reportMs = new Date(`${upcoming.reportDate}T00:00:00Z`).getTime();
+  if (!Number.isFinite(reportMs)) return false;
+  return reportMs >= nowMs && reportMs - nowMs <= windowMs;
 }
 
 /**
