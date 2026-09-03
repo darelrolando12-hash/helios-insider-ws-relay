@@ -84,7 +84,8 @@ interface ResolvedSignalRow {
   entry_tct:   number;    // CT epoch ms — used for timeOfDayBucket
   factors:     {
     gexRegime: string | null;
-    // vix is not stored in factors today — reserved for future; bucket defaults to '<15'
+    vixBucket: VixBucket | null;
+    tradeType: 'with_session' | 'counter_session' | 'continuation' | null;
   };
 }
 
@@ -275,11 +276,13 @@ function _buildFingerprint(sig: ResolvedSignalRow): SetupFingerprint {
     ticker:    sig.ticker,
     direction: sig.direction,
     gexRegime: sig.factors?.gexRegime ?? 'neutral',
-    // VIX bucket: not stored in factors yet — default to '<15' until VIX feed added
-    vixBucket: '<15',
+    // Real value written at signal-fire time. Falls back to '<15' only for
+    // historical rows written before this fix existed (factors.vixBucket is null).
+    vixBucket: sig.factors?.vixBucket ?? '<15',
     timeOfDay: _timeOfDayBucket(sig.entry_tct),
-    // tradeType: not stored in factors yet — default to 'with_session' until wired
-    tradeType: 'with_session',
+    // Real value written at signal-fire time. Falls back to 'with_session' only
+    // for historical rows written before this fix existed (factors.tradeType is null).
+    tradeType: sig.factors?.tradeType ?? 'with_session',
   };
 }
 

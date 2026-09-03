@@ -29,6 +29,9 @@ import { type CvdTick, type AssetClass, type Result, ready, loading } from './ty
 /** CVD is considered stale if no tick has arrived in the last 30 seconds. */
 const STALE_TICK_THRESHOLD_MS = 30 * 1000;
 
+/** Cap on raw tick history kept per ticker — prevents unbounded growth over a long session. */
+const MAX_TICKS_PER_TICKER = 5000;
+
 // ── CvdState ──────────────────────────────────────────────────────────────────
 
 export interface CvdState {
@@ -159,6 +162,9 @@ export function appendClassifiedTick(ticker: string, tick: CvdTick) {
   if (!state) return;
 
   state.ticks.push(tick);
+  if (state.ticks.length > MAX_TICKS_PER_TICKER) {
+    state.ticks.splice(0, state.ticks.length - MAX_TICKS_PER_TICKER);
+  }
   state.tickCount++;
   state.lastTickAt = tick.tUtc;
 

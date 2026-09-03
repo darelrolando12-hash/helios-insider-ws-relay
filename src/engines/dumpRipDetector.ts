@@ -23,6 +23,7 @@
 import * as luldStore from '../stores/luldStore';
 import type { StoredLuldEvent } from '../stores/luldStore';
 import type { SignalType }      from '../stores/types';
+import { formatError }          from '../lib/errors';
 
 // ── Event types ───────────────────────────────────────────────────────────────
 
@@ -137,7 +138,7 @@ function _emit(event: DumpRipEvent) {
   console.log(`[dumpRipDetector] ${event.ticker} ${event.signalType} @ ${event.triggerPrice}`);
   for (const fn of _listeners) {
     try { fn(event); }
-    catch (e) { console.error('[dumpRipDetector] Listener error:', e); }
+    catch (e) { console.error(`[dumpRipDetector] Listener error: ${formatError(e)}`); }
   }
 }
 

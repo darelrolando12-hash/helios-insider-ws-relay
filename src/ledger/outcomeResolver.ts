@@ -95,27 +95,27 @@ export function startResolver() {
 }
 
 /**
- * Stop the resolution loop (e.g. on app unmount or market close).
- */
-export function stopResolver() {
-  if (_intervalId === null) return;
-  clearInterval(_intervalId);
-  _intervalId = null;
-  console.log('[outcomeResolver] Stopped.');
-}
-
-/**
  * Inform the resolver whether the market is currently open.
  * The loop skips each pass when market is closed — no bars are coming in.
+ * Logs on every actual flip so the fix can be confirmed live (was silent
+ * before — setMarketOpen() had zero callers, so this line never printed).
  */
 export function setMarketOpen(isOpen: boolean) {
+  if (isOpen !== _marketIsOpen) {
+    console.error(`[outcomeResolver] Market open flag flipped → ${isOpen}.`);
+  }
   _marketIsOpen = isOpen;
 }
 
 // ── Resolution pass ────────────────────────────────────────────────────────────
 
 async function _runResolutionPass(): Promise<void> {
-  if (!_marketIsOpen) return;
+  if (!_marketIsOpen) {
+    console.log('[outcomeResolver] Pass skipped — market closed.');
+    return;
+  }
+
+  console.error('[outcomeResolver] Pass running — market open, checking pending signals.');
 
   const nowMs = Date.now();
 

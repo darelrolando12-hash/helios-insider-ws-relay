@@ -33,16 +33,8 @@ export type Result<T> =
 
 // ── Type guards ──────────────────────────────────────────────────────────────
 
-export function isReady<T>(r: Result<T>): r is { status: 'ready'; data: T; asOf: number } {
-  return r.status === 'ready';
-}
-
 export function isLoading<T>(r: Result<T>): r is { status: 'loading' } {
   return r.status === 'loading';
-}
-
-export function isError<T>(r: Result<T>): r is { status: 'error'; reason: string } {
-  return r.status === 'error';
 }
 
 // ── Factory helpers ──────────────────────────────────────────────────────────
@@ -199,6 +191,15 @@ export type InsiderTransactionType = 'buy' | 'sell' | 'other';
 export interface InsiderTransaction {
   ticker: string;
 
+  /**
+   * Real DB primary key — accession_number + owner_cik + security_type +
+   * transaction_code + transaction_date. One filing can contain multiple
+   * transaction lines for the same owner on the same date (e.g. a
+   * derivative + non-derivative line), so this is the only field that
+   * safely distinguishes them. Never key UI lists on insiderName+date alone.
+   */
+  id: string;
+
   /** Reporting person's name as filed on Form 4 */
   insiderName: string;
 
@@ -281,6 +282,17 @@ export interface Signal {
 
   /** Which engines contributed to this signal */
   sources: string[];
+
+  /**
+   * Whether the catalyst component's input data was actually available at
+   * scoring time ('real') or missing entirely ('absent'). Lets consumers
+   * (signalLedger, Brain stats) tell a genuine "no catalyst today" zero
+   * apart from "fundamentals hadn't loaded yet" — both previously looked
+   * identical. Optional for signals that bypass scoreConfluence entirely
+   * (e.g. DUMP/RIP, which fires directly off dumpRipDetector and never
+   * touches catalyst scoring).
+   */
+  catalystDataQuality?: 'real' | 'absent';
 }
 
 export interface SignalOutcome {
@@ -313,6 +325,9 @@ export interface SignalOutcome {
  */
 export interface ChainRow {
   strike: number;
+
+  /** YYYY-MM-DD expiration date — populated by chainAggregator from Massive details.expiration_date */
+  expiry: string;
 
   // Call side
   callBid:    number;

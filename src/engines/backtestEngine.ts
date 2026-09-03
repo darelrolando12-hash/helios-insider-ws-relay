@@ -18,10 +18,16 @@
  *     records every signal that would have fired. Called by the app on the
  *     marketstatus transition to 'closed'.
  *
- *   backtestHistoricalRange(ticker, from, to, restClient)
+ *   backtestHistoricalRange(ticker, from, to)
  *     Runs the signal logic against a full historical range. Used to pre-populate
- *     Brain before you've taken any live trades. Fetches bars from the REST API
- *     in chunks to avoid memory limits.
+ *     Brain before you've taken any live trades. Reads bars directly from the
+ *     `bars_1m` table (already backfilled — see bars1mIngestion.ts), paginated
+ *     in DB-side pages to avoid memory limits. No REST calls.
+ *
+ *   runHistoricalSeed()
+ *     One-time seed across all FEED_TICKERS. Resumable: skips any ticker that
+ *     already has backtested signals persisted, so it's safe to leave wired
+ *     at boot — repeat runs after the first just no-op per ticker.
  *
  * Brain data separation:
  *   - Live signals you personally took → `is_backtested = false, is_taken = true`
@@ -32,12 +38,23 @@
  * Replay fidelity rules:
  *   - Bar-by-bar only — at each candle boundary, the engine only sees bars up
  *     to and including that candle (no look-ahead bias)
- *   - CVD is not available in historical replay — the classifier is not
+ *   - CVD is not available in either replay mode — the classifier is not
  *     deterministic for past bars. A neutral CvdState stub is used so that
  *     scoreCvd() returns 0 pts. This is documented in factors.replayNote.
- *   - GEX replay uses the chain snapshot stored with each bar if available,
- *     otherwise uses the nearest available snapshot (may be stale — noted in
- *     the backtested_signal's `factors.replayNote` field)
+ *   - GEX handling is DIFFERENT for the two modes — this matters, do not
+ *     merge them back into one path:
+ *       replayTodaySession      — uses the REAL, live marketStore snapshot.
+ *                                 Valid because this replays TODAY's bars, so
+ *                                 "current" GEX genuinely matches them — not
+ *                                 an approximation.
+ *       backtestHistoricalRange — uses NEUTRAL_GEX_STUB (see below). No
+ *                                 historical GEX was ever recorded for past
+ *                                 dates, and marketStore only ever holds
+ *                                 today's snapshot, so reusing it across a
+ *                                 2-year range would be wrong, not just
+ *                                 approximate. Follow-up (not blocking):
+ *                                 persist chainAggregator's snapshots over
+ *                                 time so future seeds can use real history.
  *   - LULD events are replayed from stored luldStore events where available
  *
  * Outcome resolution:
@@ -57,9 +74,44 @@ import {
 } from './confluenceEngine';
 import type { Bar, SignalType } from '../stores/types';
 import type { CvdState }       from '../stores/cvdStore';
+import type { MarketContext }  from '../stores/marketStore';
 import { toCentralTime }       from '../lib/time';
-import { MassiveRestClient }   from '../lib/massive/api';
 import { supabase }            from '../lib/supabase';
+import { FEED_TICKERS }        from '../state/directionState';
+import { formatError }         from '../lib/errors';
+
+/** 2 years of history as epoch ms — matches bars1mIngestion.ts's backfill window. */
+const TWO_YEARS_MS = 2 * 365 * 24 * 60 * 60 * 1000;
+
+/** Rows fetched per DB page when reading bars_1m. Confirmed the project's PostgREST
+ *  max-rows allows at least 5000/request — a 2yr/1min ticker history (300k-480k rows)
+ *  at 5000/page is ~60-100 requests instead of 300-480 at the smaller page size. */
+const DB_PAGE_SIZE = 5000;
+
+/**
+ * Trailing bar window passed to EMA scoring during replay.
+ * CRITICAL PERFORMANCE FIX: the replay loop previously passed
+ * `bars.slice(0, i + 1)` — the FULL history up to bar i — into scoreEmaTrend()
+ * on every iteration. Since that history grows by one bar each step, and
+ * computeEma() recomputes from scratch every call, total work was O(n²).
+ * For a 400k-bar ticker that's ~160 billion operations — the loop would
+ * never finish, with no error to catch (that's why the seed produced zero
+ * DB rows with no exception either). EMA's exponential decay means bars
+ * beyond ~300 back have negligible weight on an 8/21/55-period EMA anyway,
+ * so bounding the window to a fixed trailing size is not an approximation
+ * that changes outcomes — it's removing wasted, decayed-to-nothing work.
+ * This bounds each iteration's EMA computation to O(1), making the full
+ * loop O(n) instead of O(n²).
+ */
+const REPLAY_EMA_WINDOW = 300;
+
+/** Yield to the event loop every N bars scanned so the tab stays responsive
+ *  and progress logs actually flush during a long replay run. */
+const YIELD_EVERY_N_BARS = 5000;
+
+function _yield(): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, 0));
+}
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
@@ -142,6 +194,40 @@ const NEUTRAL_CVD_STUB: CvdState = {
   ticks:          [],
 };
 
+/**
+ * Neutral GEX stand-in used ONLY for backtestHistoricalRange (the one-time
+ * seed over past years). No historical GEX was ever recorded for past dates,
+ * and marketStore only ever holds TODAY's live snapshot — reusing "today's"
+ * GEX uniformly across a 2-year range would be wrong, not just approximate.
+ * So this stub reports a neutral regime with flip/walls pinned far from any
+ * real price (0), so scoreGex()'s "near flip"/"near wall" bonuses never
+ * spuriously fire on every bar — matching the same "zeroed, documented"
+ * treatment already used for NEUTRAL_CVD_STUB.
+ *
+ * replayTodaySession does NOT use this — it reads the real, live marketStore
+ * snapshot instead, because it only ever replays TODAY's bars, so "current"
+ * GEX genuinely applies. Do not merge these two paths back together.
+ *
+ * Follow-up (not blocking): persist chainAggregator's GEX snapshots into a
+ * table over time (same pattern as short_interest/bars_1m) so future
+ * historical seeds can use real data instead of this stub.
+ */
+function _neutralGexStub(ticker: string): MarketContext {
+  return {
+    ticker,
+    gexRegime:  'neutral',
+    walls:      { callWall: 0, putWall: 0 },
+    flipLevel:  0,
+    upTarget:   0,
+    downTarget: 0,
+    netGex:     0,
+    pcRatio:    1,
+    maxPain:    0,
+    chain:      [],
+    asOf:       0,
+  };
+}
+
 // ── Replay counter ────────────────────────────────────────────────────────────
 
 let _replayCounter = 0;
@@ -173,52 +259,199 @@ export async function replayTodaySession(
   const from  = bars[0]?.tUtc ?? Date.now();
   const to    = bars[bars.length - 1]?.tUtc ?? Date.now();
 
-  return _replayBars(ticker, bars, from, to, config);
+  // Real, live GEX snapshot — valid here because this replays TODAY's bars,
+  // so "current" market context genuinely matches them.
+  const marketResult = marketStore.getResult(ticker);
+  const marketCtx     = marketResult.status === 'ready' ? marketResult.data : null;
+
+  return _replayBars(ticker, bars, from, to, config, marketCtx);
 }
 
 // ── backtestHistoricalRange ────────────────────────────────────────────────────
 
 /**
- * Runs the signal logic against a full historical bar range.
- * Fetches in 500-bar chunks to avoid memory limits.
- *
- * @param ticker      The ticker to backtest.
- * @param from        Start of range (Unix ms).
- * @param to          End of range (Unix ms).
- * @param restClient  MassiveRestClient instance (server-side, API key injected).
- * @param config      Optional config overrides.
+ * Reads bars_1m directly from the DB (already backfilled by bars1mIngestion.ts —
+ * covers ~2yr per ticker) and returns them as Bar[], sorted ascending by tUtc.
+ * Pages through in DB_PAGE_SIZE chunks — a 2yr/1min history is 300k-480k rows
+ * per ticker, well past Supabase's single-request row cap.
  */
-export async function backtestHistoricalRange(
-  ticker:     string,
-  from:       number,
-  to:         number,
-  restClient: MassiveRestClient,
-  config:     BacktestConfig = HISTORICAL_BACKTEST_CONFIG,
-): Promise<BacktestResult> {
-  let cursor      = from;
-  let allBars:    Bar[] = [];
-  let attempts    = 0;
-  const maxChunks = 200; // safety ceiling: 200 × 500 bars = 100,000 bars
+async function _fetchBarsFromDb(ticker: string, fromMs: number, toMs: number): Promise<Bar[]> {
+  const bars: Bar[] = [];
+  let offset = 0;
 
-  while (cursor < to && attempts < maxChunks) {
-    attempts++;
+  while (true) {
+    const { data, error } = await supabase
+      .from('bars_1m')
+      .select('ticker, t_utc, o, h, l, c, v, vw')
+      .eq('ticker', ticker)
+      .gte('t_utc', fromMs)
+      .lte('t_utc', toMs)
+      .order('t_utc', { ascending: true })
+      .range(offset, offset + DB_PAGE_SIZE - 1);
 
-    let chunk: Bar[];
-    try {
-      chunk = await restClient.fetchBarRange(ticker, cursor, to);
-    } catch {
+    if (error) {
+      console.error(`[backtestEngine] ${ticker}: bars_1m read failed at offset ${offset} —`, error.message);
       break;
     }
+    if (!data || data.length === 0) break;
 
-    if (chunk.length === 0) break;
+    for (const row of data) {
+      const tUtc = Number(row.t_utc);
+      bars.push({
+        ticker,
+        open:   Number(row.o),
+        high:   Number(row.h),
+        low:    Number(row.l),
+        close:  Number(row.c),
+        volume: Number(row.v),
+        vwap:   row.vw !== null ? Number(row.vw) : undefined,
+        tCT:    toCentralTime(tUtc).ctMs,
+        tUtc,
+      });
+    }
 
-    allBars = allBars.concat(chunk);
-    cursor  = chunk[chunk.length - 1].tUtc + 1;
+    if (data.length < DB_PAGE_SIZE) break;
+    offset += DB_PAGE_SIZE;
   }
+
+  return bars;
+}
+
+/**
+ * Runs the signal logic against a full historical bar range.
+ * Reads bars directly from bars_1m via _fetchBarsFromDb — no REST calls,
+ * no API budget spent. Requires the ticker's 1-min history to already be
+ * backfilled (see bars1mIngestion.ts); returns an empty result otherwise.
+ *
+ * @param ticker  The ticker to backtest.
+ * @param from    Start of range (Unix ms).
+ * @param to      End of range (Unix ms).
+ * @param config  Optional config overrides.
+ */
+export async function backtestHistoricalRange(
+  ticker:  string,
+  from:    number,
+  to:      number,
+  config:  BacktestConfig = HISTORICAL_BACKTEST_CONFIG,
+): Promise<BacktestResult> {
+  const allBars = await _fetchBarsFromDb(ticker, from, to);
 
   if (allBars.length === 0) return _emptyResult(ticker);
 
-  return _replayBars(ticker, allBars, from, to, config);
+  // No historical GEX data exists for past dates — use the documented
+  // neutral stub instead of marketStore (which only ever holds TODAY's
+  // snapshot). See _neutralGexStub() comment for rationale.
+  const gexStub = _neutralGexStub(ticker);
+
+  return _replayBars(ticker, allBars, from, to, config, gexStub);
+}
+
+// ── Historical seed pilot: SPY only ──────────────────────────────────────────
+
+/**
+ * Runs the historical seed for SPY alone. Same pagination-proof discipline
+ * as bars1mIngestion's runBars1mPilot() — confirm real persisted rows for
+ * one ticker before trusting the full 21-ticker runHistoricalSeed() run.
+ *
+ * Root cause of the original hang (fixed, see REPLAY_EMA_WINDOW comment):
+ * the replay loop recomputed the EMA trend over the ENTIRE growing bar
+ * history on every iteration — O(n²) for n ~= 400k bars, which never
+ * completes and throws no catchable error. Now bounded to a fixed trailing
+ * window, so this pilot should complete in seconds, not hang indefinitely.
+ */
+export async function runHistoricalSeedPilot(): Promise<void> {
+  const ticker = 'SPY';
+  console.log('[backtestEngine] Pilot starting SPY historical seed…');
+
+  const alreadySeeded = await _hasExistingSeed(ticker);
+  if (alreadySeeded) {
+    console.log('[backtestEngine] Pilot — SPY already seeded. Skipping.');
+    return;
+  }
+
+  const toMs   = Date.now();
+  const fromMs = toMs - TWO_YEARS_MS;
+
+  const result = await backtestHistoricalRange(ticker, fromMs, toMs);
+
+  console.log(
+    `[backtestEngine] Pilot SPY complete. Scanned ${result.barsScanned} bars, ` +
+    `fired ${result.signalsFired} signals, persisted ${result.persisted}. ` +
+    (result.barsScanned === 0
+      ? 'WARNING — 0 bars read from bars_1m.'
+      : result.persisted > 0
+        ? 'PASS — real rows persisted.'
+        : result.signalsFired === 0
+          ? 'OK — loop completed, no signals met conviction threshold (not a failure).'
+          : 'WARNING — signals fired but 0 persisted, check DB errors above.'),
+  );
+}
+
+// ── runHistoricalSeed ──────────────────────────────────────────────────────────
+
+/**
+ * One-time seed: runs backtestHistoricalRange for every FEED_TICKER over the
+ * full 2yr bars_1m window. Resumable — skips any ticker that already has
+ * `is_backtested = true` rows in `signals`, so it's safe to call on every
+ * boot; only the first run actually does work per ticker.
+ *
+ * Tickers with no bars_1m history (e.g. index tickers never included in the
+ * 1-min backfill) will scan 0 bars and are logged as a WARNING, not silently
+ * skipped.
+ */
+export async function runHistoricalSeed(): Promise<void> {
+  console.log('[backtestEngine] Starting one-time historical seed for all FEED_TICKERS…');
+
+  const toMs   = Date.now();
+  const fromMs = toMs - TWO_YEARS_MS;
+
+  let totalScanned   = 0;
+  let totalFired     = 0;
+  let totalPersisted = 0;
+
+  for (const ticker of FEED_TICKERS) {
+    try {
+      const alreadySeeded = await _hasExistingSeed(ticker);
+      if (alreadySeeded) {
+        console.log(`[backtestEngine] ${ticker}: already seeded — backtested signals exist. Skipping.`);
+        continue;
+      }
+
+      const result = await backtestHistoricalRange(ticker, fromMs, toMs);
+      totalScanned   += result.barsScanned;
+      totalFired     += result.signalsFired;
+      totalPersisted += result.persisted;
+
+      const verdict = result.barsScanned === 0
+        ? 'WARNING — 0 bars found in bars_1m for this ticker (not in the 1-min backfill). Skipped.'
+        : result.signalsFired > 0 && result.persisted === 0
+          ? 'WARNING — signals fired but 0 persisted, check DB errors above.'
+          : 'OK';
+
+      console.log(`[backtestEngine] ${ticker}: scanned ${result.barsScanned} bars, ` +
+        `fired ${result.signalsFired} signals, persisted ${result.persisted}. ${verdict}`);
+    } catch (e) {
+      console.error(`[backtestEngine] ${ticker}: unexpected error during seed — ${formatError(e)}`);
+    }
+  }
+
+  console.log(`[backtestEngine] Historical seed complete. ` +
+    `Total bars scanned: ${totalScanned}, total signals fired: ${totalFired}, total persisted: ${totalPersisted}.`);
+}
+
+/** True if `ticker` already has at least one backtested signal persisted. */
+async function _hasExistingSeed(ticker: string): Promise<boolean> {
+  const { count, error } = await supabase
+    .from('signals')
+    .select('*', { count: 'exact', head: true })
+    .eq('ticker', ticker)
+    .eq('is_backtested', true);
+
+  if (error) {
+    console.error(`[backtestEngine] ${ticker}: seed-check query failed —`, error.message, '— skipping to avoid duplicate seeding.');
+    return true; // fail closed: skip rather than risk duplicate signal rows
+  }
+  return (count ?? 0) > 0;
 }
 
 // ── Core replay loop ──────────────────────────────────────────────────────────
@@ -227,25 +460,24 @@ export async function backtestHistoricalRange(
  * The main replay loop. Walks bars one at a time, scoring each candle as if
  * it were the live edge. Only bars[0..i] are visible at step i (no look-ahead).
  *
- * CVD is neutralised in replay — not deterministic for historical bars.
- * GEX is derived from marketStore snapshot if available; otherwise scoring
- * proceeds with a degraded GEX contribution (noted in replayNote).
+ * CVD is always neutralised in replay — not deterministic for historical bars.
+ * GEX context is passed in by the caller: real live snapshot for today's
+ * session, neutral stub for the historical seed. See callers for rationale.
  */
 async function _replayBars(
-  ticker:  string,
-  bars:    Bar[],
-  from:    number,
-  to:      number,
-  config:  BacktestConfig,
+  ticker:    string,
+  bars:      Bar[],
+  from:      number,
+  to:        number,
+  config:    BacktestConfig,
+  marketCtx: MarketContext | null,
 ): Promise<BacktestResult> {
   const signals: BacktestedSignal[] = [];
 
   let lastSignalBarIndex = -Infinity;
   let barsScanned        = 0;
 
-  // Snapshot market context (GEX) once per replay pass.
-  const marketResult = marketStore.getResult(ticker);
-  const marketCtx    = marketResult.status === 'ready' ? marketResult.data : null;
+  console.log(`[backtestEngine] ${ticker}: replay starting — ${bars.length} bars to scan.`);
 
   // Snapshot fundamentals for catalyst gate (same across replay pass)
   const fundResult = fundamentalsStore.getResult(ticker);
@@ -255,18 +487,31 @@ async function _replayBars(
   for (let i = 2; i < bars.length; i++) {
     barsScanned++;
 
+    // Yield periodically so the tab stays responsive and progress logs
+    // actually flush during a long run — see YIELD_EVERY_N_BARS.
+    if (barsScanned % YIELD_EVERY_N_BARS === 0) {
+      console.log(`[backtestEngine] ${ticker}: progress — ${barsScanned} / ${bars.length} bars scanned, ${signals.length} signals so far.`);
+      await _yield();
+    }
+
     // Enforce gap between signals
     if (i - lastSignalBarIndex < config.minBarsBetweenSignals) continue;
 
     // Max signals per session ceiling
     if (signals.length >= config.maxSignalsPerSession) break;
 
-    // Bars visible at this step (no look-ahead)
-    const visibleBars  = bars.slice(0, i + 1);
+    // Bars visible at this step (no look-ahead), bounded to a fixed trailing
+    // window — see REPLAY_EMA_WINDOW. This is what makes the loop O(n)
+    // instead of O(n²); EMA's decay makes bars further back contribute
+    // negligibly to an 8/21/55-period trend anyway.
+    const windowStart  = Math.max(0, i + 1 - REPLAY_EMA_WINDOW);
+    const visibleBars  = bars.slice(windowStart, i + 1);
     const currentBar   = bars[i];
     const currentPrice = currentBar.close;
 
-    // GEX snapshot required for scoreConfluence — skip bar if not available
+    // Only relevant for replayTodaySession: skip bar if today's live GEX
+    // snapshot isn't ready yet. Never triggers for the historical seed —
+    // that path always has the neutral stub, never null.
     if (!marketCtx) continue;
 
     // ── EMA trend check — skip if fewer than 55 bars visible ─────────────────
@@ -285,7 +530,9 @@ async function _replayBars(
 
     // ── Build backtested signal ──────────────────────────────────────────────
 
-    const replayNote = 'CVD zeroed (not deterministic for historical bars). GEX from live snapshot — may be stale.';
+    const replayNote = marketCtx?.asOf === 0
+      ? 'CVD zeroed (not deterministic for historical bars). GEX neutral-stubbed — no historical GEX data exists for this date.'
+      : 'CVD zeroed (not deterministic for historical bars). GEX from live snapshot (today\'s session).';
 
     const ctInfo = toCentralTime(currentBar.tUtc);
 
@@ -310,11 +557,15 @@ async function _replayBars(
     lastSignalBarIndex = i;
   }
 
+  console.log(`[backtestEngine] ${ticker}: replay loop complete — ${barsScanned} bars scanned, ${signals.length} signals fired. Persisting…`);
+
   // ── Persist ──────────────────────────────────────────────────────────────────
 
   const persisted = config.persist
-    ? await _persistSignals(signals)
+    ? await _persistSignals(ticker, signals)
     : 0;
+
+  console.log(`[backtestEngine] ${ticker}: replay complete — ${persisted} / ${signals.length} signals persisted.`);
 
   return {
     ticker,
@@ -333,7 +584,7 @@ async function _replayBars(
  * Batch-inserts backtested signals into the `signals` table.
  * Groups into batches of 50 to avoid request size limits.
  */
-async function _persistSignals(signals: BacktestedSignal[]): Promise<number> {
+async function _persistSignals(ticker: string, signals: BacktestedSignal[]): Promise<number> {
   if (signals.length === 0) return 0;
 
   const BATCH_SIZE = 50;
@@ -361,13 +612,12 @@ async function _persistSignals(signals: BacktestedSignal[]): Promise<number> {
       .insert(rows);
 
     if (error) {
-      console.error(`[backtestEngine] Batch insert failed:`, error.message);
+      console.error(`[backtestEngine] ${ticker}: batch insert failed at offset ${i} —`, error.message);
     } else {
       persisted += batch.length;
     }
   }
 
-  console.log(`[backtestEngine] Persisted ${persisted} / ${signals.length} backtested signals.`);
   return persisted;
 }
 

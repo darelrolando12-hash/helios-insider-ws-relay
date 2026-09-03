@@ -90,6 +90,14 @@ import type { MarketContext } from '../stores/marketStore';
 
 // ── Colour tokens ──────────────────────────────────────────────────────────────
 
+// ── Helios spec hex values (must match index.css --col-g / --col-r / --amb) ──────
+// Single source of truth for canvas draw calls. Tailwind bridge can't reach canvas.
+const H = {
+  g:   '#00d97e',   // --col-g  rgb(0 217 126)
+  r:   '#f04c5a',   // --col-r  rgb(240 76 90)
+  amb: '#f5a623',   // --amb    rgb(245 166 35)
+} as const;
+
 const C = {
   bg:          '#0d0f14',
   bgPanel:     '#111318',
@@ -97,40 +105,40 @@ const C = {
   text:        '#c9d1d9',
   textMuted:   '#6e7681',
 
-  bullBody:    '#26a69a',
-  bullWick:    '#26a69a',
-  bearBody:    '#ef5350',
-  bearWick:    '#ef5350',
+  bullBody:    H.g,
+  bullWick:    H.g,
+  bearBody:    H.r,
+  bearWick:    H.r,
 
   // GEX levels — primary walls at full opacity, secondary at reduced
-  callWall:         '#26a69a',
-  callWallSecondary: 'rgba(38, 166, 154, 0.45)',
-  putWall:          '#ef5350',
-  putWallSecondary:  'rgba(239, 83, 80, 0.45)',
-  flip:             '#f59e0b',
-  maxPain:          '#a855f7',
-  vwap:             '#ffffff',
-  pdh:              '#4b5563',
-  pdl:              '#4b5563',
+  callWall:          H.g,
+  callWallSecondary: 'rgba(0, 217, 126, 0.45)',
+  putWall:           H.r,
+  putWallSecondary:  'rgba(240, 76, 90, 0.45)',
+  flip:              H.amb,
+  maxPain:           H.amb,   // was #a855f7 (purple) — no purple in spec
+  vwap:              '#ffffff',
+  pdh:               '#4b5563',
+  pdl:               '#4b5563',
 
-  ema8:        '#22d3ee',
+  ema8:        H.g,            // was #22d3ee (cyan) — no cyan in spec
   ema21:       '#94a3b8',
-  ema55:       '#f59e0b',
+  ema55:       H.amb,
 
-  bullTint:    'rgba(38, 166, 154, 0.04)',
-  bearTint:    'rgba(239, 83, 80, 0.04)',
+  bullTint:    'rgba(0, 217, 126, 0.04)',
+  bearTint:    'rgba(240, 76, 90, 0.04)',
   neutralTint: 'rgba(100, 116, 139, 0.04)',
 
-  cvdRising:   '#26a69a',
-  cvdFalling:  '#ef5350',
+  cvdRising:   H.g,
+  cvdFalling:  H.r,
   cvdZero:     '#374151',
 
-  aggrBull:    '#26a69a',
-  aggrBear:    '#ef5350',
+  aggrBull:    H.g,
+  aggrBear:    H.r,
 
-  callSignal:  '#26a69a',
-  putSignal:   '#ef5350',
-  dumpRip:     '#f59e0b',
+  callSignal:  H.g,
+  putSignal:   H.r,
+  dumpRip:     H.amb,
 } as const;
 
 // ── Types ──────────────────────────────────────────────────────────────────────
@@ -202,9 +210,16 @@ function _makeChartOptions(
       scaleMargins: { top: 0.05, bottom: 0.05 },
     },
     timeScale: {
-      borderColor:    C.border,
-      timeVisible:    opts.showTimeAxis,
-      secondsVisible: false,
+      borderColor:        C.border,
+      timeVisible:        opts.showTimeAxis,
+      secondsVisible:     false,
+      tickMarkFormatter: (timeAsSeconds: number) => {
+        // Always show HH:mm regardless of how many calendar days the data spans.
+        // Without this, Lightweight Charts defaults to repeating date strings for
+        // intraday data that crosses midnight (e.g. after backfill includes yesterday).
+        const ct = toCentralTime(timeAsSeconds * 1000);
+        return `${String(ct.hour).padStart(2, '0')}:${String(ct.minute).padStart(2, '0')}`;
+      },
     },
     handleScroll:  true,
     handleScale:   true,
@@ -497,7 +512,7 @@ export const HeliosChart = React.memo(function HeliosChart({
       {/* Error state */}
       {barsStatus === 'error' && (
         <div className="absolute inset-0 flex items-center justify-center bg-[#0d0f14]/80 z-30">
-          <p className="text-red-400 font-mono text-sm">
+          <p className="text-col-r font-mono text-sm">
             {(barsStore.getResult(ticker) as { status: 'error'; reason: string }).reason}
           </p>
         </div>
@@ -838,9 +853,9 @@ interface DirectionBadgeProps {
 
 function DirectionBadge({ label, value, variant, reason }: DirectionBadgeProps) {
   const colors: Record<typeof variant, string> = {
-    bull:    'bg-emerald-900/60 text-emerald-400 border-emerald-700/40',
-    bear:    'bg-red-900/60 text-red-400 border-red-700/40',
-    neutral: 'bg-slate-800/60 text-slate-400 border-slate-600/40',
+    bull:    'bg-col-g/15 text-col-g border-col-g/30',
+    bear:    'bg-col-r/15 text-col-r border-col-r/30',
+    neutral: 'bg-white/5 text-white/40 border-white/10',
   };
   return (
     <div
@@ -860,12 +875,12 @@ function ChartSkeleton() {
         {[3, 6, 4, 8, 5, 9, 6, 4, 7, 5].map((h, i) => (
           <div
             key={i}
-            className="w-3 bg-slate-600 rounded-sm animate-pulse"
+            className="w-3 bg-white/20 rounded-sm animate-pulse"
             style={{ height: `${h * 4}px`, animationDelay: `${i * 80}ms` }}
           />
         ))}
       </div>
-      <p className="text-xs text-slate-500 font-mono">Waiting for bars...</p>
+      <p className="text-xs text-white/25 font-mono">Waiting for bars...</p>
     </div>
   );
 }

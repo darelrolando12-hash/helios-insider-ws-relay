@@ -13,8 +13,8 @@
  *   signalLedger      — "I'm In" log (writes one row via supabase)
  *
  * Signal lifecycle within this cockpit:
- *   onSignal fires → score 5–7 factors → FORMING card
- *   all 8 factors → TRIGGERING card (pulsing CSS animation)
+ *   onSignal fires → 2-3 of 4 score factors confirmed → FORMING card
+ *   all 4 score factors, OR a halt-based dump/rip signal → TRIGGERING card (pulsing CSS animation)
  *   user presses "I'm In" → logs signal + navigates to ZeroDteCockpit
  *   signal in flight → ACTIVE card with live state dots
  *   resolved today → RESOLVED row
@@ -38,12 +38,14 @@ import { useNavigate } from 'react-router-dom';
 import * as confluenceEngine from '../engines/confluenceEngine';
 import * as barsStore        from '../stores/barsStore';
 import * as marketStore      from '../stores/marketStore';
+import * as cvdStore         from '../stores/cvdStore';
 import * as brainStore       from '../ledger/brainStore';
 import { supabase }          from '../lib/supabase';
 import {
   getAllDirectionStates,
+  getDirectionState,
   subscribe as subscribeDirection,
-  FEED_TICKERS,
+  computeTradeType,
   CONTEXT_ONLY_TICKERS,
   CASH_SETTLED_TICKERS,
 } from '../state/directionState';
@@ -62,16 +64,20 @@ type SetupType =
   | 'CATALYST'
   | 'DUMP_RIP';
 
-/** Which of the 8 confluence factors is confirmed */
+/**
+ * Which confluence factors are confirmed.
+ * Recalibrated to the 5 factors confluenceEngine can genuinely produce —
+ * vwap/volume/momentum scoring was never built, so those checks could never
+ * be true. See TRIGGERING_THRESHOLD/FORMING_MIN below for why cvd/gex/ema/
+ * catalyst and dumpRipUrgency are handled as two separate signal populations
+ * rather than one flat count.
+ */
 interface FactorStatus {
   cvdStrength:    boolean;
   gexAlignment:   boolean;
   emaTrend:       boolean;
   catalyst:       boolean;
   dumpRipUrgency: boolean;
-  priceVsVwap:    boolean;
-  volumeSpike:    boolean;
-  momentumStack:  boolean;
 }
 
 /** Column classification */
@@ -110,12 +116,38 @@ interface ResolvedCard {
 
 /** Signals older than this many seconds graduate out of TRIGGERING if untouched */
 const TRIGGERING_TTL_S   = 120;
+/**
+ * FORMING cards graduate out (to RESOLVED, unwatched) after this many seconds
+ * if they never reach TRIGGERING. Sits between TRIGGERING's 120s window (a
+ * card already confirmed as strong needs less runway) and Best Contracts'
+ * 15-minute staleness cutoff for a raw signal (FORMING cards have already
+ * cleared FORMING_MIN, so they deserve more time than a completely unscored
+ * signal, but still shouldn't accumulate on screen forever). 8 minutes is the
+ * midpoint of that range — long enough for a real coiling setup to develop
+ * into TRIGGERING, short enough that a signal which never gains confluence
+ * doesn't linger as dead weight in the FORMING column.
+ */
+const FORMING_TTL_S      = 480;
 /** Signals older than this many candles graduate out of ACTIVE into RESOLVED */
 const ACTIVE_MAX_CANDLES = 12;
-/** Factor confirmations needed to be TRIGGERING (all 8) */
-const TRIGGERING_THRESHOLD = 8;
-/** Factor confirmations needed to be FORMING (5, 6, or 7 of 8) */
-const FORMING_MIN    = 5;
+/**
+ * confluenceEngine genuinely scores 4 factors: cvd, gex, ema, catalyst.
+ * (vwap/volume/momentum were part of the original design but were never
+ * built into the scoring engine — see confluenceEngine.ts's scoreConfluence.
+ * Real vwap/volume/momentum scoring would be a legitimate future addition,
+ * not part of this recalibration.)
+ *
+ * Every signal reaching this screen already cleared confluenceEngine's own
+ * EXIT_THRESHOLD (55+ combined points), so it already reflects real
+ * multi-factor confluence — but catalyst tags are frequently unavailable
+ * (most tickers, most days, have no material news), so requiring all 4
+ * would make TRIGGERING nearly as unreachable as the old 8-factor design.
+ * Requiring 3 of 4 lets a strong cvd+gex+ema combo (no catalyst) trigger,
+ * while still being a materially higher bar than FORMING.
+ */
+const TRIGGERING_THRESHOLD = 3;
+/** 2 of 4 — meaningful two-factor confluence, not just one lone indicator */
+const FORMING_MIN    = 2;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -137,9 +169,6 @@ function _buildFactorStatus(signal: Signal): FactorStatus {
     emaTrend:       src.includes('ema'),
     catalyst:       src.includes('catalyst'),
     dumpRipUrgency: src.includes('dumpRipDetector'),
-    priceVsVwap:    src.includes('vwap'),
-    volumeSpike:    src.includes('volume'),
-    momentumStack:  src.includes('momentum') || signal.confidence >= 85,
   };
 }
 
@@ -168,6 +197,29 @@ function _currentPrice(ticker: string): number | null {
   return r.data[r.data.length - 1].close;
 }
 
+/**
+ * Call/put classification for a signal.
+ * ENTER / BREAKOUT / RIP → call (engine only fires these in bullish context).
+ * EXIT → inferred from live CVD classification — EXIT means confluence is
+ * weakening on an existing position, not inherently bearish, same pattern
+ * as signalLedger._inferDirection()'s EXIT case.
+ * Anything else (e.g. DUMP) → put, matching the prior default.
+ */
+function _isCallSignal(signal: Signal): boolean {
+  switch (signal.type) {
+    case 'ENTER':
+    case 'BREAKOUT':
+    case 'RIP':
+      return true;
+    case 'EXIT': {
+      const cvd = cvdStore.getResult(signal.ticker);
+      return !(cvd.status === 'ready' && cvd.data.classification === 'bearish');
+    }
+    default:
+      return false;
+  }
+}
+
 function _inferActiveState(signal: Signal, candles: number): ActiveState {
   if (candles < 2) return 'ACTIVE';
   const price = _currentPrice(signal.ticker);
@@ -177,7 +229,7 @@ function _inferActiveState(signal: Signal, candles: number): ActiveState {
   const ctx = mkt.data;
 
   // Flip detected: price crossed through flipLevel against signal direction
-  const isCallSignal = signal.type === 'ENTER' || signal.type === 'BREAKOUT' || signal.type === 'RIP';
+  const isCallSignal = _isCallSignal(signal);
   if (isCallSignal && price < ctx.flipLevel)  return 'FLIP_DETECTED';
   if (!isCallSignal && price > ctx.flipLevel) return 'FLIP_DETECTED';
 
@@ -196,16 +248,21 @@ function _inferActiveState(signal: Signal, candles: number): ActiveState {
 function _lookupBaseRate(signal: Signal): BaseRate | null {
   const mkt = marketStore.getResult(signal.ticker);
   if (mkt.status !== 'ready') return null;
-  const dir = (signal.type === 'ENTER' || signal.type === 'BREAKOUT' || signal.type === 'RIP')
-    ? 'call' as const
-    : 'put' as const;
+  const dir = _isCallSignal(signal) ? 'call' as const : 'put' as const;
+
+  const vixR = barsStore.getResult('I:VIX');
+  const vixClose = vixR.status === 'ready' && vixR.data.length > 0
+    ? vixR.data[vixR.data.length - 1].close
+    : null;
+  const sessionBias = getDirectionState(signal.ticker)?.sessionBias ?? 'neutral';
+
   const fp: SetupFingerprint = {
     ticker:    signal.ticker,
     direction: dir,
     gexRegime: mkt.data.gexRegime,
-    vixBucket: '<15', // default until VIX feed wired
+    vixBucket: vixClose !== null ? brainStore.vixBucket(vixClose) : '<15',
     timeOfDay: brainStore.timeOfDayBucket(signal.firedAtCT),
-    tradeType: 'with_session',
+    tradeType: computeTradeType(dir, sessionBias, null, null),
   };
   const r = brainStore.getBaseRate(fp);
   if (r.status !== 'ready' || !r.data.isStatisticallyValid) return null;
@@ -226,16 +283,13 @@ const FACTOR_LABELS: Record<keyof FactorStatus, string> = {
   emaTrend:       'EMA Trend',
   catalyst:       'Catalyst',
   dumpRipUrgency: 'DUMP/RIP',
-  priceVsVwap:    'vs VWAP',
-  volumeSpike:    'Vol Spike',
-  momentumStack:  'Momentum',
 };
 
 const ACTIVE_STATE_COLORS: Record<ActiveState, string> = {
-  ACTIVE:        'text-emerald-400',
-  CONSOLIDATING: 'text-amber-400',
-  CONTINUATION:  'text-sky-400',
-  FLIP_DETECTED: 'text-rose-400',
+  ACTIVE:        'text-col-g',
+  CONSOLIDATING: 'text-amb',
+  CONTINUATION:  'text-amb',
+  FLIP_DETECTED: 'text-col-r',
 };
 
 // ── Sub-components ────────────────────────────────────────────────────────────
@@ -257,7 +311,7 @@ function LoadingSkeleton() {
 
 function ErrorBanner({ reason }: { reason: string }) {
   return (
-    <div className="rounded-lg border border-rose-500/40 bg-rose-500/10 px-4 py-3 text-rose-300 text-sm">
+    <div className="rounded-lg border border-col-r/40 bg-col-r/10 px-4 py-3 text-col-r text-sm">
       Scanner error: {reason}
     </div>
   );
@@ -288,13 +342,13 @@ function DirectionBadges({ dirStates }: DirectionBadgesProps) {
   const playDom   = callPlay > putPlay ? 'CALLS' : putPlay > callPlay ? 'PUTS' : 'MIXED';
 
   const biasColor: Record<string, string> = {
-    BULL: 'bg-emerald-500/20 text-emerald-300 border-emerald-500/30',
-    BEAR: 'bg-rose-500/20 text-rose-300 border-rose-500/30',
+    BULL: 'bg-col-g/20 text-col-g border-col-g/30',
+    BEAR: 'bg-col-r/20 text-col-r border-col-r/30',
     NEUTRAL: 'bg-white/10 text-white/60 border-white/20',
   };
   const playColor: Record<string, string> = {
-    CALLS: 'bg-sky-500/20 text-sky-300 border-sky-500/30',
-    PUTS:  'bg-orange-500/20 text-orange-300 border-orange-500/30',
+    CALLS: 'bg-col-g/20 text-col-g border-col-g/30',
+    PUTS:  'bg-col-r/20 text-col-r border-col-r/30',
     MIXED: 'bg-white/10 text-white/60 border-white/20',
   };
 
@@ -323,14 +377,14 @@ function FactorDots({ factors, live = false }: FactorDotsProps) {
           key={key}
           className={`flex items-center gap-1 text-[10px] font-medium ${
             confirmed
-              ? 'text-emerald-400'
+              ? 'text-col-g'
               : live
-                ? 'text-amber-400/70 animate-pulse'
+                ? 'text-amb/70 animate-pulse'
                 : 'text-white/25'
           }`}
         >
           <span className={`inline-block w-1.5 h-1.5 rounded-full ${
-            confirmed ? 'bg-emerald-400' : live ? 'bg-amber-400/70' : 'bg-white/20'
+            confirmed ? 'bg-col-g' : live ? 'bg-amb/70' : 'bg-white/20'
           }`} />
           {FACTOR_LABELS[key]}
         </span>
@@ -344,7 +398,7 @@ function CashSettledTag({ ticker }: CashSettledTagProps) {
   if (!CASH_SETTLED_TICKERS.has(ticker)) return null;
   return (
     <span className="ml-1.5 px-1.5 py-px text-[9px] font-bold tracking-wider rounded
-      bg-amber-500/20 text-amber-300 border border-amber-500/30 uppercase">
+      bg-amb/20 text-amb border border-amb/30 uppercase">
       CASH SETTLED
     </span>
   );
@@ -353,7 +407,7 @@ function CashSettledTag({ ticker }: CashSettledTagProps) {
 interface BaseRateBadgeProps { rate: BaseRate }
 function BaseRateBadge({ rate }: BaseRateBadgeProps) {
   const pct = (rate.winRate * 100).toFixed(0);
-  const color = rate.winRate >= 0.6 ? 'text-emerald-400' : rate.winRate >= 0.45 ? 'text-amber-400' : 'text-rose-400';
+  const color = rate.winRate >= 0.6 ? 'text-col-g' : rate.winRate >= 0.45 ? 'text-amb' : 'text-col-r';
   return (
     <span className={`text-[10px] font-semibold ${color}`}>
       Brain {pct}% ({rate.n}n) · best {rate.bestWindow}
@@ -387,7 +441,7 @@ function FormingCard({ card, onWatch, watching }: FormingCardProps) {
           <CashSettledTag ticker={signal.ticker} />
         </div>
         <span className="text-[10px] font-semibold text-white/40 tabular-nums">
-          {confirmedCount}/8
+          {confirmedCount}/4
         </span>
       </div>
 
@@ -441,7 +495,7 @@ function TriggeringCard({ card, onImIn }: TriggeringCardProps) {
   const mkt        = marketStore.getResult(signal.ticker);
   const price      = _currentPrice(signal.ticker);
   const targetWall = mkt.status === 'ready'
-    ? (signal.type === 'ENTER' || signal.type === 'BREAKOUT' || signal.type === 'RIP'
+    ? (_isCallSignal(signal)
         ? mkt.data.walls.callWall
         : mkt.data.walls.putWall)
     : null;
@@ -450,11 +504,11 @@ function TriggeringCard({ card, onImIn }: TriggeringCardProps) {
   const breakEven = price != null ? (price * 1.005).toFixed(2) : '—';
 
   return (
-    <div className="rounded-lg border border-amber-400/40 bg-amber-400/5 p-3 flex flex-col gap-2
+    <div className="rounded-lg border border-amb/40 bg-amb/5 p-3 flex flex-col gap-2
       animate-pulse-border relative overflow-hidden">
       {/* Pulsing glow ring */}
       <div className="absolute inset-0 rounded-lg pointer-events-none
-        ring-1 ring-amber-400/30 animate-ping-slow" />
+        ring-1 ring-amb/30 animate-ping-slow" />
 
       {/* Header */}
       <div className="flex items-center justify-between relative z-10">
@@ -462,18 +516,18 @@ function TriggeringCard({ card, onImIn }: TriggeringCardProps) {
           <span className="text-sm font-bold text-white tracking-wide">{signal.ticker}</span>
           <CashSettledTag ticker={signal.ticker} />
         </div>
-        <span className="text-[10px] font-semibold text-amber-400/80 tabular-nums">
-          ALL 8 ✓
+        <span className="text-[10px] font-semibold text-amb/80 tabular-nums">
+          {signal.sources.includes('dumpRipDetector') ? 'HALT ✓' : 'CONFLUENCE ✓'}
         </span>
       </div>
 
       {/* Setup + score */}
       <div className="flex items-center gap-1.5 relative z-10">
-        <span className="px-1.5 py-0.5 rounded text-[10px] font-bold bg-amber-500/15
-          text-amber-300 border border-amber-500/30 tracking-wider">
+        <span className="px-1.5 py-0.5 rounded text-[10px] font-bold bg-amb/15
+          text-amb border border-amb/30 tracking-wider">
           {_setupTypeLabel(setupType)}
         </span>
-        <span className="text-[10px] font-bold text-amber-300">
+        <span className="text-[10px] font-bold text-amb">
           {signal.confidence}
         </span>
       </div>
@@ -487,7 +541,7 @@ function TriggeringCard({ card, onImIn }: TriggeringCardProps) {
         <div className="text-white/40">Break-even</div>
         <div className="text-white/70 tabular-nums">${breakEven}</div>
         <div className="text-white/40">Target wall</div>
-        <div className="text-emerald-400 font-semibold tabular-nums">
+        <div className="text-col-g font-semibold tabular-nums">
           {targetWall != null ? `$${targetWall.toFixed(2)}` : '—'}
         </div>
         <div className="text-white/40">Candles</div>
@@ -510,8 +564,8 @@ function TriggeringCard({ card, onImIn }: TriggeringCardProps) {
       <button
         onClick={() => onImIn(card)}
         className="mt-1 w-full py-1.5 rounded text-xs font-bold tracking-widest
-          bg-amber-500/25 text-amber-200 border border-amber-500/50
-          hover:bg-amber-500/40 hover:text-white transition-all duration-150
+          bg-amb/25 text-amb border border-amb/50
+          hover:bg-amb/40 hover:text-void transition-all duration-150
           active:scale-[0.98] relative z-10"
       >
         I'M IN
@@ -533,7 +587,7 @@ function ActiveCard({ card }: ActiveCardProps) {
   const entryPnl  = price != null
     ? ((price - signal.triggerPrice) / signal.triggerPrice) * 100
     : null;
-  const isCall = signal.type === 'ENTER' || signal.type === 'BREAKOUT' || signal.type === 'RIP';
+  const isCall = _isCallSignal(signal);
   const pnlPct = entryPnl != null ? (isCall ? entryPnl : -entryPnl) : null;
 
   const stateColor = ACTIVE_STATE_COLORS[activeState];
@@ -568,7 +622,7 @@ function ActiveCard({ card }: ActiveCardProps) {
         <span className="text-[10px] text-white/40">Live P&amp;L est.</span>
         <span className={`text-sm font-bold tabular-nums ${
           pnlPct == null ? 'text-white/30' :
-          pnlPct >= 0 ? 'text-emerald-400' : 'text-rose-400'
+          pnlPct >= 0 ? 'text-col-g' : 'text-col-r'
         }`}>
           {pnlPct != null ? _fmtPct(pnlPct) : '—'}
         </span>
@@ -593,8 +647,8 @@ function ResolvedCardItem({ card }: ResolvedCardItemProps) {
   const { signal, result, pnlPct, durationCandles, exitReason } = card;
 
   const resultStyles: Record<string, string> = {
-    WIN:     'text-emerald-400 bg-emerald-500/10 border-emerald-500/25',
-    LOSS:    'text-rose-400 bg-rose-500/10 border-rose-500/25',
+    WIN:     'text-col-g bg-col-g/10 border-col-g/25',
+    LOSS:    'text-col-r bg-col-r/10 border-col-r/25',
     SCRATCH: 'text-white/50 bg-white/5 border-white/15',
   };
 
@@ -616,7 +670,7 @@ function ResolvedCardItem({ card }: ResolvedCardItemProps) {
 
       {/* P&L */}
       <span className={`text-xs font-semibold tabular-nums flex-shrink-0 ${
-        pnlPct > 0 ? 'text-emerald-400' : pnlPct < 0 ? 'text-rose-400' : 'text-white/40'
+        pnlPct > 0 ? 'text-col-g' : pnlPct < 0 ? 'text-col-r' : 'text-white/40'
       }`}>
         {_fmtPct(pnlPct)}
       </span>
@@ -708,10 +762,20 @@ export default function ScannerCockpit() {
           if (ageS > TRIGGERING_TTL_S) phase = 'ACTIVE';
         }
 
+        // FORMING cards that never gain enough confluence to reach
+        // TRIGGERING time out rather than sitting on screen forever.
+        if (phase === 'FORMING') {
+          const ageS = (now - card.addedAt) / 1000;
+          if (ageS > FORMING_TTL_S) {
+            next.delete(id);
+            continue;
+          }
+        }
+
         // Graduate ACTIVE → RESOLVED if max candles exceeded
         if (phase === 'ACTIVE' && candles >= ACTIVE_MAX_CANDLES) {
           const price  = _currentPrice(card.signal.ticker) ?? card.signal.triggerPrice;
-          const isCall = card.signal.type === 'ENTER' || card.signal.type === 'BREAKOUT' || card.signal.type === 'RIP';
+          const isCall = _isCallSignal(card.signal);
           const rawPnl = ((price - card.signal.triggerPrice) / card.signal.triggerPrice) * 100;
           const pnlPct = isCall ? rawPnl : -rawPnl;
           const result: ResolvedCard['result'] = pnlPct > 0.5 ? 'WIN' : pnlPct < -0.5 ? 'LOSS' : 'SCRATCH';
@@ -755,6 +819,30 @@ export default function ScannerCockpit() {
     const candles        = _candlesElapsed(signal);
     const baseRate       = _lookupBaseRate(signal);
 
+    // Halt-based dump/rip signals are max-confidence by construction
+    // (confluenceEngine emits them at confidence: 100) and only ever set the
+    // single dumpRipUrgency factor — they're a distinct, already-urgent
+    // signal population, not a partial confluence score, so they go
+    // straight to TRIGGERING rather than competing against FORMING_MIN.
+    if (factors.dumpRipUrgency) {
+      const card: LiveSignalCard = {
+        signal,
+        phase: 'TRIGGERING',
+        setupType,
+        factors,
+        confirmedCount,
+        candlesElapsed:  candles,
+        activeState:     'ACTIVE',
+        baseRate,
+        entryBarIndex:   0,
+        userTracked:     false,
+        addedAt:         Date.now(),
+      } as LiveSignalCard;
+      setCards(prev => new Map(prev).set(signal.id, card));
+      setEngineError(null);
+      return;
+    }
+
     // Classify phase from confirmed count
     if (confirmedCount < FORMING_MIN) return; // below threshold, ignore
     const phase: SignalPhase =
@@ -792,19 +880,19 @@ export default function ScannerCockpit() {
       return next;
     });
 
-    // Log to signalLedger DB (best-effort — failure must not block navigation)
+    // Mark the existing signalLedger row as user-confirmed (best-effort —
+    // failure must not block navigation). signalLedger already wrote this
+    // row synchronously the instant the signal fired, well before human
+    // reaction time — so this updates that row rather than inserting a
+    // second, competing one.
     try {
-      await supabase.from('signals').upsert({
-        id:          signal.id,
-        ticker:      signal.ticker,
-        direction:   (signal.type === 'ENTER' || signal.type === 'BREAKOUT' || signal.type === 'RIP') ? 'call' : 'put',
-        signal_type: signal.type,
-        conviction:  signal.confidence,
-        entry_price: signal.triggerPrice,
-        entry_tct:   signal.firedAtCT,
-        entry_utc:   signal.firedAt,
-        status:      'pending',
-      }, { onConflict: 'id', ignoreDuplicates: true });
+      const { error } = await supabase
+        .from('signals')
+        .update({ user_confirmed: true })
+        .eq('id', signal.id);
+      if (error) {
+        console.warn('[ScannerCockpit] Failed to mark signal as user-confirmed (non-fatal):', error.message);
+      }
     } catch (e) {
       console.warn('[ScannerCockpit] I\'m In DB log failed (non-fatal):', e);
     }
@@ -823,11 +911,8 @@ export default function ScannerCockpit() {
 
   // ── Mount / unmount ──────────────────────────────────────────────────────────
   useEffect(() => {
-    // Initialise confluenceEngine
-    confluenceEngine.init();
-    for (const ticker of FEED_TICKERS) {
-      confluenceEngine.watchTicker(ticker);
-    }
+    // confluenceEngine.init() and watchTicker() are now called at boot in
+    // main.tsx — do not re-call here to avoid duplicate initialisation.
 
     // Subscribe to signal stream
     const unsubSignal = confluenceEngine.onSignal(onSignal);
@@ -918,7 +1003,7 @@ export default function ScannerCockpit() {
             <Column
               title="TRIGGERING"
               count={triggeringCards.length}
-              accent="bg-amber-400"
+              accent="bg-amb"
             >
               {triggeringCards.map(card => (
                 <TriggeringCard
@@ -933,7 +1018,7 @@ export default function ScannerCockpit() {
             <Column
               title="ACTIVE"
               count={activeCards.length}
-              accent="bg-emerald-400"
+              accent="bg-col-g"
             >
               {activeCards.map(card => (
                 <ActiveCard

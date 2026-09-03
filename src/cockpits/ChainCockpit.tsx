@@ -1,36 +1,26 @@
 /**
- * Layer 4 — ChainCockpit
+ * ChainCockpit — rebuilt against helios-full-mockup.html spec.
  *
- * Full options chain viewer with four sub-tabs: CHAIN / FLOW / GREEKS / GEX.
- * Ticker selector and expiry selector at top. Context bar always visible.
+ * Structure:
+ *   1. Sticky search box (real-time filter: symbol prefix or company name)
+ *   2. Expiry tab row (0DTE … furthest monthly, derived from chain rows)
+ *   3. Context bar: price · %chg · maxPain · P/C · regime · bias
+ *   4. Sub-tabs: TABLE | GREEKS | FLOW | GEX
+ *   5. TABLE sub-tab has Standard ↔ Calls|Puts toggle
+ *      Calls|Puts: exactly 5 columns, table-layout:fixed, no horizontal scroll at 390px
+ *      Columns: C Vol(13%) | C Bid/Ask(29%) | Strike(16%) | P Bid/Ask(29%) | P Vol(13%)
+ *   6. Sticky footer card: P/C ratio · IV rank · call wall · put wall
  *
- * Data reads (zero outbound calls):
- *   marketStore    — chain rows, GEX regime, walls, flip, maxPain, pcRatio, netGex
- *   barsStore      — live price, prior close for % change
- *   directionState — sessionBias, playDirection
- *
- * Layout:
- *   ┌──────────────────────────────────────────────────────────┐
- *   │  TICKER SELECTOR  |  EXPIRY SELECTOR                     │
- *   │  CONTEXT BAR: price • %chg • maxPain • regime • bias     │
- *   │  TABS: CHAIN | FLOW | GREEKS | GEX                       │
- *   ├──────────────────────────────────────────────────────────┤
- *   │  TAB CONTENT                                             │
- *   └──────────────────────────────────────────────────────────┘
- *
- * Rules enforced:
- *   - CONTEXT_ONLY_TICKERS excluded from ticker selector
- *   - SPX / NDX show "CASH SETTLED" label in context bar
- *   - sessionBias + playDirection always visible
- *   - All three Result<T> states handled (loading / error / ready)
- *   - No cockpit imports from another cockpit
- *   - Zero outbound calls
+ * Token rules:
+ *   - Active state: amber only (--amb)
+ *   - No blue, no rounded-xl, no zinc-* or slate-* overrides
+ *   - Green/red for directional data only
  */
 
-import { useCallback, useEffect, useState } from 'react';
-
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import * as barsStore   from '../stores/barsStore';
 import * as marketStore from '../stores/marketStore';
+import * as cvdStore    from '../stores/cvdStore';
 import {
   getDirectionState,
   subscribe as subscribeDirection,
@@ -38,72 +28,111 @@ import {
   CONTEXT_ONLY_TICKERS,
   CASH_SETTLED_TICKERS,
 } from '../state/directionState';
-import type { DirectionState }  from '../state/directionState';
-import type { MarketContext }    from '../stores/marketStore';
-import type { ChainRow }         from '../stores/types';
+import type { DirectionState } from '../state/directionState';
+import type { MarketContext }  from '../stores/marketStore';
+import type { ChainRow }       from '../stores/types';
 
-// ── Local types ────────────────────────────────────────────────────────────────
+// ── Constants ──────────────────────────────────────────────────────────────────
 
-type SubTab = 'CHAIN' | 'FLOW' | 'GREEKS' | 'GEX';
+const SELECTABLE = FEED_TICKERS.filter(t => !CONTEXT_ONLY_TICKERS.has(t));
 
-// Expiry entries derived from chain rows (placeholder — real expiry comes from
-// the ingestion layer tagging each row; for now we show a single "Current" slot)
-interface ExpiryOption {
-  label: string;
-  value: string;
-}
+const COMPANY_NAMES: Record<string, string> = {
+  SPX: 'S&P 500 Index', SPY: 'SPDR S&P 500 ETF', QQQ: 'Invesco QQQ Trust',
+  NDX: 'Nasdaq 100 Index', IWM: 'iShares Russell 2000', AAPL: 'Apple Inc',
+  NVDA: 'NVIDIA Corp', TSLA: 'Tesla Inc', MSFT: 'Microsoft Corp',
+  AMZN: 'Amazon.com Inc', META: 'Meta Platforms', GOOGL: 'Alphabet Inc',
+  AMD: 'Advanced Micro Devices', NFLX: 'Netflix Inc', JPM: 'JPMorgan Chase',
+  BAC: 'Bank of America', COIN: 'Coinbase Global', PLTR: 'Palantir Technologies',
+  MSTR: 'MicroStrategy Inc', HOOD: 'Robinhood Markets', GLD: 'SPDR Gold Trust',
+  TLT: 'iShares 20Y Treasury', HYG: 'iShares HY Corp Bond',
+};
 
-// ── Constants ─────────────────────────────────────────────────────────────────
-
-const SELECTABLE_TICKERS = FEED_TICKERS.filter(
-  (t) => !CONTEXT_ONLY_TICKERS.has(t),
-);
-
-const DEFAULT_EXPIRY: ExpiryOption = { label: 'Current', value: 'current' };
+type SubTab = 'TABLE' | 'GREEKS' | 'FLOW' | 'GEX';
+type TableView = 'standard' | 'splitside';
 
 // ── Formatting helpers ────────────────────────────────────────────────────────
 
-function _fmtPrice(n: number): string {
+function _fmtP(n: number): string {
   if (n === 0) return '—';
   return n >= 1000
     ? n.toLocaleString('en-US', { maximumFractionDigits: 0 })
     : n.toFixed(2);
 }
-
 function _fmtPct(n: number): string {
   const sign = n >= 0 ? '+' : '';
   return `${sign}${n.toFixed(2)}%`;
 }
-
 function _fmtIV(iv: number): string {
-  if (iv === 0) return '—';
-  return `${(iv * 100).toFixed(1)}%`;
+  return iv === 0 ? '—' : `${(iv * 100).toFixed(1)}%`;
 }
-
-function _fmtDelta(d: number): string {
-  if (d === 0) return '—';
-  return d.toFixed(2);
+function _fmtVol(v: number): string {
+  if (v === 0) return '—';
+  if (v >= 1_000_000) return `${(v / 1_000_000).toFixed(1)}M`;
+  if (v >= 1_000)     return `${(v / 1_000).toFixed(0)}K`;
+  return String(v);
 }
-
 function _fmtGex(gex: number): string {
   const abs = Math.abs(gex);
-  if (abs >= 1_000_000_000) return `${(gex / 1_000_000_000).toFixed(1)}B`;
-  if (abs >= 1_000_000)     return `${(gex / 1_000_000).toFixed(1)}M`;
-  if (abs >= 1_000)         return `${(gex / 1_000).toFixed(0)}K`;
+  const sign = gex < 0 ? '-' : '';
+  if (abs >= 1_000_000_000) return `${sign}${(abs / 1_000_000_000).toFixed(1)}B`;
+  if (abs >= 1_000_000)     return `${sign}${(abs / 1_000_000).toFixed(1)}M`;
+  if (abs >= 1_000)         return `${sign}${(abs / 1_000).toFixed(0)}K`;
   return gex.toFixed(0);
 }
+function _fmtDelta(d: number): string {
+  return d === 0 ? '—' : d.toFixed(2);
+}
+function _fmtBA(bid: number, ask: number): string {
+  if (bid === 0 && ask === 0) return '—';
+  return `${bid.toFixed(2)} / ${ask.toFixed(2)}`;
+}
 
-// ── Sub-components: common ────────────────────────────────────────────────────
+// ── Expiry helpers ────────────────────────────────────────────────────────────
 
-function LoadingSkeleton() {
+const ATM_STRIKE_WINDOW_PCT = 0.15; // show strikes within ±15% of spot
+
+/** Derive sorted expiry list from chain rows. Returns nearest expiry first. */
+function _getExpiries(rows: ChainRow[]): string[] {
+  const seen = new Set<string>();
+  for (const r of rows) {
+    if (r.expiry) seen.add(r.expiry);
+  }
+  if (seen.size === 0) return ['Current'];
+  return Array.from(seen).sort();
+}
+
+/** Format expiry for display: "Jul 18" or "0DTE" for today */
+function _fmtExpiry(expiry: string): string {  if (expiry === 'Current') return 'Current';
+  try {
+    // Parse YYYY-MM-DD
+    const [, m, d] = expiry.split('-').map(Number);
+    const today = new Date();
+    const expDate = new Date(expiry + 'T12:00:00'); // noon local avoids tz issues
+    const isToday = today.toDateString() === expDate.toDateString();
+    if (isToday) return '0DTE';
+    const months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+    return `${months[m - 1]} ${d}`;
+  } catch {
+    return expiry;
+  }
+}
+
+// ── Row classification helpers ────────────────────────────────────────────────
+
+function _isATM(r: ChainRow, spot: number): boolean {
+  return Math.abs(r.strike - spot) < spot * 0.003;
+}
+function _isFlip(r: ChainRow, flip: number, spot: number): boolean {
+  return Math.abs(r.strike - flip) < spot * 0.003;
+}
+
+// ── Skeleton / Error ──────────────────────────────────────────────────────────
+
+function Skeleton() {
   return (
-    <div className="flex flex-col gap-2 p-4">
-      {Array.from({ length: 12 }).map((_, i) => (
-        <div
-          key={i}
-          className="h-8 rounded bg-white/5 animate-pulse"
-          style={{ opacity: 1 - i * 0.06 }}
-        />
+    <div className="flex flex-col gap-1.5 p-4">
+      {Array.from({ length: 14 }).map((_, i) => (
+        <div key={i} className="h-7 animate-pulse bg-white/5" style={{ opacity: 1 - i * 0.055, borderRadius: 1 }} />
       ))}
     </div>
   );
@@ -111,187 +140,68 @@ function LoadingSkeleton() {
 
 function ErrorBanner({ reason }: { reason: string }) {
   return (
-    <div className="mx-4 mt-4 rounded border border-rose-700/50 bg-rose-950/40 px-4 py-3 text-sm text-rose-300">
+    <div className="mx-4 mt-4 px-4 py-3 text-sm text-col-r border border-col-r/30 bg-col-r/5">
       {reason}
     </div>
   );
 }
 
-// ── CashSettledTag ─────────────────────────────────────────────────────────────
+// ── ATM / Flip / MaxPain label chips ─────────────────────────────────────────
 
-function CashSettledTag() {
+function StrikeChips({ labels }: { labels: string[] }) {
+  if (labels.length === 0) return null;
   return (
-    <span className="rounded-sm bg-violet-900/60 px-1.5 py-0.5 text-[10px] font-semibold tracking-widest text-violet-300 uppercase">
-      Cash Settled
-    </span>
-  );
-}
-
-// ── GexRegimeBadge ────────────────────────────────────────────────────────────
-
-function GexRegimeBadge({ regime }: { regime: string }) {
-  const cfg =
-    regime === 'positive'
-      ? { label: 'POS GEX', cls: 'bg-emerald-900/60 text-emerald-300 border-emerald-700/40' }
-      : regime === 'negative'
-      ? { label: 'NEG GEX', cls: 'bg-rose-900/60 text-rose-300 border-rose-700/40' }
-      : { label: 'NEUTRAL', cls: 'bg-zinc-800 text-zinc-400 border-zinc-600/40' };
-
-  return (
-    <span className={`rounded border px-2 py-0.5 text-[11px] font-bold tracking-wider ${cfg.cls}`}>
-      {cfg.label}
-    </span>
-  );
-}
-
-// ── SessionBiasBadge ──────────────────────────────────────────────────────────
-
-function SessionBiasBadge({ bias }: { bias: string }) {
-  const cfg =
-    bias === 'bullish'
-      ? { label: 'SESSION BULL', cls: 'bg-emerald-950/60 text-emerald-300 border-emerald-700/40' }
-      : bias === 'bearish'
-      ? { label: 'SESSION BEAR', cls: 'bg-rose-950/60 text-rose-300 border-rose-700/40' }
-      : { label: 'SESSION NEUTRAL', cls: 'bg-zinc-800 text-zinc-400 border-zinc-600/40' };
-
-  return (
-    <span className={`rounded border px-2 py-0.5 text-[11px] font-bold tracking-wider ${cfg.cls}`}>
-      {cfg.label}
-    </span>
-  );
-}
-
-function PlayDirectionBadge({ play }: { play: string }) {
-  const cfg =
-    play === 'calls'
-      ? { label: 'PLAY CALLS', cls: 'bg-emerald-950/60 text-emerald-300 border-emerald-700/40' }
-      : play === 'puts'
-      ? { label: 'PLAY PUTS', cls: 'bg-rose-950/60 text-rose-300 border-rose-700/40' }
-      : play === 'consolidating'
-      ? { label: 'CONSOLIDATING', cls: 'bg-amber-950/60 text-amber-300 border-amber-700/40' }
-      : { label: 'NO PLAY', cls: 'bg-zinc-800 text-zinc-400 border-zinc-600/40' };
-
-  return (
-    <span className={`rounded border px-2 py-0.5 text-[11px] font-bold tracking-wider ${cfg.cls}`}>
-      {cfg.label}
-    </span>
-  );
-}
-
-// ── Context Bar ───────────────────────────────────────────────────────────────
-
-interface ContextBarProps {
-  ticker:    string;
-  price:     number | null;
-  changePct: number | null;
-  ctx:       MarketContext | null;
-  dir:       DirectionState | null;
-}
-
-function ContextBar({ ticker, price, changePct, ctx, dir }: ContextBarProps) {
-  const isCash = CASH_SETTLED_TICKERS.has(ticker);
-
-  return (
-    <div className="flex flex-wrap items-center gap-x-4 gap-y-2 border-b border-white/10 bg-zinc-900/80 px-4 py-2.5 backdrop-blur">
-      {/* Ticker + cash settled */}
-      <div className="flex items-center gap-2">
-        <span className="text-base font-bold text-white">{ticker}</span>
-        {isCash && <CashSettledTag />}
-      </div>
-
-      {/* Live price + change */}
-      <div className="flex items-center gap-2">
-        <span className="font-mono text-sm font-semibold text-white">
-          {price != null ? _fmtPrice(price) : '—'}
+    <span className="flex gap-1 ml-1">
+      {labels.map(l => (
+        <span
+          key={l}
+          className="text-[9px] font-bold px-1 py-0.5 leading-none"
+          style={{
+            borderRadius: 2,
+            background: l === 'ATM' ? 'var(--amb-solid)' : l === 'FLIP' ? 'rgba(0,217,126,0.18)' : 'rgba(255,255,255,0.08)',
+            color: l === 'ATM' ? 'var(--void)' : l === 'FLIP' ? 'var(--g)' : 'var(--mut)',
+          }}
+        >
+          {l}
         </span>
-        {changePct != null && (
-          <span
-            className={`text-xs font-semibold ${
-              changePct >= 0 ? 'text-emerald-400' : 'text-rose-400'
-            }`}
-          >
-            {_fmtPct(changePct)}
-          </span>
-        )}
-      </div>
-
-      {ctx && (
-        <>
-          {/* Max pain */}
-          <div className="flex items-center gap-1.5 text-xs text-zinc-400">
-            <span className="text-violet-400 font-semibold">MAX PAIN</span>
-            <span className="font-mono text-zinc-200">{_fmtPrice(ctx.maxPain)}</span>
-          </div>
-
-          {/* GEX regime */}
-          <GexRegimeBadge regime={ctx.gexRegime} />
-
-          {/* P/C ratio */}
-          <div className="text-xs text-zinc-400">
-            P/C{' '}
-            <span className="font-mono text-zinc-200">{ctx.pcRatio.toFixed(2)}</span>
-          </div>
-        </>
-      )}
-
-      {dir && (
-        <div className="ml-auto flex items-center gap-2">
-          <SessionBiasBadge bias={dir.sessionBias} />
-          <PlayDirectionBadge play={dir.playDirection} />
-        </div>
-      )}
-    </div>
+      ))}
+    </span>
   );
 }
 
-// ── Row label helpers for CHAIN tab ──────────────────────────────────────────
+// ── TABLE sub-tab — Standard view ────────────────────────────────────────────
 
-function _strikeLabels(
-  row:       ChainRow,
-  spotPrice: number,
-  flipLevel: number,
-  maxPain:   number,
-): string[] {
-  const labels: string[] = [];
-  const atm = Math.abs(row.strike - spotPrice) < spotPrice * 0.003;
-  if (atm)                     labels.push('ATM');
-  if (row.strike === maxPain)  labels.push('MP');
-  if (Math.abs(row.strike - flipLevel) < spotPrice * 0.003) labels.push('FLIP');
-  return labels;
-}
+const STD_COLS = 'grid-cols-[1fr_1fr_1fr_1fr_1fr_1fr_1fr_1fr_1fr_1fr_1fr]';
+const STD_MIN  = 'min-w-[700px]';
 
-function _isITMCall(row: ChainRow, spotPrice: number): boolean {
-  return row.strike < spotPrice;
-}
-function _isITMPut(row: ChainRow, spotPrice: number): boolean {
-  return row.strike > spotPrice;
-}
-function _isFlipRow(row: ChainRow, flipLevel: number, spotPrice: number): boolean {
-  return Math.abs(row.strike - flipLevel) < spotPrice * 0.003;
-}
-function _isMaxPainRow(row: ChainRow): boolean {
-  return row.isMaxPain;
-}
-function _isATMRow(row: ChainRow, spotPrice: number): boolean {
-  return Math.abs(row.strike - spotPrice) < spotPrice * 0.003;
-}
-
-// ── CHAIN Tab ────────────────────────────────────────────────────────────────
-
-interface ChainTabProps {
-  rows:      ChainRow[];
-  ctx:       MarketContext;
-  spotPrice: number;
-  onStrikeSelect: (strike: number) => void;
-}
-
-function ChainTab({ rows, ctx, spotPrice, onStrikeSelect }: ChainTabProps) {
+function StandardTable({
+  rows,
+  ctx,
+  spot,
+}: {
+  rows: ChainRow[];
+  ctx: MarketContext;
+  spot: number;
+}) {
   const { flipLevel, maxPain } = ctx;
+  const scrollRef = useRef<HTMLDivElement>(null);
+
+  // Scroll ATM row into view on first load and when rows change
+  useEffect(() => {
+    if (!scrollRef.current) return;
+    const atm = scrollRef.current.querySelector<HTMLElement>('[data-atm="true"]');
+    if (atm) {
+      atm.scrollIntoView({ block: 'center', behavior: 'instant' });
+    }
+  }, [rows.length]);
 
   return (
-    <div className="chain-scroll overflow-x-auto">
+    <div className="chain-scroll overflow-x-auto" ref={scrollRef}>
       {/* Header */}
-      <div className="grid grid-cols-[1fr_1fr_1fr_1fr_1fr_100px_1fr_1fr_1fr_1fr_1fr] min-w-[900px] border-b border-white/10 px-2 py-1.5 text-[11px] font-semibold uppercase tracking-widest text-zinc-500">
+      <div
+        className={`grid ${STD_COLS} ${STD_MIN} border-b px-2 py-1.5 text-[10px] font-bold uppercase tracking-widest`}
+        style={{ borderColor: 'var(--line)', color: 'var(--dim)' }}
+      >
         <span className="text-right">Bid</span>
         <span className="text-right">Ask</span>
         <span className="text-right">Last</span>
@@ -304,640 +214,801 @@ function ChainTab({ rows, ctx, spotPrice, onStrikeSelect }: ChainTabProps) {
         <span className="text-left">Ask</span>
         <span className="text-left">Bid</span>
       </div>
-
       {/* Rows */}
-      <div className="min-w-[900px]">
-        {rows.map((row) => {
-          const labels    = _strikeLabels(row, spotPrice, flipLevel, maxPain);
-          const isATM     = _isATMRow(row, spotPrice);
-          const isFlip    = _isFlipRow(row, flipLevel, spotPrice);
-          const isMP      = _isMaxPainRow(row);
-          const isITMCall = _isITMCall(row, spotPrice);
-          const isITMPut  = _isITMPut(row, spotPrice);
+      <div className={STD_MIN}>
+        {rows.map((row, i) => {
+          const atm    = _isATM(row, spot);
+          const flip   = _isFlip(row, flipLevel, spot);
+          const isMP   = row.isMaxPain;
+          const labels: string[] = [];
+          if (atm) labels.push('ATM');
+          if (flip) labels.push('FLIP');
+          if (isMP) labels.push('MP');
 
-          // Row background priority: ATM > flip/MP > ITM
-          const rowBg = isATM
-            ? 'bg-amber-950/40 hover:bg-amber-950/60'
-            : isFlip || isMP
-            ? 'bg-violet-950/30 hover:bg-violet-950/50'
-            : 'hover:bg-white/[0.03]';
+          const rowBg = atm
+            ? 'bg-amber-950/40'
+            : flip || isMP
+            ? 'bg-white/4'
+            : i % 2 === 0 ? 'bg-white/1' : '';
 
           return (
-            <button
+            <div
               key={row.strike}
-              type="button"
-              onClick={() => onStrikeSelect(row.strike)}
-              className={`grid w-full cursor-pointer grid-cols-[1fr_1fr_1fr_1fr_1fr_100px_1fr_1fr_1fr_1fr_1fr] border-b border-white/5 px-2 py-1 text-xs transition-colors ${rowBg}`}
+              data-atm={atm ? 'true' : undefined}
+              className={`grid ${STD_COLS} items-center px-2 py-1 text-[11px] font-mono transition-colors hover:bg-white/6 ${rowBg}`}
             >
-              {/* Calls side */}
-              <span className={`text-right font-mono ${isITMCall ? 'text-emerald-300/80' : 'text-zinc-300'}`}>
-                {row.callBid > 0 ? row.callBid.toFixed(2) : '—'}
-              </span>
-              <span className={`text-right font-mono ${isITMCall ? 'text-emerald-300/80' : 'text-zinc-300'}`}>
-                {row.callAsk > 0 ? row.callAsk.toFixed(2) : '—'}
-              </span>
-              <span className={`text-right font-mono ${isITMCall ? 'text-emerald-300/80' : 'text-zinc-300'}`}>
-                {row.callLast > 0 ? row.callLast.toFixed(2) : '—'}
-              </span>
-              <span className={`text-right font-mono text-[11px] ${isITMCall ? 'text-emerald-300/70' : 'text-zinc-400'}`}>
-                {_fmtIV(row.callIV)}
-              </span>
-              <span className={`text-right font-mono text-[11px] ${isITMCall ? 'text-emerald-300/70' : 'text-zinc-400'}`}>
-                {row.callVolume > 0 ? row.callVolume.toLocaleString() : '—'}
-              </span>
-
-              {/* Strike column */}
-              <div className="flex flex-col items-center justify-center">
+              <span className="text-right" style={{ color: 'var(--mut)' }}>{row.callBid > 0 ? row.callBid.toFixed(2) : '—'}</span>
+              <span className="text-right" style={{ color: 'var(--ink)' }}>{row.callAsk > 0 ? row.callAsk.toFixed(2) : '—'}</span>
+              <span className="text-right" style={{ color: 'var(--ink)' }}>{row.callLast > 0 ? _fmtP(row.callLast) : '—'}</span>
+              <span className="text-right" style={{ color: 'var(--mut)' }}>{_fmtIV(row.callIV)}</span>
+              <span className="text-right" style={{ color: 'var(--mut)' }}>{_fmtVol(row.callVolume)}</span>
+              {/* Strike cell */}
+              <div className="flex items-center justify-center gap-1">
                 <span
-                  className={`font-mono text-[11px] font-bold leading-tight ${
-                    isATM ? 'text-amber-300' : isFlip || isMP ? 'text-violet-300' : 'text-zinc-200'
-                  }`}
+                  className="font-bold text-[11px]"
+                  style={{ color: atm ? 'var(--amb-solid)' : 'var(--ink)' }}
                 >
-                  {_fmtPrice(row.strike)}
+                  {_fmtP(row.strike)}
                 </span>
-                {labels.length > 0 && (
-                  <span className="text-[9px] font-bold tracking-wider text-zinc-500">
-                    {labels.join(' ')}
-                  </span>
-                )}
+                <StrikeChips labels={labels} />
               </div>
-
-              {/* Puts side */}
-              <span className={`text-left font-mono text-[11px] ${isITMPut ? 'text-rose-300/70' : 'text-zinc-400'}`}>
-                {row.putVolume > 0 ? row.putVolume.toLocaleString() : '—'}
-              </span>
-              <span className={`text-left font-mono text-[11px] ${isITMPut ? 'text-rose-300/70' : 'text-zinc-400'}`}>
-                {_fmtIV(row.putIV)}
-              </span>
-              <span className={`text-left font-mono ${isITMPut ? 'text-rose-300/80' : 'text-zinc-300'}`}>
-                {row.putLast > 0 ? row.putLast.toFixed(2) : '—'}
-              </span>
-              <span className={`text-left font-mono ${isITMPut ? 'text-rose-300/80' : 'text-zinc-300'}`}>
-                {row.putAsk > 0 ? row.putAsk.toFixed(2) : '—'}
-              </span>
-              <span className={`text-left font-mono ${isITMPut ? 'text-rose-300/80' : 'text-zinc-300'}`}>
-                {row.putBid > 0 ? row.putBid.toFixed(2) : '—'}
-              </span>
-            </button>
+              <span className="text-left" style={{ color: 'var(--mut)' }}>{_fmtVol(row.putVolume)}</span>
+              <span className="text-left" style={{ color: 'var(--mut)' }}>{_fmtIV(row.putIV)}</span>
+              <span className="text-left" style={{ color: 'var(--ink)' }}>{row.putLast > 0 ? _fmtP(row.putLast) : '—'}</span>
+              <span className="text-left" style={{ color: 'var(--ink)' }}>{row.putAsk > 0 ? row.putAsk.toFixed(2) : '—'}</span>
+              <span className="text-left" style={{ color: 'var(--mut)' }}>{row.putBid > 0 ? row.putBid.toFixed(2) : '—'}</span>
+            </div>
           );
         })}
+        {rows.length === 0 && (
+          <div className="py-12 text-center text-sm" style={{ color: 'var(--dim)' }}>
+            No chain data — relay not connected.
+          </div>
+        )}
       </div>
-
-      {/* Footer */}
-      <ChainFooter ctx={ctx} rows={rows} />
+      {/* maxPain footer note */}
+      {maxPain > 0 && (
+        <div className="border-t px-4 py-1.5 text-[10px]" style={{ borderColor: 'var(--line)', color: 'var(--dim)' }}>
+          Max Pain <span className="font-bold" style={{ color: 'var(--ink)' }}>{_fmtP(maxPain)}</span>
+        </div>
+      )}
     </div>
   );
 }
 
-function ChainFooter({ ctx, rows }: { ctx: MarketContext; rows: ChainRow[] }) {
-  const totalCallOI = rows.reduce((s, r) => s + r.callOI, 0);
-  const totalPutOI  = rows.reduce((s, r) => s + r.putOI, 0);
-  const avgCallIV   = rows.filter((r) => r.callIV > 0).reduce((s, r) => s + r.callIV, 0) /
-                      Math.max(1, rows.filter((r) => r.callIV > 0).length);
+// ── TABLE sub-tab — Calls|Puts split (5-column, table-layout:fixed) ───────────
+// Columns: C Vol(13%) | C Bid/Ask(29%) | Strike(16%) | P Bid/Ask(29%) | P Vol(13%)
+// No horizontal scroll at 390px — table-layout:fixed with explicit widths.
 
-  return (
-    <div className="flex flex-wrap items-center gap-x-6 gap-y-1 border-t border-white/10 px-3 py-2 text-[11px] text-zinc-500">
-      <span>Call OI <span className="font-mono text-zinc-300">{totalCallOI.toLocaleString()}</span></span>
-      <span>Put OI <span className="font-mono text-zinc-300">{totalPutOI.toLocaleString()}</span></span>
-      <span>P/C <span className="font-mono text-zinc-300">{ctx.pcRatio.toFixed(2)}</span></span>
-      <span>Avg IV <span className="font-mono text-zinc-300">{_fmtIV(avgCallIV)}</span></span>
-      <span>Net GEX <span className={`font-mono ${ctx.netGex >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>{_fmtGex(ctx.netGex)}</span></span>
-    </div>
-  );
-}
-
-// ── FLOW Tab ─────────────────────────────────────────────────────────────────
-
-type FlowMode = 'OI' | 'VOL';
-
-interface FlowTabProps {
+function SplitTable({
+  rows,
+  ctx,
+  spot,
+}: {
   rows: ChainRow[];
-  ctx:  MarketContext;
-}
+  ctx: MarketContext;
+  spot: number;
+}) {
+  const { flipLevel, maxPain } = ctx;
+  const scrollRef = useRef<HTMLDivElement>(null);
 
-function FlowTab({ rows, ctx }: FlowTabProps) {
-  const [mode, setMode] = useState<FlowMode>('OI');
-
-  const callWall = ctx.walls.callWall;
-  const putWall  = ctx.walls.putWall;
-
-  const getValue = (row: ChainRow, side: 'call' | 'put'): number =>
-    mode === 'OI'
-      ? side === 'call' ? row.callOI : row.putOI
-      : side === 'call' ? row.callVolume : row.putVolume;
-
-  const allValues = rows.flatMap((r) => [getValue(r, 'call'), getValue(r, 'put')]);
-  const maxVal    = Math.max(1, ...allValues);
+  // Scroll ATM row into view on first load and when rows change
+  useEffect(() => {
+    if (!scrollRef.current) return;
+    const atm = scrollRef.current.querySelector<HTMLElement>('[data-atm="true"]');
+    if (atm) {
+      atm.scrollIntoView({ block: 'center', behavior: 'instant' });
+    }
+  }, [rows.length]);
 
   return (
-    <div className="flex flex-col overflow-hidden">
-      {/* Mode toggle */}
-      <div className="flex items-center gap-2 border-b border-white/10 px-4 py-2">
-        {(['OI', 'VOL'] as FlowMode[]).map((m) => (
+    <div className="chain-scroll" ref={scrollRef}>
+      <table
+        className="w-full"
+        style={{
+          tableLayout: 'fixed',
+          borderCollapse: 'collapse',
+          fontSize: '11px',
+          fontFamily: 'JetBrains Mono, monospace',
+        }}
+      >
+        <colgroup>
+          <col style={{ width: '13%' }} />
+          <col style={{ width: '29%' }} />
+          <col style={{ width: '16%' }} />
+          <col style={{ width: '29%' }} />
+          <col style={{ width: '13%' }} />
+        </colgroup>
+        <thead>
+          <tr style={{ borderBottom: `1px solid var(--line)` }}>
+            <th className="text-right py-1.5 px-1 text-[10px] font-bold uppercase tracking-widest" style={{ color: 'var(--dim)' }}>C Vol</th>
+            <th className="text-right py-1.5 px-1 text-[10px] font-bold uppercase tracking-widest" style={{ color: 'var(--g)' }}>C Bid/Ask</th>
+            <th className="text-center py-1.5 px-1 text-[10px] font-bold uppercase tracking-widest" style={{ color: 'var(--ink)' }}>Strike</th>
+            <th className="text-left  py-1.5 px-1 text-[10px] font-bold uppercase tracking-widest" style={{ color: 'var(--r)' }}>P Bid/Ask</th>
+            <th className="text-left  py-1.5 px-1 text-[10px] font-bold uppercase tracking-widest" style={{ color: 'var(--dim)' }}>P Vol</th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((row, i) => {
+            const atm  = _isATM(row, spot);
+            const flip = _isFlip(row, flipLevel, spot);
+            const isMP = row.isMaxPain;
+            const labels: string[] = [];
+            if (atm) labels.push('ATM');
+            if (flip) labels.push('FLIP');
+            if (isMP) labels.push('MP');
+
+            const rowBg = atm
+              ? 'rgba(245,166,35,0.08)'
+              : flip || isMP
+              ? 'rgba(255,255,255,0.03)'
+              : i % 2 === 0 ? 'rgba(255,255,255,0.01)' : 'transparent';
+
+            return (
+              <tr
+                key={row.strike}
+                data-atm={atm ? 'true' : undefined}
+                style={{ background: rowBg }}
+                className="hover:bg-white/5 transition-colors"
+              >
+                {/* C Vol */}
+                <td className="text-right py-1 px-1 truncate" style={{ color: 'var(--mut)' }}>
+                  {_fmtVol(row.callVolume)}
+                </td>
+                {/* C Bid/Ask */}
+                <td className="text-right py-1 px-1 truncate" style={{ color: 'var(--g)' }}>
+                  {_fmtBA(row.callBid, row.callAsk)}
+                </td>
+                {/* Strike */}
+                <td className="text-center py-1 px-1">
+                  <div className="flex items-center justify-center gap-1">
+                    <span
+                      className="font-bold truncate"
+                      style={{ color: atm ? 'var(--amb-solid)' : 'var(--ink)' }}
+                    >
+                      {_fmtP(row.strike)}
+                    </span>
+                    <StrikeChips labels={labels} />
+                  </div>
+                </td>
+                {/* P Bid/Ask */}
+                <td className="text-left py-1 px-1 truncate" style={{ color: 'var(--r)' }}>
+                  {_fmtBA(row.putBid, row.putAsk)}
+                </td>
+                {/* P Vol */}
+                <td className="text-left py-1 px-1 truncate" style={{ color: 'var(--mut)' }}>
+                  {_fmtVol(row.putVolume)}
+                </td>
+              </tr>
+            );
+          })}
+          {rows.length === 0 && (
+            <tr>
+              <td colSpan={5} className="py-12 text-center text-sm" style={{ color: 'var(--dim)' }}>
+                No chain data — relay not connected.
+              </td>
+            </tr>
+          )}
+        </tbody>
+      </table>
+      {maxPain > 0 && (
+        <div className="border-t px-4 py-1.5 text-[10px]" style={{ borderColor: 'var(--line)', color: 'var(--dim)' }}>
+          Max Pain <span className="font-bold" style={{ color: 'var(--ink)' }}>{_fmtP(maxPain)}</span>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── TABLE tab wrapper — Standard / Calls|Puts toggle ─────────────────────────
+
+function TableTab({
+  rows,
+  ctx,
+  spot,
+}: {
+  rows: ChainRow[];
+  ctx: MarketContext;
+  spot: number;
+}) {
+  const [view, setView] = useState<TableView>('splitside');
+
+  return (
+    <div className="flex flex-col h-full overflow-hidden">
+      {/* Toggle */}
+      <div className="flex flex-shrink-0 border-b" style={{ borderColor: 'var(--line)' }}>
+        {(['standard', 'splitside'] as TableView[]).map(v => (
           <button
-            key={m}
-            type="button"
-            onClick={() => setMode(m)}
-            className={`rounded px-3 py-1 text-xs font-bold transition-colors ${
-              mode === m
-                ? 'bg-white/15 text-white'
-                : 'text-zinc-500 hover:text-zinc-300'
-            }`}
+            key={v}
+            onClick={() => setView(v)}
+            className="flex-1 py-1.5 text-[10px] font-bold uppercase tracking-widest transition-colors"
+            style={{
+              color: view === v ? 'var(--amb-solid)' : 'var(--dim)',
+              borderBottom: `2px solid ${view === v ? 'var(--amb-solid)' : 'transparent'}`,
+              background: 'transparent',
+            }}
           >
-            {m === 'OI' ? 'Open Interest' : 'Volume'}
+            {v === 'standard' ? 'Standard' : 'Calls | Puts'}
+          </button>
+        ))}
+      </div>
+      {/* Content */}
+      <div className="flex-1 overflow-hidden">
+        {view === 'standard'
+          ? <StandardTable rows={rows} ctx={ctx} spot={spot} />
+          : <SplitTable    rows={rows} ctx={ctx} spot={spot} />
+        }
+      </div>
+    </div>
+  );
+}
+
+// ── GREEKS tab ────────────────────────────────────────────────────────────────
+
+const GRK_COLS = 'grid-cols-[1fr_1fr_1fr_1fr_1fr_1fr_1fr]';
+const GRK_MIN  = 'min-w-[540px]';
+
+function GreeksTab({ rows, spot }: { rows: ChainRow[]; spot: number }) {
+  return (
+    <div className="greeks-scroll overflow-x-auto">
+      <div
+        className={`grid ${GRK_COLS} ${GRK_MIN} border-b px-2 py-1.5 text-[10px] font-bold uppercase tracking-widest`}
+        style={{ borderColor: 'var(--line)', color: 'var(--dim)' }}
+      >
+        <span className="text-center">Strike</span>
+        <span className="text-right">Δ Call</span>
+        <span className="text-right">Δ Put</span>
+        <span className="text-right">Γ</span>
+        <span className="text-right">Θ Call</span>
+        <span className="text-right">Θ Put</span>
+        <span className="text-right">Vega</span>
+      </div>
+      <div className={GRK_MIN}>
+        {rows.map((row, i) => {
+          const atm = _isATM(row, spot);
+          return (
+            <div
+              key={row.strike}
+              className={`grid ${GRK_COLS} items-center px-2 py-1 text-[11px] font-mono transition-colors hover:bg-white/5 ${i % 2 === 0 ? 'bg-white/1' : ''} ${atm ? 'bg-amber-950/40' : ''}`}
+            >
+              <span
+                className="text-center font-bold"
+                style={{ color: atm ? 'var(--amb-solid)' : 'var(--ink)' }}
+              >
+                {_fmtP(row.strike)}
+              </span>
+              <span className="text-right" style={{ color: row.callDelta >= 0.5 ? 'var(--g)' : 'var(--mut)' }}>{_fmtDelta(row.callDelta)}</span>
+              <span className="text-right" style={{ color: Math.abs(row.putDelta) >= 0.5 ? 'var(--r)' : 'var(--mut)' }}>{_fmtDelta(row.putDelta)}</span>
+              <span className="text-right" style={{ color: 'var(--ink)' }}>{row.callGamma > 0 ? row.callGamma.toFixed(4) : '—'}</span>
+              <span className="text-right" style={{ color: 'var(--r)' }}>{row.callTheta !== 0 ? row.callTheta.toFixed(3) : '—'}</span>
+              <span className="text-right" style={{ color: 'var(--r)' }}>{row.putTheta !== 0 ? row.putTheta.toFixed(3) : '—'}</span>
+              <span className="text-right" style={{ color: 'var(--mut)' }}>{row.callVega > 0 ? row.callVega.toFixed(3) : '—'}</span>
+            </div>
+          );
+        })}
+        {rows.length === 0 && (
+          <div className="py-12 text-center text-sm" style={{ color: 'var(--dim)' }}>No Greeks data.</div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ── FLOW tab ──────────────────────────────────────────────────────────────────
+
+type FlowScope = 'overall' | 'ticker';
+
+function FlowTab({ ticker, rows }: { ticker: string; rows: ChainRow[] }) {
+  const [scope, setScope] = useState<FlowScope>('overall');
+  const [, forceUpdate]   = useState(0);
+
+  useEffect(() => {
+    const unsub = cvdStore.subscribe(() => forceUpdate(n => n + 1));
+    return () => unsub();
+  }, []);
+
+  // Overall: CVD data for the ticker
+  const cvdRes  = cvdStore.getResult(ticker);
+  const cvd     = cvdRes.status === 'ready' ? cvdRes.data : null;
+
+  // This Ticker: sum call/put volume from chain rows
+  const callVol = rows.reduce((s, r) => s + r.callVolume, 0);
+  const putVol  = rows.reduce((s, r) => s + r.putVolume, 0);
+  const totalVol = callVol + putVol;
+  const callPct = totalVol > 0 ? (callVol / totalVol) * 100 : 50;
+  const putPct  = totalVol > 0 ? (putVol  / totalVol) * 100 : 50;
+
+  return (
+    <div className="flow-scroll px-4 py-3 space-y-4">
+      {/* Scope toggle */}
+      <div className="flex gap-2">
+        {(['overall', 'ticker'] as FlowScope[]).map(s => (
+          <button
+            key={s}
+            onClick={() => setScope(s)}
+            className="px-3 py-1 text-[10px] font-bold uppercase tracking-widest transition-colors border"
+            style={{
+              borderRadius: 3,
+              background: scope === s ? 'var(--amb-dim)' : 'transparent',
+              borderColor: scope === s ? 'var(--amb-solid)' : 'var(--line)',
+              color: scope === s ? 'var(--amb-solid)' : 'var(--mut)',
+            }}
+          >
+            {s === 'overall' ? 'Overall' : `This Ticker (${ticker})`}
           </button>
         ))}
       </div>
 
-      {/* Bar rows */}
-      <div className="flow-scroll overflow-y-auto">
-        {rows.map((row) => {
-          const callVal  = getValue(row, 'call');
-          const putVal   = getValue(row, 'put');
-          const callPct  = (callVal / maxVal) * 100;
-          const putPct   = (putVal  / maxVal) * 100;
-          const isCallWall = row.strike === callWall;
-          const isPutWall  = row.strike === putWall;
-
-          return (
-            <div
-              key={row.strike}
-              className="flex items-center gap-0 border-b border-white/5 px-2 py-0.5"
-            >
-              {/* Call bar (left, right-aligned) */}
-              <div className="flex flex-1 items-center justify-end gap-2 pr-2">
-                {isCallWall && (
-                  <span className="text-[9px] font-bold tracking-widest text-emerald-400 uppercase">
-                    Call Wall
-                  </span>
-                )}
-                <span className="w-14 text-right font-mono text-[11px] text-zinc-400">
-                  {callVal > 0 ? callVal.toLocaleString() : '—'}
-                </span>
-                <div className="h-5 overflow-hidden rounded-l-sm" style={{ width: '120px' }}>
-                  <div
-                    className="h-full rounded-l-sm bg-emerald-600/60 transition-all duration-300"
-                    style={{ width: `${callPct}%`, marginLeft: 'auto' }}
-                  />
-                </div>
+      {scope === 'overall' ? (
+        cvd ? (
+          <div className="space-y-3">
+            {/* Call/Put CVD bar */}
+            <div>
+              <div className="flex justify-between text-[10px] mb-1" style={{ color: 'var(--mut)' }}>
+                <span className="text-[var(--g)] font-bold">CALLS {Math.round(cvd.callPct)}%</span>
+                <span className="text-[var(--r)] font-bold">PUTS {Math.round(cvd.putPct)}%</span>
               </div>
-
-              {/* Strike */}
-              <div className="w-20 text-center font-mono text-[11px] font-bold text-zinc-300">
-                {_fmtPrice(row.strike)}
-              </div>
-
-              {/* Put bar (right, left-aligned) */}
-              <div className="flex flex-1 items-center gap-2 pl-2">
-                <div className="h-5 w-[120px] overflow-hidden rounded-r-sm">
-                  <div
-                    className="h-full rounded-r-sm bg-rose-600/60 transition-all duration-300"
-                    style={{ width: `${putPct}%` }}
-                  />
-                </div>
-                <span className="w-14 font-mono text-[11px] text-zinc-400">
-                  {putVal > 0 ? putVal.toLocaleString() : '—'}
-                </span>
-                {isPutWall && (
-                  <span className="text-[9px] font-bold tracking-widest text-rose-400 uppercase">
-                    Put Wall
-                  </span>
-                )}
-              </div>
-            </div>
-          );
-        })}
-      </div>
-
-      {/* Footer */}
-      <FlowFooter rows={rows} ctx={ctx} mode={mode} />
-    </div>
-  );
-}
-
-function FlowFooter({ rows, ctx, mode }: { rows: ChainRow[]; ctx: MarketContext; mode: FlowMode }) {
-  const callWallStrike = ctx.walls.callWall;
-  const putWallStrike  = ctx.walls.putWall;
-  const callWallRow    = rows.find((r) => r.strike === callWallStrike);
-  const putWallRow     = rows.find((r) => r.strike === putWallStrike);
-  const callWallVal    = callWallRow ? (mode === 'OI' ? callWallRow.callOI : callWallRow.callVolume) : null;
-  const putWallVal     = putWallRow  ? (mode === 'OI' ? putWallRow.putOI   : putWallRow.putVolume)   : null;
-
-  return (
-    <div className="flex flex-wrap items-center gap-x-6 gap-y-1 border-t border-white/10 px-3 py-2 text-[11px] text-zinc-500">
-      <span>
-        Top Call Wall{' '}
-        <span className="font-mono text-emerald-300">
-          {_fmtPrice(callWallStrike)}
-          {callWallVal != null ? ` (${callWallVal.toLocaleString()})` : ''}
-        </span>
-      </span>
-      <span>
-        Top Put Wall{' '}
-        <span className="font-mono text-rose-300">
-          {_fmtPrice(putWallStrike)}
-          {putWallVal != null ? ` (${putWallVal.toLocaleString()})` : ''}
-        </span>
-      </span>
-      <span>Net GEX <span className={`font-mono ${ctx.netGex >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>{_fmtGex(ctx.netGex)}</span></span>
-      <span>P/C <span className="font-mono text-zinc-300">{ctx.pcRatio.toFixed(2)}</span></span>
-    </div>
-  );
-}
-
-// ── GREEKS Tab ────────────────────────────────────────────────────────────────
-
-interface GreeksTabProps {
-  rows:      ChainRow[];
-  ctx:       MarketContext;
-  spotPrice: number;
-}
-
-function GreeksTab({ rows, ctx, spotPrice }: GreeksTabProps) {
-  const { flipLevel } = ctx;
-
-  return (
-    <div className="greeks-scroll overflow-x-auto">
-      {/* Header — calls */}
-      <div className="grid grid-cols-[80px_1fr_1fr_1fr_1fr_1fr_1fr_80px_1fr_1fr_1fr_1fr_1fr_1fr] min-w-[1100px] border-b border-white/10 px-2 py-1.5 text-[11px] font-semibold uppercase tracking-widest text-zinc-500">
-        <span className="text-right pr-2 text-zinc-600 col-span-7 text-center">Calls</span>
-        <span className="text-center">Strike</span>
-        <span className="text-left col-span-6 text-center text-zinc-600">Puts</span>
-      </div>
-      <div className="grid grid-cols-[80px_1fr_1fr_1fr_1fr_1fr_1fr_80px_1fr_1fr_1fr_1fr_1fr_1fr] min-w-[1100px] border-b border-white/10 px-2 py-1 text-[11px] font-semibold uppercase tracking-widest text-zinc-500">
-        <span className="text-right">B/E</span>
-        <span className="text-right">IV</span>
-        <span className="text-right">Vega</span>
-        <span className="text-right">Theta</span>
-        <span className="text-right">Gamma</span>
-        <span className="text-right">Delta</span>
-        <span className="text-right">OI</span>
-        <span className="text-center">Strike</span>
-        <span className="text-left">OI</span>
-        <span className="text-left">Delta</span>
-        <span className="text-left">Gamma</span>
-        <span className="text-left">Theta</span>
-        <span className="text-left">Vega</span>
-        <span className="text-left">IV</span>
-      </div>
-
-      {/* Rows */}
-      <div className="min-w-[1100px]">
-        {rows.map((row) => {
-          const isATM   = _isATMRow(row, spotPrice);
-          const isFlip  = _isFlipRow(row, flipLevel, spotPrice);
-          const isMP    = _isMaxPainRow(row);
-          const rowBg   = isATM
-            ? 'bg-amber-950/40 hover:bg-amber-950/60'
-            : isFlip || isMP
-            ? 'bg-violet-950/30 hover:bg-violet-950/50'
-            : 'hover:bg-white/[0.03]';
-
-          // Break-even = strike + call premium (for calls)
-          const callMid = (row.callBid + row.callAsk) / 2;
-          const callBE  = callMid > 0 ? row.strike + callMid : 0;
-
-          // Delta colour
-          const callDeltaColor =
-            row.callDelta >= 0.5 ? 'text-emerald-300 font-bold' :
-            row.callDelta >= 0.3 ? 'text-emerald-400' :
-            'text-zinc-400';
-          const putDeltaColor =
-            row.putDelta <= -0.5 ? 'text-rose-300 font-bold' :
-            row.putDelta <= -0.3 ? 'text-rose-400' :
-            'text-zinc-400';
-
-          return (
-            <div
-              key={row.strike}
-              className={`grid grid-cols-[80px_1fr_1fr_1fr_1fr_1fr_1fr_80px_1fr_1fr_1fr_1fr_1fr_1fr] border-b border-white/5 px-2 py-1 text-xs transition-colors ${rowBg}`}
-            >
-              {/* Calls */}
-              <span className="text-right font-mono text-zinc-300">
-                {callBE > 0 ? _fmtPrice(callBE) : '—'}
-              </span>
-              <span className="text-right font-mono text-zinc-400">{_fmtIV(row.callIV)}</span>
-              <span className="text-right font-mono text-zinc-400">{row.callVega !== 0 ? row.callVega.toFixed(3) : '—'}</span>
-              <span className="text-right font-mono text-zinc-400">{row.callTheta !== 0 ? row.callTheta.toFixed(3) : '—'}</span>
-              <span className="text-right font-mono text-zinc-400">{row.callGamma !== 0 ? row.callGamma.toFixed(4) : '—'}</span>
-              <span className={`text-right font-mono ${callDeltaColor}`}>{_fmtDelta(row.callDelta)}</span>
-              <span className="text-right font-mono text-zinc-500">{row.callOI > 0 ? row.callOI.toLocaleString() : '—'}</span>
-
-              {/* Strike */}
-              <div className="flex flex-col items-center justify-center">
-                <span className={`font-mono text-[11px] font-bold ${
-                  isATM ? 'text-amber-300' : isFlip || isMP ? 'text-violet-300' : 'text-zinc-200'
-                }`}>
-                  {_fmtPrice(row.strike)}
-                </span>
-              </div>
-
-              {/* Puts */}
-              <span className="text-left font-mono text-zinc-500">{row.putOI > 0 ? row.putOI.toLocaleString() : '—'}</span>
-              <span className={`text-left font-mono ${putDeltaColor}`}>{_fmtDelta(row.putDelta)}</span>
-              <span className="text-left font-mono text-zinc-400">{row.putGamma !== 0 ? row.putGamma.toFixed(4) : '—'}</span>
-              <span className="text-left font-mono text-zinc-400">{row.putTheta !== 0 ? row.putTheta.toFixed(3) : '—'}</span>
-              <span className="text-left font-mono text-zinc-400">{row.putVega !== 0 ? row.putVega.toFixed(3) : '—'}</span>
-              <span className="text-left font-mono text-zinc-400">{_fmtIV(row.putIV)}</span>
-            </div>
-          );
-        })}
-      </div>
-
-      {/* B/E key */}
-      <div className="border-t border-white/10 px-3 py-2 text-[10px] text-zinc-600">
-        B/E = Break-even (strike ± mid-market premium). ATM highlighted amber. Flip/MP highlighted violet. Delta ≥ 0.50 bold.
-      </div>
-    </div>
-  );
-}
-
-// ── GEX Tab ───────────────────────────────────────────────────────────────────
-
-interface GexTabProps {
-  rows:      ChainRow[];
-  ctx:       MarketContext;
-  spotPrice: number;
-}
-
-function GexTab({ rows, ctx, spotPrice }: GexTabProps) {
-  const { gexRegime, netGex, walls, flipLevel } = ctx;
-
-  const regimeName =
-    gexRegime === 'positive' ? 'POSITIVE GAMMA REGIME' :
-    gexRegime === 'negative' ? 'NEGATIVE GAMMA REGIME' :
-    'NEUTRAL GAMMA REGIME';
-
-  const regimeColor =
-    gexRegime === 'positive' ? 'text-emerald-300' :
-    gexRegime === 'negative' ? 'text-rose-300' :
-    'text-zinc-400';
-
-  const regimeExplanation =
-    gexRegime === 'positive'
-      ? 'Dealers are long gamma — they sell into rallies and buy dips, suppressing volatility and keeping price in a range.'
-      : gexRegime === 'negative'
-      ? 'Dealers are short gamma — they buy into rallies and sell dips, amplifying moves and increasing volatility.'
-      : 'Net dealer gamma is near zero — no dominant force; price can break in either direction with modest momentum.';
-
-  // Dot size: scale magnitude relative to max |netGex| in chain
-  const maxAbs = Math.max(1, ...rows.map((r) => Math.abs(r.netGex)));
-  const dotSize = (absVal: number) => Math.max(4, Math.round((absVal / maxAbs) * 20));
-
-  return (
-    <div className="flex flex-col overflow-hidden">
-      {/* Regime banner */}
-      <div className="border-b border-white/10 px-4 py-4">
-        <div className={`text-2xl font-black tracking-tight ${regimeColor}`}>
-          {regimeName}
-        </div>
-        <div className="mt-1 flex items-center gap-3">
-          <span className="font-mono text-sm font-bold text-zinc-300">
-            Net GEX{' '}
-            <span className={netGex >= 0 ? 'text-emerald-400' : 'text-rose-400'}>
-              {_fmtGex(netGex)}
-            </span>
-          </span>
-        </div>
-        <p className="mt-2 max-w-xl text-sm text-zinc-400">{regimeExplanation}</p>
-
-        {/* Regime pills */}
-        <div className="mt-3 flex flex-wrap gap-2">
-          <div className="flex items-center gap-2 rounded border border-emerald-700/40 bg-emerald-950/40 px-3 py-1.5">
-            <span className="text-[10px] font-bold uppercase tracking-widest text-emerald-500">Main Wall</span>
-            <span className="font-mono text-sm font-bold text-emerald-300">{_fmtPrice(walls.callWall)}</span>
-          </div>
-          <div className="flex items-center gap-2 rounded border border-rose-700/40 bg-rose-950/40 px-3 py-1.5">
-            <span className="text-[10px] font-bold uppercase tracking-widest text-rose-500">Put Wall</span>
-            <span className="font-mono text-sm font-bold text-rose-300">{_fmtPrice(walls.putWall)}</span>
-          </div>
-          <div className="flex items-center gap-2 rounded border border-violet-700/40 bg-violet-950/40 px-3 py-1.5">
-            <span className="text-[10px] font-bold uppercase tracking-widest text-violet-500">Flip Point</span>
-            <span className="font-mono text-sm font-bold text-violet-300">{_fmtPrice(flipLevel)}</span>
-          </div>
-          <div className="flex items-center gap-2 rounded border border-violet-700/40 bg-violet-950/40 px-3 py-1.5">
-            <span className="text-[10px] font-bold uppercase tracking-widest text-violet-500">Max Pain</span>
-            <span className="font-mono text-sm font-bold text-violet-300">{_fmtPrice(ctx.maxPain)}</span>
-          </div>
-        </div>
-      </div>
-
-      {/* Per-strike GEX table */}
-      <div className="gex-scroll overflow-y-auto">
-        {/* Header */}
-        <div className="grid grid-cols-[80px_1fr_1fr_1fr_32px] border-b border-white/10 px-3 py-1.5 text-[11px] font-semibold uppercase tracking-widest text-zinc-500">
-          <span>Strike</span>
-          <span className="text-right">Call GEX</span>
-          <span className="text-right">Put GEX</span>
-          <span className="text-right">Net GEX</span>
-          <span />
-        </div>
-
-        {rows.map((row) => {
-          const isFlip     = _isFlipRow(row, flipLevel, spotPrice);
-          const isMP       = _isMaxPainRow(row);
-          const isATM      = _isATMRow(row, spotPrice);
-          const rowBg      = isATM
-            ? 'bg-amber-950/30'
-            : isFlip || isMP
-            ? 'bg-violet-950/25'
-            : '';
-          const netColor   = row.netGex >= 0 ? 'text-emerald-400' : 'text-rose-400';
-          const ds         = dotSize(Math.abs(row.netGex));
-
-          return (
-            <div
-              key={row.strike}
-              className={`grid grid-cols-[80px_1fr_1fr_1fr_32px] items-center border-b border-white/5 px-3 py-1 text-xs ${rowBg}`}
-            >
-              <span className={`font-mono font-bold ${
-                isATM ? 'text-amber-300' : isFlip || isMP ? 'text-violet-300' : 'text-zinc-300'
-              }`}>
-                {_fmtPrice(row.strike)}
-              </span>
-              <span className="text-right font-mono text-emerald-400/80">{_fmtGex(row.callGex)}</span>
-              <span className="text-right font-mono text-rose-400/80">{_fmtGex(row.putGex)}</span>
-              <span className={`text-right font-mono font-bold ${netColor}`}>{_fmtGex(row.netGex)}</span>
-              {/* Proportional dot */}
-              <div className="flex items-center justify-center">
+              <div className="h-3 overflow-hidden" style={{ background: 'var(--r-dim)', borderRadius: 2 }}>
                 <div
-                  className={`rounded-full ${row.netGex >= 0 ? 'bg-emerald-500/70' : 'bg-rose-500/70'}`}
-                  style={{ width: ds, height: ds }}
+                  className="h-full transition-all"
+                  style={{ width: `${cvd.callPct}%`, background: 'var(--g)' }}
                 />
               </div>
             </div>
-          );
-        })}
-      </div>
+            <div className="grid grid-cols-2 gap-3">
+              <div className="p-2 space-y-0.5" style={{ background: 'var(--panel2)', borderRadius: 2 }}>
+                <div className="text-[10px]" style={{ color: 'var(--dim)' }}>NET DELTA</div>
+                <div className="text-sm font-bold font-mono" style={{ color: cvd.netDelta >= 0 ? 'var(--g)' : 'var(--r)' }}>
+                  {cvd.netDelta >= 0 ? '+' : ''}{cvd.netDelta.toFixed(2)}
+                </div>
+              </div>
+              <div className="p-2 space-y-0.5" style={{ background: 'var(--panel2)', borderRadius: 2 }}>
+                <div className="text-[10px]" style={{ color: 'var(--dim)' }}>CLASSIFICATION</div>
+                <div
+                  className="text-sm font-bold uppercase"
+                  style={{ color: cvd.classification === 'bullish' ? 'var(--g)' : cvd.classification === 'bearish' ? 'var(--r)' : 'var(--mut)' }}
+                >
+                  {cvd.classification}
+                </div>
+              </div>
+              <div className="p-2 space-y-0.5" style={{ background: 'var(--panel2)', borderRadius: 2 }}>
+                <div className="text-[10px]" style={{ color: 'var(--dim)' }}>TICK COUNT</div>
+                <div className="text-sm font-bold font-mono" style={{ color: 'var(--ink)' }}>
+                  {cvd.tickCount.toLocaleString()}
+                </div>
+              </div>
+            </div>
+          </div>
+        ) : (
+          <div className="py-8 text-center text-sm" style={{ color: 'var(--dim)' }}>CVD data unavailable.</div>
+        )
+      ) : (
+        /* This Ticker: chain-derived vol split */
+        <div className="space-y-3">
+          <div>
+            <div className="flex justify-between text-[10px] mb-1" style={{ color: 'var(--mut)' }}>
+              <span className="text-[var(--g)] font-bold">CALLS {Math.round(callPct)}%</span>
+              <span className="text-[var(--r)] font-bold">PUTS {Math.round(putPct)}%</span>
+            </div>
+            <div className="h-3 overflow-hidden" style={{ background: 'var(--r-dim)', borderRadius: 2 }}>
+              <div className="h-full transition-all" style={{ width: `${callPct}%`, background: 'var(--g)' }} />
+            </div>
+          </div>
+          <div className="grid grid-cols-3 gap-2">
+            {[
+              { label: 'CALL VOL', val: _fmtVol(callVol), col: 'var(--g)' },
+              { label: 'PUT VOL',  val: _fmtVol(putVol),  col: 'var(--r)' },
+              { label: 'TOTAL',    val: _fmtVol(totalVol), col: 'var(--ink)' },
+            ].map(({ label, val, col }) => (
+              <div key={label} className="p-2 space-y-0.5" style={{ background: 'var(--panel2)', borderRadius: 2 }}>
+                <div className="text-[10px]" style={{ color: 'var(--dim)' }}>{label}</div>
+                <div className="text-sm font-bold font-mono" style={{ color: col }}>{val}</div>
+              </div>
+            ))}
+          </div>
+          {rows.length === 0 && (
+            <div className="py-4 text-center text-sm" style={{ color: 'var(--dim)' }}>No chain rows loaded.</div>
+          )}
+        </div>
+      )}
     </div>
   );
 }
 
-// ── Main: ChainCockpit ────────────────────────────────────────────────────────
+// ── GEX Map tab ───────────────────────────────────────────────────────────────
 
-export default function ChainCockpit() {
-  const [activeTicker, setActiveTicker] = useState<string>(SELECTABLE_TICKERS[0] ?? 'SPY');
-  const [activeTab,    setActiveTab]    = useState<SubTab>('CHAIN');
-  const [_expiry,      setExpiry]       = useState<string>(DEFAULT_EXPIRY.value);
-
-  // ── Store state ─────────────────────────────────────────────────────────────
-  const [ctxResult,  setCtxResult]  = useState(() => marketStore.getResult(activeTicker));
-  const [barsResult, setBarsResult] = useState(() => barsStore.getResult(activeTicker));
-  const [dir,        setDir]        = useState<DirectionState | null>(
-    () => getDirectionState(activeTicker),
-  );
-
-  // Selected strike — stored in local state; navigation will be wired once
-  // ZeroDteCockpit is built.
-  const [_selectedStrike, setSelectedStrike] = useState<number | null>(null);
-
-  // ── Re-read stores whenever ticker changes or stores update ─────────────────
-  const refresh = useCallback(() => {
-    setCtxResult(marketStore.getResult(activeTicker));
-    setBarsResult(barsStore.getResult(activeTicker));
-    setDir(getDirectionState(activeTicker));
-  }, [activeTicker]);
-
-  useEffect(() => {
-    refresh();
-
-    const unsubs = [
-      marketStore.subscribe(refresh),
-      barsStore.subscribe(refresh),
-      subscribeDirection((_t, _s) => refresh()),
-    ];
-
-    return () => { for (const u of unsubs) u(); };
-  }, [refresh]);
-
-  // ── Derived data ─────────────────────────────────────────────────────────────
-
-  // Live price + prior close
-  let price:     number | null = null;
-  let changePct: number | null = null;
-
-  if (barsResult.status === 'ready' && barsResult.data.length >= 2) {
-    const bars = barsResult.data;
-    price = bars[bars.length - 1].close;
-    const prev = bars[0].open;
-    if (prev > 0) changePct = ((price - prev) / prev) * 100;
-  }
-
-  // ctx + chain rows
-  const ctx:   MarketContext | null  = ctxResult.status === 'ready' ? ctxResult.data : null;
-  const rows:  ChainRow[]            = ctx?.chain ?? [];
-  const spotPrice = price ?? ctx?.flipLevel ?? 0;
-
-  // ── Tab content ───────────────────────────────────────────────────────────────
-
-  function renderTabContent() {
-    if (ctxResult.status === 'loading') return <LoadingSkeleton />;
-    if (ctxResult.status === 'error')   return <ErrorBanner reason={ctxResult.reason} />;
-    if (!ctx || rows.length === 0) {
-      return (
-        <div className="flex flex-col items-center justify-center gap-2 py-16 text-zinc-500">
-          <span className="text-3xl">⛓</span>
-          <span className="text-sm">No chain data — waiting for first snapshot</span>
-        </div>
-      );
-    }
-
-    switch (activeTab) {
-      case 'CHAIN':
-        return (
-          <ChainTab
-            rows={rows}
-            ctx={ctx}
-            spotPrice={spotPrice}
-            onStrikeSelect={(strike) => {
-              setSelectedStrike(strike);
-              // TODO: navigate to /zerod/${activeTicker}?strike=${strike}
-              // once ZeroDteCockpit is built
-            }}
-          />
-        );
-      case 'FLOW':
-        return <FlowTab rows={rows} ctx={ctx} />;
-      case 'GREEKS':
-        return <GreeksTab rows={rows} ctx={ctx} spotPrice={spotPrice} />;
-      case 'GEX':
-        return <GexTab rows={rows} ctx={ctx} spotPrice={spotPrice} />;
-    }
-  }
-
-  // ── Render ────────────────────────────────────────────────────────────────────
+function GexTab({ rows, spot }: { rows: ChainRow[]; spot: number }) {
+  const maxAbs = useMemo(() => {
+    return rows.reduce((m, r) => Math.max(m, Math.abs(r.netGex)), 1);
+  }, [rows]);
 
   return (
-    <section id="chain" className="flex h-full flex-col bg-zinc-950 text-white">
-      {/* Ticker + Expiry selectors */}
-      <div className="flex items-center gap-3 border-b border-white/10 bg-zinc-900/60 px-4 py-2.5">
-        {/* Ticker selector */}
-        <div className="flex flex-wrap items-center gap-1">
-          {SELECTABLE_TICKERS.map((t) => (
-            <button
-              key={t}
-              type="button"
-              onClick={() => {
-                setActiveTicker(t);
-                setSelectedStrike(null);
-              }}
-              className={`rounded px-2.5 py-1 text-xs font-bold transition-colors ${
-                activeTicker === t
-                  ? 'bg-white/20 text-white'
-                  : 'text-zinc-500 hover:text-zinc-300 hover:bg-white/5'
-              }`}
+    <div className="gex-scroll px-2 py-2 space-y-0.5">
+      {rows.length === 0 && (
+        <div className="py-12 text-center text-sm" style={{ color: 'var(--dim)' }}>No GEX data.</div>
+      )}
+      {rows.map((row) => {
+        const gex  = row.netGex;
+        const pct  = Math.abs(gex) / maxAbs;
+        const atm  = _isATM(row, spot);
+        const pos  = gex >= 0;
+        return (
+          <div key={row.strike} className="flex items-center gap-2 py-0.5">
+            {/* Strike label */}
+            <span
+              className="w-14 shrink-0 text-right text-[11px] font-mono font-bold"
+              style={{ color: atm ? 'var(--amb-solid)' : 'var(--mut)' }}
             >
-              {t}
+              {_fmtP(row.strike)}
+            </span>
+            {/* Bar */}
+            <div className="flex-1 h-5 relative overflow-hidden" style={{ background: 'var(--line)', borderRadius: 1 }}>
+              <div
+                className="h-full absolute top-0 left-0 transition-all"
+                style={{
+                  width: `${pct * 100}%`,
+                  background: pos ? 'var(--g-dim)' : 'var(--r-dim)',
+                  borderRight: `2px solid ${pos ? 'var(--g)' : 'var(--r)'}`,
+                }}
+              />
+            </div>
+            {/* GEX value */}
+            <span
+              className="w-16 shrink-0 text-right text-[11px] font-mono"
+              style={{ color: pos ? 'var(--g)' : 'var(--r)' }}
+            >
+              {_fmtGex(gex)}
+            </span>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+// ── Footer card ───────────────────────────────────────────────────────────────
+
+function FooterCard({ ctx }: { ctx: MarketContext | null }) {
+  if (!ctx) return null;
+  const { pcRatio, walls, netGex } = ctx;
+  const ivRank = (ctx as MarketContext & { ivRank?: number }).ivRank ?? null;
+
+  return (
+    <div
+      className="flex-shrink-0 flex items-center justify-around px-4 py-2 border-t"
+      style={{
+        background: 'var(--panel)',
+        borderColor: 'var(--line)',
+        minHeight: 44,
+      }}
+    >
+      {[
+        { label: 'P/C', val: pcRatio > 0 ? pcRatio.toFixed(2) : '—', col: pcRatio > 1 ? 'var(--r)' : pcRatio > 0 ? 'var(--g)' : 'var(--dim)' },
+        { label: 'IV RANK', val: ivRank != null ? `${ivRank.toFixed(0)}%` : '—', col: 'var(--ink)' },
+        { label: 'CALL WALL', val: walls?.callWall > 0 ? _fmtP(walls.callWall) : '—', col: 'var(--g)' },
+        { label: 'PUT WALL', val: walls?.putWall > 0 ? _fmtP(walls.putWall) : '—', col: 'var(--r)' },
+        { label: 'NET GEX', val: netGex !== 0 ? _fmtGex(netGex) : '—', col: netGex >= 0 ? 'var(--g)' : 'var(--r)' },
+      ].map(({ label, val, col }) => (
+        <div key={label} className="flex flex-col items-center">
+          <span className="text-[9px] font-bold uppercase tracking-widest" style={{ color: 'var(--dim)' }}>{label}</span>
+          <span className="text-[13px] font-bold font-mono" style={{ color: col }}>{val}</span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+// ── Main ChainCockpit ─────────────────────────────────────────────────────────
+
+export default function ChainCockpit({ onOpenChart }: { onOpenChart?: (ticker: string) => void }) {
+  const [query,      setQuery]      = useState('');
+  const [ticker,     setTicker]     = useState<string>(SELECTABLE[0] ?? 'SPY');
+  const [expiry,     setExpiry]     = useState('Current');
+  const [activeTab,  setActiveTab]  = useState<SubTab>('TABLE');
+  const [, forceUpdate]             = useState(0);
+  const searchRef = useRef<HTMLInputElement>(null);
+
+  // ── Store subscriptions ───────────────────────────────────────────────────
+
+  useEffect(() => {
+    const unsubMkt  = marketStore.subscribe(() => forceUpdate(n => n + 1));
+    const unsubBars = barsStore.subscribe(() => forceUpdate(n => n + 1));
+    const unsubDir  = subscribeDirection(() => forceUpdate(n => n + 1));
+    return () => { unsubMkt(); unsubBars(); unsubDir(); };
+  }, []);
+
+  // ── Derived data ──────────────────────────────────────────────────────────
+
+  const mktRes  = marketStore.getResult(ticker);
+  const barsRes = barsStore.getResult(ticker);
+  const dir     = getDirectionState(ticker) as DirectionState | null;
+
+  const ctx     = mktRes.status  === 'ready' ? mktRes.data  : null;
+  const bars    = barsRes.status === 'ready' ? barsRes.data : null;
+
+  const spot    = bars && bars.length > 0 ? bars[bars.length - 1].close : 0;
+  const priorClose = bars && bars.length > 1 ? bars[bars.length - 2].close : null;
+  const changePct  = spot > 0 && priorClose && priorClose > 0
+    ? ((spot - priorClose) / priorClose) * 100 : null;
+
+  // All chain rows for selected ticker
+  const allRows: ChainRow[] = ctx?.chain ?? [];
+
+  // Derive expiry list
+  const expiries = useMemo(() => _getExpiries(allRows), [allRows]);
+
+  // Resolve effective expiry synchronously in render — no useEffect flash state.
+  // If expiry state is unset or stale (not in current list), fall back to first.
+  // Keep expiry state in sync for tab highlighting.
+  const effectiveExpiry = expiries.includes(expiry) ? expiry : (expiries[0] ?? 'Current');
+  useEffect(() => {
+    if (effectiveExpiry !== expiry) setExpiry(effectiveExpiry);
+  }, [effectiveExpiry, expiry]);
+
+  // Filter rows by effective expiry — always correct on first paint
+  const expiryRows = useMemo(() => {
+    if (effectiveExpiry === 'Current' || !effectiveExpiry) return allRows;
+    return allRows.filter(r => r.expiry === effectiveExpiry);
+  }, [allRows, effectiveExpiry]);
+
+  // ATM filter: keep only strikes within ±15% of spot
+  const filteredRows = useMemo(() => {
+    if (spot <= 0 || expiryRows.length === 0) return expiryRows;
+    const lo = spot * (1 - ATM_STRIKE_WINDOW_PCT);
+    const hi = spot * (1 + ATM_STRIKE_WINDOW_PCT);
+    const inWindow = expiryRows.filter(r => r.strike >= lo && r.strike <= hi);
+    return inWindow.length >= 5 ? inWindow : expiryRows;
+  }, [expiryRows, spot]);
+
+  // ── Ticker search filter ──────────────────────────────────────────────────
+
+  const filteredTickers = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    if (!q) return SELECTABLE;
+    return SELECTABLE.filter(t => {
+      const name = (COMPANY_NAMES[t] ?? '').toLowerCase();
+      return t.toLowerCase().startsWith(q) || name.includes(q);
+    });
+  }, [query]);
+
+  const handleTickerSelect = useCallback((t: string) => {
+    setTicker(t);
+    setQuery('');
+    setExpiry('Current');
+  }, []);
+
+  // ── Render tab content ────────────────────────────────────────────────────
+
+  const renderTabContent = useCallback(() => {
+    if (mktRes.status === 'loading') return <Skeleton />;
+    if (mktRes.status === 'error') return <ErrorBanner reason={mktRes.reason} />;
+
+    switch (activeTab) {
+      case 'TABLE':
+        return <TableTab rows={filteredRows} ctx={ctx!} spot={spot} />;
+      case 'GREEKS':
+        return <GreeksTab rows={filteredRows} spot={spot} />;
+      case 'FLOW':
+        return <FlowTab ticker={ticker} rows={filteredRows} />;
+      case 'GEX':
+        return <GexTab rows={filteredRows} spot={spot} />;
+    }
+  }, [mktRes, activeTab, filteredRows, ctx, spot, ticker]);
+
+  const isCash = CASH_SETTLED_TICKERS.has(ticker);
+
+  return (
+    <section
+      id="chain"
+      className="flex flex-col"
+      style={{ height: '100%', background: 'var(--void)', color: 'var(--ink)', fontFamily: 'JetBrains Mono, monospace' }}
+    >
+      {/* ── Ticker search box ── */}
+      <div
+        className="flex-shrink-0 px-3 py-2 border-b"
+        style={{ background: 'var(--panel)', borderColor: 'var(--line)' }}
+      >
+        <div
+          className="flex items-center gap-2 px-2.5 py-1.5"
+          style={{ background: 'var(--panel2)', border: '1px solid var(--line)', borderRadius: 3 }}
+        >
+          <svg width="13" height="13" viewBox="0 0 20 20" fill="none" style={{ flexShrink: 0 }}>
+            <circle cx="9" cy="9" r="6" stroke="var(--dim)" strokeWidth="2"/>
+            <path d="M14 14l3 3" stroke="var(--dim)" strokeWidth="2" strokeLinecap="round"/>
+          </svg>
+          <input
+            ref={searchRef}
+            type="text"
+            value={query}
+            onChange={e => setQuery(e.target.value)}
+            placeholder="Search ticker or company…"
+            className="flex-1 bg-transparent text-[12px] outline-none placeholder-opacity-40"
+            style={{ color: 'var(--ink)', fontFamily: 'inherit' }}
+          />
+          {query && (
+            <button
+              onClick={() => setQuery('')}
+              className="text-[11px]"
+              style={{ color: 'var(--dim)' }}
+            >
+              ✕
             </button>
-          ))}
+          )}
+          {/* Active ticker pill — tap to open chart for this ticker */}
+          {!query && (
+            <span
+              className="text-[11px] font-bold px-2 py-0.5 cursor-pointer"
+              style={{ background: 'var(--amb-solid)', color: '#000', borderRadius: 2 }}
+              onClick={() => onOpenChart?.(ticker)}
+              title={`Open chart for ${ticker}`}
+            >
+              {ticker}
+              {isCash && <span className="ml-1 font-normal opacity-70">CASH</span>}
+            </span>
+          )}
         </div>
 
-        {/* Expiry selector */}
-        <div className="ml-auto flex items-center gap-2">
-          <span className="text-[11px] font-semibold uppercase tracking-widest text-zinc-500">
-            Expiry
-          </span>
-          <select
-            value={_expiry}
-            onChange={(e) => setExpiry(e.target.value)}
-            className="rounded border border-white/10 bg-zinc-800 px-2 py-1 text-xs text-zinc-300 focus:outline-none focus:ring-1 focus:ring-white/20"
+        {/* Dropdown results — only show when searching */}
+        {query.trim() && (
+          <div
+            className="mt-1 overflow-y-auto"
+            style={{
+              maxHeight: 200,
+              background: 'var(--panel2)',
+              border: '1px solid var(--line)',
+              borderRadius: 3,
+            }}
           >
-            <option value={DEFAULT_EXPIRY.value}>{DEFAULT_EXPIRY.label}</option>
-          </select>
-        </div>
+            {filteredTickers.length === 0 ? (
+              <div className="px-3 py-2 text-[11px]" style={{ color: 'var(--dim)' }}>No match</div>
+            ) : (
+              filteredTickers.map(t => (
+                <button
+                  key={t}
+                  onClick={() => handleTickerSelect(t)}
+                  className="w-full flex items-center gap-3 px-3 py-1.5 text-left transition-colors hover:bg-white/5"
+                >
+                  <span className="text-[12px] font-bold" style={{ color: 'var(--ink)', minWidth: 36 }}>{t}</span>
+                  <span className="text-[11px] truncate" style={{ color: 'var(--mut)' }}>{COMPANY_NAMES[t] ?? ''}</span>
+                </button>
+              ))
+            )}
+          </div>
+        )}
       </div>
 
-      {/* Context bar */}
-      <ContextBar
-        ticker={activeTicker}
-        price={price}
-        changePct={changePct}
-        ctx={ctx}
-        dir={dir}
-      />
+      {/* ── Expiry tabs ── */}
+      <div
+        className="flex-shrink-0 flex items-center gap-0 overflow-x-auto scrollbar-none border-b"
+        style={{ background: 'var(--panel)', borderColor: 'var(--line)' }}
+      >
+        {expiries.map(exp => (
+          <button
+            key={exp}
+            onClick={() => setExpiry(exp)}
+            className="flex-shrink-0 px-4 py-2 text-[11px] font-bold uppercase tracking-widest transition-colors"
+            style={{
+              color:        effectiveExpiry === exp ? 'var(--amb-solid)' : 'var(--dim)',
+              borderBottom: `2px solid ${effectiveExpiry === exp ? 'var(--amb-solid)' : 'transparent'}`,
+              background:   'transparent',
+            }}
+          >
+            {_fmtExpiry(exp)}
+          </button>
+        ))}
+      </div>
 
-      {/* Sub-tabs */}
-      <div className="flex items-center gap-0 border-b border-white/10 bg-zinc-900/40 px-4">
-        {(['CHAIN', 'FLOW', 'GREEKS', 'GEX'] as SubTab[]).map((tab) => (
+      {/* ── Context bar ── */}
+      <div
+        className="flex-shrink-0 flex flex-wrap items-center gap-x-4 gap-y-1.5 px-4 py-2 border-b"
+        style={{ background: 'var(--panel2)', borderColor: 'var(--line)' }}
+      >
+        <div className="flex items-center gap-2">
+          <span className="text-sm font-bold" style={{ color: 'var(--ink)' }}>{ticker}</span>
+          {isCash && (
+            <span
+              className="text-[9px] font-bold px-1.5 py-0.5 uppercase tracking-widest"
+              style={{ background: 'rgba(167,139,250,0.15)', color: '#c4b5fd', borderRadius: 2 }}
+            >
+              Cash Settled
+            </span>
+          )}
+        </div>
+
+        <div className="flex items-center gap-2">
+          <span className="font-mono text-sm font-bold" style={{ color: 'var(--ink)' }}>
+            {spot > 0 ? _fmtP(spot) : '—'}
+          </span>
+          {changePct != null && (
+            <span
+              className="text-xs font-semibold font-mono"
+              style={{ color: changePct >= 0 ? 'var(--g)' : 'var(--r)' }}
+            >
+              {_fmtPct(changePct)}
+            </span>
+          )}
+        </div>
+
+        {ctx && (
+          <>
+            <div className="flex items-center gap-1 text-xs" style={{ color: 'var(--mut)' }}>
+              <span className="text-[10px] uppercase font-bold" style={{ color: 'var(--dim)' }}>MAX PAIN</span>
+              <span className="font-mono" style={{ color: 'var(--ink)' }}>{_fmtP(ctx.maxPain)}</span>
+            </div>
+            <div className="flex items-center gap-1 text-xs" style={{ color: 'var(--mut)' }}>
+              <span className="text-[10px] uppercase font-bold" style={{ color: 'var(--dim)' }}>P/C</span>
+              <span className="font-mono" style={{ color: ctx.pcRatio > 1 ? 'var(--r)' : 'var(--g)' }}>
+                {ctx.pcRatio.toFixed(2)}
+              </span>
+            </div>
+            <span
+              className="text-[10px] font-bold px-2 py-0.5"
+              style={{
+                borderRadius: 2,
+                background: ctx.gexRegime === 'positive' ? 'var(--g-dim)' : ctx.gexRegime === 'negative' ? 'var(--r-dim)' : 'var(--line)',
+                color: ctx.gexRegime === 'positive' ? 'var(--g)' : ctx.gexRegime === 'negative' ? 'var(--r)' : 'var(--mut)',
+              }}
+            >
+              {ctx.gexRegime === 'positive' ? 'POS GEX' : ctx.gexRegime === 'negative' ? 'NEG GEX' : 'GEX NEUTRAL'}
+            </span>
+          </>
+        )}
+
+        {dir && (
+          <div className="ml-auto flex items-center gap-1.5">
+            <span
+              className="text-[10px] font-bold px-2 py-0.5"
+              style={{
+                borderRadius: 2,
+                background: dir.sessionBias === 'bullish' ? 'var(--g-dim)' : dir.sessionBias === 'bearish' ? 'var(--r-dim)' : 'var(--line)',
+                color: dir.sessionBias === 'bullish' ? 'var(--g)' : dir.sessionBias === 'bearish' ? 'var(--r)' : 'var(--mut)',
+              }}
+            >
+              {dir.sessionBias === 'bullish' ? 'SESSION BULL' : dir.sessionBias === 'bearish' ? 'SESSION BEAR' : 'NEUTRAL'}
+            </span>
+            <span
+              className="text-[10px] font-bold px-2 py-0.5"
+              style={{
+                borderRadius: 2,
+                background: dir.playDirection === 'calls' ? 'var(--g-dim)' : dir.playDirection === 'puts' ? 'var(--r-dim)' : 'var(--line)',
+                color: dir.playDirection === 'calls' ? 'var(--g)' : dir.playDirection === 'puts' ? 'var(--r)' : 'var(--mut)',
+              }}
+            >
+              {dir.playDirection === 'calls' ? 'PLAY CALLS' : dir.playDirection === 'puts' ? 'PLAY PUTS' : dir.playDirection === 'consolidating' ? 'CONSOLIDATING' : 'NO PLAY'}
+            </span>
+          </div>
+        )}
+      </div>
+
+      {/* ── Sub-tabs ── */}
+      <div
+        className="flex-shrink-0 flex items-center border-b"
+        style={{ background: 'var(--panel)', borderColor: 'var(--line)' }}
+      >
+        {(['TABLE', 'GREEKS', 'FLOW', 'GEX'] as SubTab[]).map(tab => (
           <button
             key={tab}
             type="button"
             onClick={() => setActiveTab(tab)}
-            className={`border-b-2 px-5 py-2.5 text-xs font-bold uppercase tracking-widest transition-colors ${
-              activeTab === tab
-                ? 'border-white text-white'
-                : 'border-transparent text-zinc-500 hover:text-zinc-300'
-            }`}
+            className="flex-1 py-2.5 text-[11px] font-bold uppercase tracking-widest transition-colors"
+            style={{
+              color:        activeTab === tab ? 'var(--amb-solid)' : 'var(--dim)',
+              borderBottom: `2px solid ${activeTab === tab ? 'var(--amb-solid)' : 'transparent'}`,
+              background:   'transparent',
+            }}
           >
             {tab}
           </button>
         ))}
       </div>
 
-      {/* Tab content */}
+      {/* ── Tab content ── */}
       <div className="flex-1 overflow-hidden">
         {renderTabContent()}
       </div>
+
+      {/* ── Sticky footer P/C card ── */}
+      <FooterCard ctx={ctx} />
     </section>
   );
 }

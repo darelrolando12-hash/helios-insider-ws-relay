@@ -55,6 +55,40 @@ const _formatter = new Intl.DateTimeFormat('en-US', {
   hour12: false,
 });
 
+// Plausible calendar range for a Unix millisecond timestamp. Used to detect
+// when a raw timestamp arrived in the wrong unit (see normaliseTimestampMs).
+const _MIN_PLAUSIBLE_MS = new Date('2000-01-01T00:00:00Z').getTime();
+const _MAX_PLAUSIBLE_MS = new Date('2100-01-01T00:00:00Z').getTime();
+
+function _isPlausibleMs(ms: number): boolean {
+  return Number.isFinite(ms) && ms >= _MIN_PLAUSIBLE_MS && ms < _MAX_PLAUSIBLE_MS;
+}
+
+/**
+ * Normalises a raw feed timestamp to Unix milliseconds, regardless of which
+ * unit it was actually sent in.
+ *
+ * Most Massive channels send milliseconds. LULD messages have been observed
+ * sending nanoseconds instead (e.g. 1787924309993088500 — 207x larger than
+ * the maximum valid Date value), which crashes toCentralTime()'s Intl
+ * formatter with "Invalid time value" downstream.
+ *
+ * Validity alone is not a safe test: that same nanosecond value divided by
+ * 1e3 (treating it as microseconds) produces a technically *valid* Date —
+ * just in the year 58627. That's silently wrong, which is worse than
+ * rejecting it outright. So instead, try each unit in order and accept only
+ * the first candidate that lands in a plausible calendar range.
+ */
+export function normaliseTimestampMs(raw: number): number {
+  const candidates = [raw, raw / 1e3, raw / 1e6];
+  for (const candidate of candidates) {
+    if (_isPlausibleMs(candidate)) return candidate;
+  }
+  // Nothing plausible in any unit — fall back to now() rather than handing
+  // a garbage value to Date/Intl and crashing the caller.
+  return Date.now();
+}
+
 /**
  * Converts a UTC Unix millisecond timestamp to Central Time (America/Chicago).
  *
@@ -122,25 +156,6 @@ export function toCentralTime(unixMs: number): CentralTimeInfo {
 }
 
 /**
- * Returns the CT components for a given UTC timestamp without the full CentralTimeInfo.
- * Lightweight helper for stores that only need date components for bucketing/comparison.
- */
-export function toCTComponents(unixMs: number): CentralTimeComponents {
-  const { year, month, day, hour, minute, second, millisecond } = toCentralTime(unixMs);
-  return { year, month, day, hour, minute, second, millisecond };
-}
-
-/**
- * Returns a CT date-only string (YYYY-MM-DD) for a UTC timestamp.
- * Used for daily bucketing in bar stores and expiry comparison.
- */
-export function toCTDateString(unixMs: number): string {
-  const { year, month, day } = toCentralTime(unixMs);
-  const pad = (n: number) => String(n).padStart(2, '0');
-  return `${year}-${pad(month)}-${pad(day)}`;
-}
-
-/**
  * Returns a CT midnight epoch (as pseudo-UTC ms, same convention as ctMs)
  * for a given UTC timestamp. Used for expiry boundary comparisons.
  */
@@ -148,3 +163,69 @@ export function toCTMidnight(unixMs: number): number {
   const { year, month, day } = toCentralTime(unixMs);
   return Date.UTC(year, month - 1, day, 0, 0, 0, 0);
 }
+
+/**
+ * Returns true if the Massive data feed is expected to be active right now.
+ *
+ * Feed schedule (Central Time, DST-correct):
+ *   Active:  ~3:00 AM CT  to  ~7:00 PM CT  (Mon–Fri)
+ *   Offline: ~7:00 PM CT  to  ~3:00 AM CT  (every day)
+ *
+ * This is used to distinguish "feed dead because market closed" from
+ * "feed dead because of a real connection problem". These need different
+ * banner messages and different UX behaviour.
+ *
+ * Note: weekend check is intentionally omitted — the feed is technically
+ * offline all weekend, but returning false Mon–Fri night is sufficient
+ * for the current UX need (suppress misleading RECONNECTING banner).
+ */
+export function isFeedScheduleActive(unixMs: number = Date.now()): boolean {
+  const ct = toCentralTime(unixMs);
+  const minuteOfDay = ct.hour * 60 + ct.minute;
+  // Active window: 3:00 AM (180) to 7:00 PM (19:00 = 1140)
+  return minuteOfDay >= 180 && minuteOfDay < 1140;
+}
+
+// Regular trading session, Central Time: 8:00 AM (480 min) to 3:30 PM (930 min).
+// Heavy, non-time-sensitive backfill jobs (e.g. the ~5,300-ticker 52-week
+// high/low backfill) should stay out of this window so they don't compete
+// with live chain polling for the same network path during the session.
+const BUSY_WINDOW_START_MIN = 480; // 8:00 AM CT
+const BUSY_WINDOW_END_MIN   = 930; // 3:30 PM CT
+
+/**
+ * Milliseconds to wait before it's safe to run a heavy, non-urgent backfill
+ * job without competing with live trading-session traffic.
+ *
+ * Returns 0 if the current CT time is already outside the 8:00 AM–3:30 PM
+ * busy window (job can run immediately). Otherwise returns the exact
+ * remaining time until 3:30 PM CT today.
+ */
+export function msUntilQuietWindow(unixMs: number = Date.now()): number {
+  const ct = toCentralTime(unixMs);
+  const minuteOfDay = ct.hour * 60 + ct.minute;
+
+  if (minuteOfDay < BUSY_WINDOW_START_MIN || minuteOfDay >= BUSY_WINDOW_END_MIN) {
+    return 0;
+  }
+
+  const minutesRemaining = BUSY_WINDOW_END_MIN - minuteOfDay;
+  return minutesRemaining * 60_000 - (ct.second * 1_000 + ct.millisecond);
+}
+
+/**
+ * Returns the next feed-open time as a human-readable CT string.
+ * Used in the closed-state banner.
+ */
+export function nextFeedOpenCT(unixMs: number = Date.now()): string {
+  const ct = toCentralTime(unixMs);
+  const minuteOfDay = ct.hour * 60 + ct.minute;
+  if (minuteOfDay < 180) {
+    // Before 3 AM today — opens at 3:00 AM today
+    return '3:00 AM CT';
+  }
+  // After 7 PM — opens at 3:00 AM tomorrow
+  return '3:00 AM CT';
+}
+
+

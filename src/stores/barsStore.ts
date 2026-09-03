@@ -18,6 +18,7 @@
 import { massiveBus, type WSMessageWithCT } from '../lib/massive/websocket';
 import { MassiveRestClient }                from '../lib/massive/api';
 import { type Bar, type Result, ready, loading, error } from './types';
+import { formatError } from '../lib/errors';
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -116,6 +117,28 @@ export function getResult(ticker: string): Result<Bar[]> {
  */
 export function isDataReady(ticker: string): boolean {
   return getResult(ticker).status === 'ready';
+}
+
+/**
+ * hasHistoricalData — returns true if the ticker has any bars at all,
+ * regardless of staleness. Used by scoring engines that can work on
+ * day-old data (e.g. Swing score, after-hours EMA trend check).
+ * Does NOT imply the data is fresh or the feed is active.
+ */
+export function hasHistoricalData(ticker: string): boolean {
+  const state = _state.get(ticker);
+  return !!(state && state.bars.length >= 2);
+}
+
+/**
+ * getBarsRaw — returns the raw bar array for a ticker regardless of staleness.
+ * Returns [] if no bars are loaded.
+ * Use this for scoring/analysis that is valid on stale data (e.g. Swing EMA).
+ * Use getResult() when you need to know if data is fresh.
+ */
+export function getBarsRaw(ticker: string): import('./types').Bar[] {
+  const state = _state.get(ticker);
+  return state ? [...state.bars] : [];
 }
 
 /**
@@ -263,7 +286,7 @@ async function _backfill(ticker: string, reason: 'cold-start' | 'reconnect') {
 
     console.log(`[barsStore] ${ticker} backfill complete — ${state.bars.length} bars total.`);
   } catch (e) {
-    console.error(`[barsStore] Backfill failed for ${ticker}:`, e);
+    console.error(`[barsStore] Backfill failed for ${ticker}: ${formatError(e)}`);
   } finally {
     state.backfilling = false;
     _notify();

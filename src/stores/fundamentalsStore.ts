@@ -39,13 +39,15 @@ export type DisclosureCategory =
   | 'leadership'
   | 'dividend'
   | 'buyback'
+  | 'debt'
+  | 'equity'
+  | 'activism'
   | 'other';
 
 export interface EightKDisclosure {
   ticker:      string;
   category:    DisclosureCategory;
-  title:       string;
-  summary:     string;
+  summary:     string;  // from real API's supporting_text — no title field exists
   filedAt:     number;  // UTC ms
   accessionNo: string;  // SEC EDGAR accession number — unique per filing
 }
@@ -145,6 +147,14 @@ export function isDataReady(ticker: string): boolean {
   return getResult(ticker).status === 'ready';
 }
 
+/**
+ * Return all tickers that have ever had any fundamentals data written.
+ * Used by squeezeEngine to enumerate tickers to re-score on fundamentals update.
+ */
+export function getTickers(): string[] {
+  return Array.from(_state.keys());
+}
+
 export function subscribe(listener: () => void): () => void {
   _listeners.add(listener);
   return () => _listeners.delete(listener);
@@ -199,7 +209,13 @@ export function upsertShortVolume(
 /**
  * Upsert insider transactions for `ticker`.
  *
- * Filters out 10b5-1 transactions at write time — they never reach consumers.
+ * Stores every transaction type and both 10b5-1 states as-is — no write-time
+ * filtering. "Which rows matter most" is a display-layer judgment (the
+ * cockpit's filter tabs + pill color), not a store-level decision. An earlier
+ * version of this function dropped every sell and every 10b5-1 transaction
+ * before it reached the store, which made the Sells/10b5-1 filter tabs and
+ * the pill's two-color contrast structurally impossible — that was the bug,
+ * not the cockpit's expectations.
  * Deduplicates by (insiderName + transactedAt) as conflict target.
  * Merges with existing transactions; result is sorted descending by transactedAt.
  */
@@ -209,18 +225,12 @@ export function upsertInsiderTransactions(
 ) {
   const data = _getOrCreate(ticker);
 
-  // Filter: only non-10b5-1 buys surface as signals (per spec)
-  const discretionaryBuys = transactions.filter(
-    (t) => !t.is10b51 && t.transactionType === 'buy'
-  );
-
-  // Deduplicate against existing by (insiderName + transactedAt)
-  const existing = new Set(
-    data.insiderTransactions.map((t) => `${t.insiderName}:${t.transactedAt}`)
-  );
-  const newOnes = discretionaryBuys.filter(
-    (t) => !existing.has(`${t.insiderName}:${t.transactedAt}`)
-  );
+  // Deduplicate against existing by real DB id (accession_number + owner_cik +
+  // security_type + transaction_code + transaction_date) — insiderName+transactedAt
+  // is not unique: one filing can carry multiple transaction lines for the same
+  // owner on the same date (e.g. a derivative + non-derivative line).
+  const existing = new Set(data.insiderTransactions.map((t) => t.id));
+  const newOnes = transactions.filter((t) => !existing.has(t.id));
 
   data.insiderTransactions = [
     ...data.insiderTransactions,

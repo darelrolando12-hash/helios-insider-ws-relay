@@ -2,10 +2,11 @@
  * InsidersCockpit — Form 4 insider transaction feed.
  *
  * Data source: fundamentalsStore exclusively. Zero outbound calls.
- * Only non-10b5-1 transactions are shown (is10b51 === false — already filtered
- * at write time in fundamentalsStore; this cockpit never relaxes that filter).
+ * fundamentalsStore holds every transaction type and both 10b5-1 states —
+ * filtering for "which rows matter" happens here, at the display layer,
+ * via the filter tabs below.
  *
- * Filter tabs: All | Buys Only | Sells | Officers | Directors
+ * Filter tabs: All | Buys | Sells | Non-10b5-1 | 10b5-1
  * Signal indicator: shown when ticker has an active directionState signal.
  * Squeeze risk: shown from squeezeEngine when available.
  */
@@ -26,7 +27,10 @@ import type { InsiderTransaction }          from '../stores/types';
 
 const TRADEABLE = FEED_TICKERS.filter(t => !CONTEXT_ONLY_TICKERS.has(t));
 
-type FilterTab = 'all' | 'buys' | 'sells' | 'officers' | 'directors';
+// Spec filter set: All / Buys / Sells / Non-10b5-1 / 10b5-1
+// fundamentalsStore holds every transaction type and both 10b5-1 states —
+// each tab filters the real underlying data, none are structurally empty.
+type FilterTab = 'all' | 'buys' | 'sells' | 'non_10b51' | 'is_10b51';
 
 interface EnrichedTx extends InsiderTransaction {
   ticker: string; // pulled from the parent fundamentals record
@@ -54,39 +58,33 @@ function _formatDate(utcMs: number): string {
   return `${ct.year}-${pad(ct.month)}-${pad(ct.day)}`;
 }
 
-function _isOfficer(relationship: string): boolean {
-  return /\b(ceo|cfo|coo|cto|president|vp|chief|officer|svp|evp)\b/i.test(relationship);
-}
-
-function _isDirector(relationship: string): boolean {
-  return /\bdirector\b/i.test(relationship);
-}
+// (officer/director helpers removed — spec filters are All/Buys/Sells/Non-10b5-1/10b5-1)
 
 // ── Sub-components ─────────────────────────────────────────────────────────────
 
 function HeaderBar() {
   const tickers = ['SPY', 'QQQ', 'IWM'];
   return (
-    <div className="sticky top-0 z-20 bg-slate-950 border-b border-slate-800">
+    <div className="sticky top-0 z-20 bg-void border-b" style={{ borderColor: 'var(--line)' }}>
       <div className="flex items-center justify-between px-4 py-2 flex-wrap gap-2">
         <div className="flex items-center gap-4 flex-wrap">
-          <span className="text-xs text-slate-500 uppercase tracking-wider font-bold">INSIDERS</span>
+          <span className="text-xs text-mut uppercase tracking-wider font-bold">INSIDERS</span>
           {tickers.map(t => {
             const ds = getDirectionState(t);
             if (!ds) return null;
             const biasColor = ds.sessionBias === 'bullish'
-              ? 'bg-emerald-900/60 text-emerald-300 border-emerald-700'
+              ? 'bg-col-g/15 text-col-g border-col-g/30'
               : ds.sessionBias === 'bearish'
-              ? 'bg-rose-900/60 text-rose-300 border-rose-700'
-              : 'bg-slate-800 text-slate-400 border-slate-700';
+              ? 'bg-col-r/15 text-col-r border-col-r/30'
+              : 'bg-white/5 text-white/40 border-white/10';
             const playColor = ds.playDirection === 'calls'
-              ? 'bg-emerald-900/60 text-emerald-300 border-emerald-700'
+              ? 'bg-col-g/15 text-col-g border-col-g/30'
               : ds.playDirection === 'puts'
-              ? 'bg-rose-900/60 text-rose-300 border-rose-700'
-              : 'bg-slate-800 text-slate-400 border-slate-700';
+              ? 'bg-col-r/15 text-col-r border-col-r/30'
+              : 'bg-white/5 text-white/40 border-white/10';
             return (
               <div key={t} className="flex items-center gap-1">
-                <span className="text-xs text-slate-500 font-mono">{t}</span>
+                <span className="text-xs text-mut font-mono">{t}</span>
                 <span className={`text-[10px] px-1.5 py-0.5 rounded font-bold uppercase border ${biasColor}`}>
                   {ds.sessionBias}
                 </span>
@@ -97,7 +95,7 @@ function HeaderBar() {
             );
           })}
         </div>
-        <span className="text-xs text-slate-500">Form 4 · non-10b5-1 only</span>
+        <span className="text-xs text-mut">Form 4 · non-10b5-1 only</span>
       </div>
     </div>
   );
@@ -113,11 +111,11 @@ function FilterTabs({
   counts: Record<FilterTab, number>;
 }) {
   const tabs: { id: FilterTab; label: string }[] = [
-    { id: 'all',       label: 'All'       },
-    { id: 'buys',      label: 'Buys Only' },
-    { id: 'sells',     label: 'Sells'     },
-    { id: 'officers',  label: 'Officers'  },
-    { id: 'directors', label: 'Directors' },
+    { id: 'all',       label: 'All'         },
+    { id: 'buys',      label: 'Buys'        },
+    { id: 'sells',     label: 'Sells'       },
+    { id: 'non_10b51', label: 'Non-10b5-1'  },
+    { id: 'is_10b51',  label: '10b5-1'      },
   ];
 
   return (
@@ -126,14 +124,15 @@ function FilterTabs({
         <button
           key={tab.id}
           onClick={() => onChange(tab.id)}
-          className={`flex-shrink-0 px-3 py-1.5 rounded-lg text-xs font-semibold transition-colors ${
+          className={`flex-shrink-0 px-3 py-1.5 text-xs font-semibold transition-colors ${
             active === tab.id
-              ? 'bg-sky-700 text-white'
-              : 'bg-slate-800 text-slate-400 hover:bg-slate-700'
+              ? 'bg-amb/20 text-amb border border-amb/40'
+              : 'bg-white/5 text-white/40 border border-white/8 hover:text-white/70'
           }`}
+          style={{ borderRadius: 4 }}
         >
           {tab.label}
-          <span className={`ml-1.5 ${active === tab.id ? 'text-sky-200' : 'text-slate-500'}`}>
+          <span className={`ml-1.5 ${active === tab.id ? 'text-amb/70' : 'text-white/25'}`}>
             {counts[tab.id]}
           </span>
         </button>
@@ -146,15 +145,15 @@ function SignalIndicator({ ticker }: { ticker: string }) {
   const ds = getDirectionState(ticker);
   if (!ds || ds.sessionBias === 'neutral') return null;
 
-  const color = ds.sessionBias === 'bullish' ? 'text-emerald-400' : 'text-rose-400';
+  const color = ds.sessionBias === 'bullish' ? 'text-col-g' : 'text-col-r';
   const label = ds.playDirection === 'calls' ? 'CALL' : ds.playDirection === 'puts' ? 'PUT' : null;
   if (!label) return null;
 
   return (
     <span className={`text-[10px] px-1 py-0.5 rounded font-bold border ${
       ds.sessionBias === 'bullish'
-        ? 'border-emerald-700 bg-emerald-900/40 text-emerald-400'
-        : 'border-rose-700 bg-rose-900/40 text-rose-400'
+        ? 'border-col-g/40 bg-col-g/15 text-col-g'
+        : 'border-col-r/40 bg-col-r/15 text-col-r'
     } ${color}`}>
       ▲ {label} active
     </span>
@@ -168,8 +167,8 @@ function SqueezeIndicator({ ticker }: { ticker: string }) {
   if (level === 'low') return null;
 
   const color = level === 'high'
-    ? 'border-rose-700 bg-rose-900/40 text-rose-400'
-    : 'border-amber-700 bg-amber-900/40 text-amber-400';
+    ? 'border-col-r/40 bg-col-r/15 text-col-r'
+    : 'border-amb/40 bg-amb/15 text-amb';
 
   return (
     <span className={`text-[10px] px-1 py-0.5 rounded font-bold border ${color}`}>
@@ -180,20 +179,34 @@ function SqueezeIndicator({ ticker }: { ticker: string }) {
 
 function TransactionRow({ tx }: { tx: EnrichedTx }) {
   const isBuy    = tx.transactionType === 'buy';
-  const dirColor = isBuy ? 'text-emerald-400' : 'text-rose-400';
+  const dirColor = isBuy ? 'text-col-g' : 'text-col-r';
   const dirIcon  = isBuy ? '↑' : '↓';
-  const borderColor = isBuy ? 'border-emerald-800' : 'border-rose-900';
+  const borderColor = isBuy ? 'border-col-g/20' : 'border-col-r/15';
 
   return (
-    <div className={`bg-slate-900 border ${borderColor} rounded-lg px-4 py-3`}>
+    <div className={`bg-[var(--panel)] border ${borderColor} px-4 py-3`} style={{ borderRadius: 4 }}>
       {/* Top row */}
       <div className="flex items-start justify-between gap-3 flex-wrap">
         <div className="flex items-center gap-2 flex-wrap">
           <span className={`text-lg font-bold ${dirColor}`}>{dirIcon}</span>
-          <span className="font-mono text-sm font-bold text-slate-100">{tx.ticker}</span>
+          <span className="font-mono text-sm font-bold text-[var(--ink)]">{tx.ticker}</span>
           <span className={`text-2xl font-extrabold tabular-nums ${dirColor}`}>
             {_formatDollar(tx.totalValue)}
           </span>
+          {/* 10b5-1 pill — load-bearing per spec */}
+          {tx.is10b51
+            ? (
+              <span className="text-[10px] px-1.5 py-0.5 border border-white/15 text-dim font-bold"
+                style={{ borderRadius: 3 }}>
+                10b5-1 Scheduled
+              </span>
+            ) : (
+              <span className="text-[10px] px-1.5 py-0.5 border border-col-g/40 bg-col-g/15 text-col-g font-bold"
+                style={{ borderRadius: 3 }}>
+                Not 10b5-1
+              </span>
+            )
+          }
         </div>
         <div className="flex items-center gap-1.5 flex-wrap">
           <SignalIndicator ticker={tx.ticker} />
@@ -202,15 +215,15 @@ function TransactionRow({ tx }: { tx: EnrichedTx }) {
       </div>
 
       {/* Detail row */}
-      <div className="mt-1.5 flex items-center gap-3 flex-wrap text-xs text-slate-400">
-        <span className="text-slate-300 font-medium">{tx.insiderName}</span>
-        <span className="text-slate-500">·</span>
+      <div className="mt-1.5 flex items-center gap-3 flex-wrap text-xs text-[var(--mut)]">
+        <span className="text-[var(--ink)]/70 font-medium">{tx.insiderName}</span>
+        <span className="text-[var(--dim)]">·</span>
         <span>{tx.relationship}</span>
-        <span className="text-slate-500">·</span>
+        <span className="text-[var(--dim)]">·</span>
         <span>{_formatShares(tx.shares)}</span>
-        <span className="text-slate-500">·</span>
+        <span className="text-[var(--dim)]">·</span>
         <span>@ ${tx.pricePerShare.toFixed(2)}/sh</span>
-        <span className="text-slate-500">·</span>
+        <span className="text-[var(--dim)]">·</span>
         <span>{_formatDate(tx.transactedAt)}</span>
       </div>
     </div>
@@ -219,9 +232,9 @@ function TransactionRow({ tx }: { tx: EnrichedTx }) {
 
 function SkeletonRow() {
   return (
-    <div className="bg-slate-900 border border-slate-800 rounded-lg px-4 py-3 animate-pulse space-y-2">
-      <div className="h-4 bg-slate-800 rounded w-48" />
-      <div className="h-3 bg-slate-800 rounded w-72" />
+    <div className="bg-panel border rounded-lg px-4 py-3 animate-pulse space-y-2" style={{ borderColor: 'var(--line)' }}>
+      <div className="h-4 bg-white/8 rounded w-48" />
+      <div className="h-3 bg-white/5 rounded w-72" />
     </div>
   );
 }
@@ -231,7 +244,7 @@ function SkeletonRow() {
 export default function InsidersCockpit() {
   const [allTxs,  setAllTxs]  = useState<EnrichedTx[]>([]);
   const [loading, setLoading] = useState(true);
-  const [filter,  setFilter]  = useState<FilterTab>('buys');
+  const [filter,  setFilter]  = useState<FilterTab>('all');
   const [, forceRender]       = useState(0);
 
   const rebuild = useCallback(() => {
@@ -244,9 +257,6 @@ export default function InsidersCockpit() {
       anyReady = true;
 
       for (const tx of res.data.insiderTransactions) {
-        // is10b5-1 filter: fundamentalsStore already excludes them at write time,
-        // but we double-guard here per spec.
-        if (tx.is10b51) continue;
         txs.push({ ...tx, ticker });
       }
     }
@@ -273,8 +283,8 @@ export default function InsidersCockpit() {
   const filtered = allTxs.filter(tx => {
     if (filter === 'buys')      return tx.transactionType === 'buy';
     if (filter === 'sells')     return tx.transactionType === 'sell';
-    if (filter === 'officers')  return _isOfficer(tx.relationship);
-    if (filter === 'directors') return _isDirector(tx.relationship);
+    if (filter === 'non_10b51') return !tx.is10b51;
+    if (filter === 'is_10b51')  return tx.is10b51;
     return true;
   });
 
@@ -282,12 +292,12 @@ export default function InsidersCockpit() {
     all:       allTxs.length,
     buys:      allTxs.filter(t => t.transactionType === 'buy').length,
     sells:     allTxs.filter(t => t.transactionType === 'sell').length,
-    officers:  allTxs.filter(t => _isOfficer(t.relationship)).length,
-    directors: allTxs.filter(t => _isDirector(t.relationship)).length,
+    non_10b51: allTxs.filter(t => !t.is10b51).length,
+    is_10b51:  allTxs.filter(t => t.is10b51).length,
   };
 
   return (
-    <div className="flex flex-col min-h-screen bg-slate-950 text-slate-100 font-mono">
+    <div className="flex flex-col min-h-screen bg-[var(--void)] text-[var(--ink)] font-mono">
       <HeaderBar />
 
       <div className="flex-1 max-w-4xl w-full mx-auto px-4 py-4 space-y-4">
@@ -308,22 +318,26 @@ export default function InsidersCockpit() {
           )}
 
           {!loading && filtered.length === 0 && (
-            <div className="text-center py-12 text-slate-600 text-sm">
+            <div className="text-center py-12 text-[var(--dim)] text-sm">
               {filter === 'buys'
                 ? 'No discretionary insider buys on file.'
                 : filter === 'sells'
                 ? 'No insider sells on file.'
+                : filter === 'non_10b51'
+                ? 'No non-10b5-1 transactions on file.'
+                : filter === 'is_10b51'
+                ? 'No 10b5-1 scheduled transactions on file.'
                 : 'No transactions match this filter.'}
             </div>
           )}
 
-          {filtered.map((tx, i) => (
-            <TransactionRow key={`${tx.ticker}-${tx.transactedAt}-${i}`} tx={tx} />
+          {filtered.map((tx) => (
+            <TransactionRow key={tx.id} tx={tx} />
           ))}
         </section>
 
         {!loading && allTxs.length === 0 && (
-          <p className="text-center text-xs text-slate-600 pb-4">
+          <p className="text-center text-xs text-dim pb-4">
             Insider data loads after the post-market cron runs. No Form 4 filings detected yet.
           </p>
         )}

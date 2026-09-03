@@ -34,9 +34,9 @@ import {
   useRef,
   useState,
 } from 'react';
-import { useNavigate } from 'react-router-dom';
 
 import * as confluenceEngine   from '../engines/confluenceEngine';
+import * as catalystGate       from '../engines/catalystGate';
 import * as barsStore          from '../stores/barsStore';
 import * as marketStore        from '../stores/marketStore';
 import * as cvdStore           from '../stores/cvdStore';
@@ -49,6 +49,7 @@ import {
   getAllDirectionStates,
   getDirectionState,
   subscribe as subscribeDirection,
+  computeTradeType,
   FEED_TICKERS,
   CONTEXT_ONLY_TICKERS,
   CASH_SETTLED_TICKERS,
@@ -107,7 +108,7 @@ interface DteRecommendation {
 interface ContractOption {
   label:     string; // e.g. "ATM +1 Call"
   strike:    number;
-  expiry:    string;
+  expiry:    string; // real 'YYYY-MM-DD' from the chain row, not a DTE category
   bid:       number;
   ask:       number;
   iv:        number;
@@ -184,6 +185,12 @@ interface RankedCard {
   delta:          number | null;
   theta:          number | null;
 
+  // The specific, tradeable contract this card recommends — real strike +
+  // real expiry from the chain snapshot, not a category label like "0DTE".
+  contractStrike:     number;
+  contractExpiry:     string; // 'YYYY-MM-DD', empty until chain data loads
+  usedFallbackStrike: boolean; // true if ATM failed spread/IV and an adjacent strike was used instead
+
   // Risk / reward
   callWall:       number;
   putWall:        number;
@@ -247,6 +254,14 @@ function formatCT(utcMs: number): string {
   return toCentralTime(utcMs).formatted.slice(11, 16); // "HH:mm"
 }
 
+/** 'YYYY-MM-DD' -> 'MM/DD' for compact display; falls back to raw string if unparsable. */
+function formatExpiry(expiry: string): string {
+  const parts = expiry.split('-');
+  if (parts.length !== 3) return expiry || '—';
+  const [, month, day] = parts;
+  return `${month}/${day}`;
+}
+
 function formatDollar(n: number): string {
   return `$${n.toFixed(2)}`;
 }
@@ -281,13 +296,18 @@ function buildFingerprint(
   ctx: MarketContext | null,
 ): SetupFingerprint {
   const nowCT = toCentralTime(Date.now());
+  const vixR = barsStore.getResult('I:VIX');
+  const vixClose = vixR.status === 'ready' && vixR.data.length > 0
+    ? vixR.data[vixR.data.length - 1].close
+    : null;
+  const sessionBias = getDirectionState(ticker)?.sessionBias ?? 'neutral';
   return {
     ticker,
     direction,
     gexRegime:  ctx?.gexRegime ?? 'neutral',
-    vixBucket:  '<15', // VIX feed not yet wired; spec-compliant default
+    vixBucket:  vixClose !== null ? brainStore.vixBucket(vixClose) : '<15',
     timeOfDay:  timeOfDayBucket(nowCT.ctMs),
-    tradeType:  'with_session',
+    tradeType:  computeTradeType(direction, sessionBias, null, null),
   };
 }
 
@@ -357,8 +377,11 @@ function computeRankScore(card: Omit<RankedCard, 'rank' | 'rankScore'>): number 
 
 // ── Component ──────────────────────────────────────────────────────────────────
 
-export default function BestContractsCockpit() {
-  const navigate = useNavigate();
+export default function BestContractsCockpit({
+  onOpenCockpit,
+}: {
+  onOpenCockpit?: (ticker: string) => void;
+}) {
 
   // ── State ────────────────────────────────────────────────────────────────────
 
@@ -367,6 +390,7 @@ export default function BestContractsCockpit() {
   const [directions,  setDirections]  = useState<Map<string, DirectionState>>(new Map());
   const [brainReady,  setBrainReady]  = useState(false);
   const [nowCT,       setNowCT]       = useState(() => toCentralTime(Date.now()));
+  const [filterChip,  setFilterChip]  = useState<'all' | 'calls' | 'puts' | '0dte' | 'swing'>('all');
 
   // Track live signals: ticker → latest Signal
   const signalsRef = useRef<Map<string, Signal>>(new Map());
@@ -413,9 +437,9 @@ export default function BestContractsCockpit() {
       });
 
       const ct = toCentralTime(Date.now());
-      // Pre-market: before 9:30 AM CT; if after 9:35 AM CT and first candle closed
+      // Pre-market: before 8:30 AM CT (= 9:30 AM ET, market open); if after 8:35 AM CT and first candle closed
       const minuteOfDay = ct.hour * 60 + ct.minute;
-      const marketOpen  = 9 * 60 + 30; // 9:30 AM CT
+      const marketOpen  = 8 * 60 + 30; // 8:30 AM CT = 9:30 AM ET
       const premarketStart = 8 * 60;   // 8:00 AM CT
 
       if (minuteOfDay < premarketStart) {
@@ -599,31 +623,70 @@ export default function BestContractsCockpit() {
         });
       }
 
-      // Contract economics from chain
+      // Contract economics from chain — select ONE specific, tradeable contract.
+      //
+      // Default: nearest-ATM (most liquid, what a trader expects by default).
+      // Fallback: if ATM itself fails spread (C5) or IV-rank (C7), check the
+      // one strike immediately above and below. If either of those clears
+      // BOTH checks while ATM doesn't, use it instead. This is intentionally
+      // narrow — it does not scan the whole chain for an "optimal" strike,
+      // which could land on an illiquid, hard-to-trade contract far from
+      // the money. It only steps away from ATM when ATM's own quote is the
+      // specific problem and a same-class neighbor is clean.
       let bid = 0, ask = 0, iv = null as number | null, delta = null as number | null;
       let theta = null as number | null;
+      let contractStrike = 0, contractExpiry = '';
+      let usedFallbackStrike = false;
 
       if (ctx && ctx.chain && ctx.chain.length > 0 && bars && bars.length > 0) {
         const price = bars[bars.length - 1].close;
-        // Find ATM strike row
-        const atm = ctx.chain.reduce((best, row) =>
-          Math.abs(row.strike - price) < Math.abs(best.strike - price) ? row : best,
-          ctx.chain[0],
-        );
+        const sortedByDistance = ctx.chain
+          .slice()
+          .sort((a, b) => Math.abs(a.strike - price) - Math.abs(b.strike - price));
 
-        if (direction === 'call') {
-          bid   = atm.callBid;
-          ask   = atm.callAsk;
-          iv    = atm.callIV;
-          delta = atm.callDelta;
-          theta = atm.callTheta;
-        } else {
-          bid   = atm.putBid;
-          ask   = atm.putAsk;
-          iv    = atm.putIV;
-          delta = atm.putDelta;
-          theta = atm.putTheta;
+        const readSide = (row: typeof sortedByDistance[number]) => direction === 'call'
+          ? { bid: row.callBid, ask: row.callAsk, iv: row.callIV, delta: row.callDelta, theta: row.callTheta }
+          : { bid: row.putBid,  ask: row.putAsk,  iv: row.putIV,  delta: row.putDelta,  theta: row.putTheta };
+
+        const passesQuality = (side: ReturnType<typeof readSide>) => {
+          const mid = (side.bid + side.ask) / 2;
+          const sPct = mid > 0 ? (side.ask - side.bid) / mid : 1;
+          const rank = side.iv !== null ? estimateIvRank(side.iv) : null;
+          return (sPct < SPREAD_MAX_PCT || mid === 0) && (rank === null || rank < IV_RANK_WARN);
+        };
+
+        const atmRow  = sortedByDistance[0];
+        const atmSide = readSide(atmRow);
+
+        let chosenRow  = atmRow;
+        let chosenSide = atmSide;
+
+        if (!passesQuality(atmSide) && sortedByDistance.length > 1) {
+          // atmRow is index 0 of the distance-sorted list; the two nearest
+          // neighbors (by strike, not distance) are the next candidates.
+          const neighbors = ctx.chain
+            .filter(r => r.strike !== atmRow.strike)
+            .sort((a, b) => Math.abs(a.strike - atmRow.strike) - Math.abs(b.strike - atmRow.strike))
+            .slice(0, 2);
+
+          for (const candidate of neighbors) {
+            const side = readSide(candidate);
+            if (passesQuality(side)) {
+              chosenRow  = candidate;
+              chosenSide = side;
+              usedFallbackStrike = true;
+              break;
+            }
+          }
         }
+
+        bid   = chosenSide.bid;
+        ask   = chosenSide.ask;
+        iv    = chosenSide.iv;
+        delta = chosenSide.delta;
+        theta = chosenSide.theta;
+        contractStrike = chosenRow.strike;
+        contractExpiry = chosenRow.expiry;
       }
 
       const midPremium   = (bid + ask) / 2;
@@ -742,7 +805,7 @@ export default function BestContractsCockpit() {
           alternatives.push({
             label,
             strike:    row.strike,
-            expiry:    dte.category,
+            expiry:    row.expiry,
             bid:       isBid,
             ask:       isAsk,
             iv:        isIV,
@@ -763,7 +826,7 @@ export default function BestContractsCockpit() {
       const analystAction = fund?.recentDisclosures.find(d =>
         ['acquisition', 'leadership', 'guidance'].includes(d.category) &&
         Date.now() - d.filedAt < 24 * 3600_000,
-      )?.title ?? null;
+      )?.summary ?? null;
 
       const preMarketFlow = cvd
         ? `CVD ${cvd.classification} — ${cvd.callPct.toFixed(0)}% buy / ${cvd.putPct.toFixed(0)}% sell`
@@ -797,6 +860,9 @@ export default function BestContractsCockpit() {
         ivRank,
         delta,
         theta,
+        contractStrike,
+        contractExpiry,
+        usedFallbackStrike,
         callWall,
         putWall,
         flipLevel,
@@ -872,15 +938,17 @@ export default function BestContractsCockpit() {
       cvdPct:     cvd ? cvd.callPct - cvd.putPct : null,
       cvdClass:   cvd?.classification ?? null,
       emaStack:   null, // derived by confluenceEngine, not re-exposed here
-      catalystTags: fundData ? {
-        earningsPending: !!earningsWithinDays(fundData.recentDisclosures, 2),
-        materialEvent:   fundData.recentDisclosures.some(d =>
-          ['acquisition', 'restructuring', 'regulatory'].includes(d.category) &&
-          Date.now() - d.filedAt < 24 * 3600_000,
-        ),
-        insiderBuy:  fundData.insiderTransactions.length > 0,
-        insiderSell: false, // spec: only discretionary buys stored
-      } : null,
+      // Same computeTags() confluenceEngine/signalLedger use for scoring — no
+      // second copy of the category set or time window to drift out of sync.
+      catalystTags: fundData ? (() => {
+        const tags = catalystGate.computeTags(ticker, fundData);
+        return {
+          earningsPending: tags.earningsPending,
+          materialEvent:   tags.materialEvent,
+          insiderBuy:      tags.insiderBuy,
+          insiderSell:     tags.insiderSell,
+        };
+      })() : null,
       luld: {
         isHalted:  luld?.isCurrentlyHalted ?? null,
         upperBand: luld?.events.at(-1)?.upperBand ?? null,
@@ -891,7 +959,11 @@ export default function BestContractsCockpit() {
     const nowCTInfo = toCentralTime(Date.now());
 
     const row = {
-      id:          `imin_${ticker}_${Date.now()}`,
+      // Use the engine-generated signal.id so this upsert merges with the
+      // auto-written ledger row rather than creating a duplicate Brain sample.
+      // ignoreDuplicates: true means if signalLedger already wrote this id,
+      // the manual press adds nothing (the ledger row is the authoritative record).
+      id:          signal.id,
       ticker,
       direction,
       signal_type: signal.type,
@@ -903,7 +975,9 @@ export default function BestContractsCockpit() {
       factors,
     };
 
-    const { error: dbErr } = await supabase.from('signals').insert(row);
+    const { error: dbErr } = await supabase
+      .from('signals')
+      .upsert(row, { onConflict: 'id', ignoreDuplicates: true });
     if (dbErr) {
       console.error('[BestContractsCockpit] I\'m In write failed:', dbErr.message);
     }
@@ -930,8 +1004,8 @@ export default function BestContractsCockpit() {
     });
 
     rebuildCards();
-    navigate(`/zerod/${ticker}`);
-  }, [navigate, rebuildCards]);
+    onOpenCockpit?.(ticker);
+  }, [onOpenCockpit, rebuildCards]);
 
   function upTarget(card: RankedCard): number | null {
     if (card.direction === 'call') return card.upTarget > 0 ? card.upTarget : null;
@@ -969,7 +1043,7 @@ export default function BestContractsCockpit() {
       <div className="sticky top-0 z-30 bg-[#0a0a0f]/95 backdrop-blur border-b border-white/5 px-4 py-3">
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-3">
-            <span className="text-xs font-bold tracking-widest text-white/30 uppercase">Best Contracts</span>
+            <span className="text-xs font-bold tracking-widest text-dim uppercase">Best Contracts</span>
             <ModeBadge mode={mode} />
           </div>
 
@@ -988,21 +1062,27 @@ export default function BestContractsCockpit() {
           <PreMarketPanel cards={cards} />
         ) : (
           <>
-            {cards.length === 0 ? (
-              <EmptyState brainReady={brainReady} />
-            ) : (
-              <div className="space-y-4">
-                {cards.map(card => (
-                  <ContractCard
-                    key={card.ticker}
-                    card={card}
-                    onImIn={handleImIn}
-                    onDisciplineAck={handleDisciplineAck}
-                    onToggleComparison={handleToggleComparison}
-                  />
-                ))}
-              </div>
-            )}
+            {/* Filter chips — always visible regardless of card count */}
+            <FilterChips active={filterChip} onChange={setFilterChip} />
+
+            {(() => {
+              const filtered = filterCards(cards, filterChip);
+              return filtered.length === 0 ? (
+                <EmptyState brainReady={brainReady} filter={filterChip} />
+              ) : (
+                <div className="space-y-4">
+                  {filtered.map(card => (
+                    <ContractCard
+                      key={card.ticker}
+                      card={card}
+                      onImIn={handleImIn}
+                      onDisciplineAck={handleDisciplineAck}
+                      onToggleComparison={handleToggleComparison}
+                    />
+                  ))}
+                </div>
+              );
+            })()}
           </>
         )}
       </div>
@@ -1034,8 +1114,8 @@ function ModeBadge({ mode }: { mode: CockpitMode }) {
   return (
     <span className={`px-2 py-0.5 rounded text-[10px] font-bold tracking-wider uppercase
       ${isLive
-        ? 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/30'
-        : 'bg-amber-500/20 text-amber-400 border border-amber-500/30'
+        ? 'bg-col-g/20 text-col-g border border-col-g/30'
+        : 'bg-amb/20 text-amb border border-amb/30'
       }`}>
       {isLive ? 'LIVE MODE' : 'PRE-MARKET'}
     </span>
@@ -1044,16 +1124,16 @@ function ModeBadge({ mode }: { mode: CockpitMode }) {
 
 function DirectionBadge({ ticker, state }: { ticker: string; state: DirectionState }) {
   const biasColor = state.sessionBias === 'bullish'
-    ? 'text-emerald-400'
+    ? 'text-col-g'
     : state.sessionBias === 'bearish'
-    ? 'text-rose-400'
+    ? 'text-col-r'
     : 'text-white/40';
 
   const playColor = state.playDirection === 'calls'
-    ? 'text-emerald-300'
+    ? 'text-col-g'
     : state.playDirection === 'puts'
-    ? 'text-rose-300'
-    : 'text-white/30';
+    ? 'text-col-r'
+    : 'text-dim';
 
   return (
     <div className="flex items-center gap-1 bg-white/5 rounded px-2 py-1">
@@ -1069,19 +1149,63 @@ function DirectionBadge({ ticker, state }: { ticker: string; state: DirectionSta
   );
 }
 
-function EmptyState({ brainReady }: { brainReady: boolean }) {
+function EmptyState({ brainReady, filter }: { brainReady: boolean; filter: string }) {
+  const filterMsg = filter !== 'all' ? ` matching "${filter.toUpperCase()}"` : '';
   return (
     <div className="flex flex-col items-center justify-center py-20 gap-4">
       <div className="w-12 h-12 rounded-full border-2 border-white/10 flex items-center justify-center">
         <span className="text-white/20 text-lg">◎</span>
       </div>
-      <p className="text-white/30 text-sm text-center">
+      <p className="text-dim text-sm text-center">
         {brainReady
-          ? 'No ranked setups at this time. Waiting for qualifying signals.'
+          ? `No ranked setups${filterMsg} at this time. Waiting for qualifying signals.`
           : 'Initialising Brain — loading historical base rates...'}
       </p>
     </div>
   );
+}
+
+// ── Filter chips ───────────────────────────────────────────────────────────────
+
+type FilterChip = 'all' | 'calls' | 'puts' | '0dte' | 'swing';
+
+function FilterChips({ active, onChange }: { active: FilterChip; onChange: (f: FilterChip) => void }) {
+  const chips: { id: FilterChip; label: string }[] = [
+    { id: 'all',   label: 'All'   },
+    { id: 'calls', label: 'Calls' },
+    { id: 'puts',  label: 'Puts'  },
+    { id: '0dte',  label: '0DTE'  },
+    { id: 'swing', label: 'Swing' },
+  ];
+  return (
+    <div className="flex items-center gap-2 flex-wrap">
+      {chips.map(c => (
+        <button
+          key={c.id}
+          onClick={() => onChange(c.id)}
+          className="px-3 py-1 text-[10px] font-bold uppercase tracking-widest transition-colors border"
+          style={{
+            borderRadius: 2,
+            borderColor:  active === c.id ? 'var(--amb-solid)' : 'var(--line)',
+            background:   active === c.id ? 'rgba(245,166,35,0.12)' : 'transparent',
+            color:        active === c.id ? 'var(--amb-solid)' : 'var(--dim)',
+          }}
+        >
+          {c.label}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+function filterCards(cards: RankedCard[], filter: FilterChip): RankedCard[] {
+  switch (filter) {
+    case 'calls':  return cards.filter(c => c.direction === 'call');
+    case 'puts':   return cards.filter(c => c.direction === 'put');
+    case '0dte':   return cards.filter(c => c.dte.category === '0DTE');
+    case 'swing':  return cards.filter(c => c.dte.category === '1-2DTE' || c.dte.category === '3-5DTE');
+    default:       return cards;
+  }
 }
 
 // ── Pre-Market Panel ───────────────────────────────────────────────────────────
@@ -1089,12 +1213,12 @@ function EmptyState({ brainReady }: { brainReady: boolean }) {
 function PreMarketPanel({ cards }: { cards: RankedCard[] }) {
   return (
     <div className="space-y-4">
-      <div className="rounded-xl border border-amber-500/20 bg-amber-500/5 px-4 py-3">
-        <p className="text-amber-400 text-xs font-bold tracking-wider uppercase mb-1">
+      <div className="border border-amb/20 bg-amb/5 px-4 py-3">
+        <p className="text-amb text-xs font-bold tracking-wider uppercase mb-1">
           Pre-Market Analysis Mode
         </p>
         <p className="text-white/40 text-xs">
-          Market opens at 9:30 AM CT. Showing overnight setup analysis and ranked candidates
+          Market opens at 9:30 AM ET (8:30 AM CT). Showing overnight setup analysis and ranked candidates
           for the open. Live signals activate on first 5m candle close.
         </p>
       </div>
@@ -1116,13 +1240,13 @@ function PreMarketPanel({ cards }: { cards: RankedCard[] }) {
 
 function PreMarketCard({ card }: { card: RankedCard }) {
   return (
-    <div className="rounded-xl border border-white/8 bg-white/2 p-4 space-y-3">
+    <div className="border border-white/8 bg-white/2 p-4 space-y-3">
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-2">
           <RankBadge rank={card.rank} />
           <span className="font-bold text-white text-sm">{card.ticker}</span>
           {card.cashSettled && (
-            <span className="text-[9px] bg-yellow-500/20 text-yellow-400 px-1.5 py-0.5 rounded border border-yellow-500/30">
+            <span className="text-[9px] bg-amb/10 text-amb px-1.5 py-0.5 rounded border border-amb/30">
               CASH SETTLED
             </span>
           )}
@@ -1134,14 +1258,14 @@ function PreMarketCard({ card }: { card: RankedCard }) {
       {/* Overnight analysis */}
       <div className="grid grid-cols-2 gap-2 text-xs">
         {card.earningsDate && (
-          <div className="bg-rose-500/10 border border-rose-500/20 rounded p-2">
-            <span className="text-rose-400 font-bold">EARNINGS</span>
+          <div className="bg-col-r/10 border border-col-r/20 rounded p-2">
+            <span className="text-col-r font-bold">EARNINGS</span>
             <span className="text-white/50 ml-2">{card.earningsDate}</span>
           </div>
         )}
         {card.analystAction && (
-          <div className="bg-blue-500/10 border border-blue-500/20 rounded p-2">
-            <span className="text-blue-400 font-bold">ANALYST</span>
+          <div className="bg-amb/10 border border-amb/20 px-2 py-1.5" style={{ borderRadius: 2 }}>
+            <span className="text-amb font-bold">ANALYST</span>
             <span className="text-white/50 ml-2 truncate">{card.analystAction}</span>
           </div>
         )}
@@ -1158,7 +1282,7 @@ function PreMarketCard({ card }: { card: RankedCard }) {
         <BrainIntelligenceBar baseRate={card.baseRate} compact />
       )}
 
-      <div className="flex items-center gap-2 text-xs text-white/30">
+      <div className="flex items-center gap-2 text-xs text-dim">
         <span>GEX: <span className={gexColor(card.gexRegime)}>{card.gexRegime.toUpperCase()}</span></span>
         <span className="text-white/15">·</span>
         <span>DTE rec: <span className="text-white/60">{card.dte.category}</span></span>
@@ -1187,15 +1311,15 @@ function ContractCard({
   const isBlocked    = card.status === 'blocked' || card.blockers.length > 0;
 
   const borderClass = isActive
-    ? 'border-emerald-500/40'
+    ? 'border-col-g/40'
     : isTriggering
-    ? 'border-sky-500/40 animate-pulse-border'
+    ? 'border-amb/40 animate-pulse-border'
     : isBlocked
-    ? 'border-rose-500/20'
+    ? 'border-col-r/20'
     : 'border-white/8';
 
   return (
-    <div className={`rounded-xl border ${borderClass} bg-[#0d0d14] overflow-hidden`}>
+    <div className={`border ${borderClass} bg-panel2 overflow-hidden`}>
 
       {/* ── Section 1: Header ──────────────────────────────────────────── */}
       <CardHeader card={card} />
@@ -1217,7 +1341,7 @@ function ContractCard({
 
       {/* ── Section 5: Live Monitoring Panel (post I'm In) ────────────── */}
       {isActive && card.monitor && (
-        <div className="px-4 py-3 border-t border-emerald-500/20 bg-emerald-500/5">
+        <div className="px-4 py-3 border-t border-col-g/20 bg-col-g/5">
           <LiveMonitorPanel monitor={card.monitor} direction={card.direction} />
         </div>
       )}
@@ -1231,7 +1355,7 @@ function ContractCard({
 
       {/* ── Section 6: Timing Blockers / Monitoring State ─────────────── */}
       {(isBlocked || card.blockers.length > 0) && (
-        <div className="px-4 py-3 border-t border-rose-500/10 bg-rose-500/5">
+        <div className="px-4 py-3 border-t border-col-r/10 bg-col-r/5">
           <BlockerSection blockers={card.blockers} />
         </div>
       )}
@@ -1241,7 +1365,7 @@ function ContractCard({
         <div className="border-t border-white/5">
           <button
             onClick={() => onToggleComparison(card.ticker)}
-            className="w-full px-4 py-2 text-xs text-white/30 hover:text-white/60 transition-colors text-left"
+            className="w-full px-4 py-2 text-xs text-dim hover:text-white/60 transition-colors text-left"
           >
             {card.showComparison ? '▲ Hide comparison' : '▼ Compare contracts'}
           </button>
@@ -1266,8 +1390,8 @@ function ContractCard({
             className={`w-full py-3 rounded-lg font-bold text-sm tracking-widest uppercase transition-all
               ${card.disciplineAck
                 ? isTriggering
-                  ? 'bg-sky-500 hover:bg-sky-400 text-black shadow-lg shadow-sky-500/30'
-                  : 'bg-emerald-600 hover:bg-emerald-500 text-black shadow-lg shadow-emerald-500/20'
+                  ? 'bg-amb hover:bg-amb/80 text-void shadow-lg shadow-amb/30'
+                  : 'bg-col-g/80 hover:bg-col-g text-void shadow-lg shadow-col-g/20'
                 : 'bg-white/5 text-white/20 cursor-not-allowed'
               }`}
           >
@@ -1278,10 +1402,10 @@ function ContractCard({
 
       {/* Active trade — already in */}
       {isActive && (
-        <div className="px-4 py-3 border-t border-emerald-500/20">
+        <div className="px-4 py-3 border-t border-col-g/20">
           <div className="flex items-center gap-2">
-            <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
-            <span className="text-xs text-emerald-400 font-bold">TRADE ACTIVE — monitoring via 0DTE cockpit</span>
+            <span className="w-2 h-2 rounded-full bg-col-g animate-pulse" />
+            <span className="text-xs text-col-g font-bold">TRADE ACTIVE — monitoring via 0DTE cockpit</span>
           </div>
         </div>
       )}
@@ -1302,7 +1426,7 @@ function CardHeader({ card }: { card: RankedCard }) {
           <div className="flex items-center gap-2 flex-wrap">
             <span className="font-bold text-white text-base">{card.ticker}</span>
             {card.cashSettled && (
-              <span className="text-[9px] bg-yellow-500/20 text-yellow-400 px-1.5 py-0.5 rounded border border-yellow-500/30">
+              <span className="text-[9px] bg-amb/10 text-amb px-1.5 py-0.5 rounded border border-amb/30">
                 CASH SETTLED
               </span>
             )}
@@ -1310,21 +1434,41 @@ function CardHeader({ card }: { card: RankedCard }) {
             <StatusBadge status={card.status} />
           </div>
 
+          {/* The specific, tradeable contract this card recommends — real
+              strike + real expiry, not just a DTE category. This is the
+              literal answer to "which contract" a screen named Best
+              Contracts must give. */}
+          {card.contractStrike > 0 ? (
+            <div className="mt-1 flex items-center gap-1.5 flex-wrap">
+              <span className="text-sm font-bold text-amb tracking-tight">
+                {formatDollar(card.contractStrike)} {card.direction === 'call' ? 'Call' : 'Put'}
+              </span>
+              <span className="text-[10px] text-white/40">
+                exp {formatExpiry(card.contractExpiry)}
+              </span>
+              {card.usedFallbackStrike && (
+                <span className="text-[9px] text-white/25 italic">(adjacent strike — ATM failed spread/IV check)</span>
+              )}
+            </div>
+          ) : (
+            <div className="mt-1 text-[10px] text-white/25 italic">Awaiting chain data for contract selection...</div>
+          )}
+
           <div className="flex items-center gap-3 mt-1.5 flex-wrap">
             {dirState && (
               <>
-                <span className="text-[10px] text-white/30">
+                <span className="text-[10px] text-dim">
                   Session: <span className={
-                    dirState.sessionBias === 'bullish' ? 'text-emerald-400' :
-                    dirState.sessionBias === 'bearish' ? 'text-rose-400' :
+                    dirState.sessionBias === 'bullish' ? 'text-col-g' :
+                    dirState.sessionBias === 'bearish' ? 'text-col-r' :
                     'text-white/40'
                   }>{dirState.sessionBias.toUpperCase()}</span>
                 </span>
-                <span className="text-[10px] text-white/30">
+                <span className="text-[10px] text-dim">
                   Play: <span className={
-                    dirState.playDirection === 'calls' ? 'text-emerald-300' :
-                    dirState.playDirection === 'puts' ? 'text-rose-300' :
-                    'text-white/30'
+                    dirState.playDirection === 'calls' ? 'text-col-g' :
+                    dirState.playDirection === 'puts' ? 'text-col-r' :
+                    'text-dim'
                   }>{dirState.playDirection.toUpperCase()}</span>
                 </span>
               </>
@@ -1350,7 +1494,7 @@ function BrainIntelligenceSection({ card }: { card: RankedCard }) {
   return (
     <div className="space-y-2">
       <div className="flex items-center gap-2 mb-2">
-        <span className="text-[10px] font-bold tracking-widest text-white/30 uppercase">Brain Intelligence</span>
+        <span className="text-[10px] font-bold tracking-widest text-dim uppercase">Brain Intelligence</span>
         <CriterionDot pass={c1BrainValid} label="C1" />
       </div>
 
@@ -1358,8 +1502,8 @@ function BrainIntelligenceSection({ card }: { card: RankedCard }) {
         <div className="text-xs text-white/25 italic">No Brain data for this setup yet.</div>
       ) : !baseRate.isStatisticallyValid ? (
         <div className="flex items-center gap-2">
-          <span className="w-2 h-2 rounded-full bg-amber-400" />
-          <span className="text-xs text-amber-400">
+          <span className="w-2 h-2 rounded-full bg-amb" />
+          <span className="text-xs text-amb">
             BUILDING BASE RATE — n={baseRate.n} (need {BRAIN_VALID_FLOOR})
           </span>
         </div>
@@ -1383,26 +1527,26 @@ function BrainIntelligenceBar({ baseRate, compact = false }: { baseRate: BaseRat
     <div className={`space-y-1.5 ${compact ? '' : ''}`}>
       <div className="flex items-center gap-4 flex-wrap">
         <div className="flex items-center gap-1.5">
-          <span className={`text-sm font-bold ${valid ? 'text-emerald-400' : 'text-amber-400'}`}>
+          <span className={`text-sm font-bold ${valid ? 'text-col-g' : 'text-amb'}`}>
             {winPct}%
           </span>
-          <span className="text-[10px] text-white/30">win rate</span>
+          <span className="text-[10px] text-dim">win rate</span>
         </div>
         <div className="flex items-center gap-1.5">
           <span className="text-xs text-white/50">n={baseRate.n}</span>
           {baseRate.n < BRAIN_N_FLOOR && (
-            <span className="text-[9px] text-amber-400">({BRAIN_N_FLOOR - baseRate.n} more needed)</span>
+            <span className="text-[9px] text-amb">({BRAIN_N_FLOOR - baseRate.n} more needed)</span>
           )}
         </div>
         <div className="flex items-center gap-1.5">
-          <span className="text-xs text-white/30">avg P&L:</span>
-          <span className={`text-xs font-bold ${Number(avgPnl) >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
+          <span className="text-xs text-dim">avg P&L:</span>
+          <span className={`text-xs font-bold ${Number(avgPnl) >= 0 ? 'text-col-g' : 'text-col-r'}`}>
             {Number(avgPnl) >= 0 ? '+' : ''}{avgPnl}%
           </span>
         </div>
         <div className="flex items-center gap-1.5">
           <span className="text-[10px] text-white/25">Best window:</span>
-          <span className="text-[10px] text-sky-400 font-bold">{baseRate.bestWindow}</span>
+          <span className="text-[10px] text-amb font-bold">{baseRate.bestWindow}</span>
         </div>
       </div>
 
@@ -1411,7 +1555,7 @@ function BrainIntelligenceBar({ baseRate, compact = false }: { baseRate: BaseRat
           {Object.entries(baseRate.windowWinRates).map(([window, wr]) => (
             <div key={window} className="flex flex-col items-center">
               <div
-                className={`w-8 rounded-sm ${wr >= 0.6 ? 'bg-emerald-500' : wr >= 0.4 ? 'bg-amber-500' : 'bg-rose-500'}`}
+                className={`w-8 rounded-sm ${wr >= 0.6 ? 'bg-col-g' : wr >= 0.4 ? 'bg-amb' : 'bg-col-r'}`}
                 style={{ height: `${Math.max(4, wr * 28)}px` }}
               />
               <span className="text-[8px] text-white/25 mt-0.5">{window}</span>
@@ -1430,7 +1574,7 @@ function ContractEconomicsSection({ card }: { card: RankedCard }) {
   return (
     <div className="space-y-2">
       <div className="flex items-center gap-2 mb-2">
-        <span className="text-[10px] font-bold tracking-widest text-white/30 uppercase">Contract Economics</span>
+        <span className="text-[10px] font-bold tracking-widest text-dim uppercase">Contract Economics</span>
         <CriterionDot pass={card.c5Spread} label="C5" />
         <CriterionDot pass={card.c7IvRank} label="C7" />
       </div>
@@ -1439,6 +1583,7 @@ function ContractEconomicsSection({ card }: { card: RankedCard }) {
         <span className="text-xs text-white/25 italic">Awaiting chain data...</span>
       ) : (
         <div className="grid grid-cols-2 gap-x-6 gap-y-1.5 text-xs">
+          <EconRow label="Contract" value={`${formatDollar(card.contractStrike)} ${card.direction === 'call' ? 'C' : 'P'} · exp ${formatExpiry(card.contractExpiry)}`} highlight />
           <EconRow label="Bid / Ask" value={`${formatDollar(bid)} / ${formatDollar(ask)}`} />
           <EconRow label="Mid Premium" value={formatDollar(midPremium)} highlight />
           <EconRow
@@ -1480,7 +1625,7 @@ function RiskRewardSection({ card }: { card: RankedCard }) {
   return (
     <div className="space-y-2">
       <div className="flex items-center gap-2 mb-2">
-        <span className="text-[10px] font-bold tracking-widest text-white/30 uppercase">Risk / Reward</span>
+        <span className="text-[10px] font-bold tracking-widest text-dim uppercase">Risk / Reward</span>
         <CriterionDot pass={card.c6BreakEven} label="C6" />
         <CriterionDot pass={card.c8NoEarnings} label="C8" />
       </div>
@@ -1539,10 +1684,10 @@ function RiskRewardSection({ card }: { card: RankedCard }) {
 function LiveMonitorPanel({ monitor, direction }: { monitor: ActiveMonitor; direction: 'call' | 'put' }) {
   const phaseColor = {
     watching:      'text-white/60',
-    'mae-guard':   'text-rose-400',
-    continuation:  'text-emerald-400',
-    pullback:      'text-amber-400',
-    exited:        'text-white/30',
+    'mae-guard':   'text-col-r',
+    continuation:  'text-col-g',
+    pullback:      'text-amb',
+    exited:        'text-dim',
   }[monitor.phase];
 
   const maeSign = direction === 'call'
@@ -1554,37 +1699,37 @@ function LiveMonitorPanel({ monitor, direction }: { monitor: ActiveMonitor; dire
   return (
     <div className="space-y-3">
       <div className="flex items-center gap-2 mb-1">
-        <span className="text-[10px] font-bold tracking-widest text-white/30 uppercase">Live Monitor</span>
+        <span className="text-[10px] font-bold tracking-widest text-dim uppercase">Live Monitor</span>
         <span className={`text-[10px] font-bold uppercase ${phaseColor}`}>{monitor.phase.replace('-', ' ')}</span>
         <span className="text-white/20 text-[10px]">· {monitor.candleCount} candles</span>
       </div>
 
       <div className="grid grid-cols-3 gap-3 text-xs">
         <div className="bg-white/5 rounded-lg p-2 text-center">
-          <div className="text-[10px] text-white/30 mb-1">Entry</div>
+          <div className="text-[10px] text-dim mb-1">Entry</div>
           <div className="font-bold text-white">{monitor.entryPrice.toFixed(2)}</div>
         </div>
         <div className="bg-white/5 rounded-lg p-2 text-center">
-          <div className="text-[10px] text-white/30 mb-1">Current</div>
-          <div className={`font-bold ${monitor.currentPrice >= monitor.entryPrice ? 'text-emerald-400' : 'text-rose-400'}`}>
+          <div className="text-[10px] text-dim mb-1">Current</div>
+          <div className={`font-bold ${monitor.currentPrice >= monitor.entryPrice ? 'text-col-g' : 'text-col-r'}`}>
             {monitor.currentPrice.toFixed(2)}
           </div>
         </div>
         <div className="bg-white/5 rounded-lg p-2 text-center">
-          <div className="text-[10px] text-white/30 mb-1">MFE / MAE</div>
+          <div className="text-[10px] text-dim mb-1">MFE / MAE</div>
           <div className="font-bold">
-            <span className="text-emerald-400">+{mfePct.toFixed(1)}%</span>
+            <span className="text-col-g">+{mfePct.toFixed(1)}%</span>
             <span className="text-white/20"> / </span>
-            <span className="text-rose-400">{(maeSign * maePct).toFixed(1)}%</span>
+            <span className="text-col-r">{(maeSign * maePct).toFixed(1)}%</span>
           </div>
         </div>
       </div>
 
       {/* MAE Guard alert */}
       {monitor.phase === 'mae-guard' && (
-        <div className="rounded-lg bg-rose-500/10 border border-rose-500/20 px-3 py-2">
-          <span className="text-rose-400 text-xs font-bold">MAE GUARD ACTIVE</span>
-          <span className="text-rose-300/60 text-xs ml-2">
+        <div className="rounded-lg bg-col-r/10 border border-col-r/20 px-3 py-2">
+          <span className="text-col-r text-xs font-bold">MAE GUARD ACTIVE</span>
+          <span className="text-col-r/60 text-xs ml-2">
             Price moved adversely — consider exit
           </span>
         </div>
@@ -1592,9 +1737,9 @@ function LiveMonitorPanel({ monitor, direction }: { monitor: ActiveMonitor; dire
 
       {/* Continuation signal */}
       {monitor.phase === 'continuation' && (
-        <div className="rounded-lg bg-emerald-500/10 border border-emerald-500/20 px-3 py-2">
-          <span className="text-emerald-400 text-xs font-bold">CONTINUATION</span>
-          <span className="text-emerald-300/60 text-xs ml-2">
+        <div className="rounded-lg bg-col-g/10 border border-col-g/20 px-3 py-2">
+          <span className="text-col-g text-xs font-bold">CONTINUATION</span>
+          <span className="text-col-g/60 text-xs ml-2">
             Trend extending — hold or trail stop
           </span>
         </div>
@@ -1602,19 +1747,19 @@ function LiveMonitorPanel({ monitor, direction }: { monitor: ActiveMonitor; dire
 
       {/* Pullback classifier */}
       {monitor.phase === 'pullback' && (
-        <div className="rounded-lg bg-amber-500/10 border border-amber-500/20 px-3 py-2">
-          <span className="text-amber-400 text-xs font-bold">PULLBACK</span>
-          <span className="text-amber-300/60 text-xs ml-2">
+        <div className="rounded-lg bg-amb/10 border border-amb/20 px-3 py-2">
+          <span className="text-amb text-xs font-bold">PULLBACK</span>
+          <span className="text-amb/60 text-xs ml-2">
             Retracing from high — watch for continuation vs exhaustion
           </span>
         </div>
       )}
 
       {monitor.stopLevel && (
-        <div className="flex items-center gap-3 text-xs text-white/30">
-          <span>Stop: <span className="text-rose-400 font-bold">{monitor.stopLevel.toFixed(2)}</span></span>
+        <div className="flex items-center gap-3 text-xs text-dim">
+          <span>Stop: <span className="text-col-r font-bold">{monitor.stopLevel.toFixed(2)}</span></span>
           {monitor.targetLevel && (
-            <span>Target: <span className="text-emerald-400 font-bold">{monitor.targetLevel.toFixed(2)}</span></span>
+            <span>Target: <span className="text-col-g font-bold">{monitor.targetLevel.toFixed(2)}</span></span>
           )}
         </div>
       )}
@@ -1630,10 +1775,10 @@ function GhostTrackingBar({ ghost, direction }: { ghost: GhostMonitor; direction
 
   return (
     <div className="flex items-center gap-4 text-[10px] text-white/25">
-      <span className="font-bold text-white/30">GHOST</span>
+      <span className="font-bold text-dim">GHOST</span>
       <span>not taken · {ghost.candleCount} candles</span>
-      <span className="text-emerald-400/60">MFE: +{signedMfe.toFixed(2)}%</span>
-      <span className="text-rose-400/60">MAE: {signedMae.toFixed(2)}%</span>
+      <span className="text-col-g/60">MFE: +{signedMfe.toFixed(2)}%</span>
+      <span className="text-col-r/60">MAE: {signedMae.toFixed(2)}%</span>
     </div>
   );
 }
@@ -1641,18 +1786,18 @@ function GhostTrackingBar({ ghost, direction }: { ghost: GhostMonitor; direction
 function BlockerSection({ blockers }: { blockers: TimingBlocker[] }) {
   return (
     <div className="space-y-2">
-      <span className="text-[10px] font-bold tracking-widest text-rose-400/60 uppercase">
+      <span className="text-[10px] font-bold tracking-widest text-col-r/60 uppercase">
         Timing Blockers
       </span>
       <div className="space-y-1.5">
         {blockers.map((b, i) => (
           <div key={i} className="flex items-start gap-2">
-            <span className="w-2 h-2 mt-0.5 rounded-full bg-rose-400 flex-shrink-0" />
+            <span className="w-2 h-2 mt-0.5 rounded-full bg-col-r flex-shrink-0" />
             <div>
-              <span className="text-[10px] font-bold text-rose-400">{b.label}</span>
-              <span className="text-[10px] text-white/30 ml-2">{b.description}</span>
+              <span className="text-[10px] font-bold text-col-r">{b.label}</span>
+              <span className="text-[10px] text-dim ml-2">{b.description}</span>
               {b.resolvedAt && (
-                <span className="text-[10px] text-emerald-400 ml-2">
+                <span className="text-[10px] text-col-g ml-2">
                   ✓ resolved @ {formatCT(b.resolvedAt)}
                 </span>
               )}
@@ -1666,19 +1811,19 @@ function BlockerSection({ blockers }: { blockers: TimingBlocker[] }) {
 
 function DisciplineGate({ ticker, onAck }: { ticker: string; onAck: (t: string) => void }) {
   return (
-    <div className="rounded-lg border border-amber-500/20 bg-amber-500/5 px-3 py-3 space-y-2">
-      <p className="text-amber-400 text-[10px] font-bold uppercase tracking-wider">
+    <div className="rounded-lg border border-amb/20 bg-amb/5 px-3 py-3 space-y-2">
+      <p className="text-amb text-[10px] font-bold uppercase tracking-wider">
         Discipline Gate
       </p>
       <div className="space-y-1 text-[10px] text-white/40">
-        <p>✓ I have a defined stop level</p>
-        <p>✓ I am not chasing — this is a planned setup</p>
-        <p>✓ I understand the risk and position size</p>
-        <p>✓ I have not already exceeded my daily loss limit</p>
+        <p>Defined stop level required</p>
+        <p>Not chasing — this is a planned setup</p>
+        <p>Understand the risk and position size</p>
+        <p>Have not already exceeded daily loss limit</p>
       </div>
       <button
         onClick={() => onAck(ticker)}
-        className="w-full mt-1 py-1.5 rounded text-[10px] font-bold text-amber-400 border border-amber-500/30 hover:bg-amber-500/10 transition-colors uppercase tracking-wider"
+        className="w-full mt-1 py-1.5 rounded text-[10px] font-bold text-amb border border-amb/30 hover:bg-amb/10 transition-colors uppercase tracking-wider"
       >
         I confirm — show I'm In
       </button>
@@ -1706,7 +1851,7 @@ function ComparisonTable({ alternatives }: { alternatives: ContractOption[] }) {
               <td className="text-right px-2">{formatDollar((alt.bid + alt.ask) / 2)}</td>
               <td className="text-right px-2">{formatPct(alt.iv)}</td>
               <td className="text-right px-2">{alt.delta.toFixed(2)}</td>
-              <td className="text-right px-2 text-rose-400/60">{alt.theta.toFixed(3)}</td>
+              <td className="text-right px-2 text-col-r/60">{alt.theta.toFixed(3)}</td>
             </tr>
           ))}
         </tbody>
@@ -1719,9 +1864,9 @@ function ComparisonTable({ alternatives }: { alternatives: ContractOption[] }) {
 
 function RankBadge({ rank }: { rank: number }) {
   const colors = [
-    'bg-yellow-500/20 text-yellow-400 border-yellow-500/30',
+    'bg-amb/20 text-amb border-amb/30',
     'bg-white/10 text-white/70 border-white/20',
-    'bg-orange-900/30 text-orange-400/70 border-orange-500/20',
+    'bg-white/5 text-white/40 border-white/10',
     'bg-white/5 text-white/40 border-white/10',
     'bg-white/5 text-white/40 border-white/10',
   ];
@@ -1737,8 +1882,8 @@ function DirectionPill({ direction }: { direction: 'call' | 'put' }) {
   return (
     <span className={`text-[10px] font-bold px-1.5 py-0.5 rounded uppercase tracking-wider
       ${isCall
-        ? 'bg-emerald-500/15 text-emerald-400 border border-emerald-500/25'
-        : 'bg-rose-500/15 text-rose-400 border border-rose-500/25'
+        ? 'bg-col-g/15 text-col-g border border-col-g/25'
+        : 'bg-col-r/15 text-col-r border border-col-r/25'
       }`}>
       {direction === 'call' ? '▲ CALL' : '▼ PUT'}
     </span>
@@ -1747,10 +1892,10 @@ function DirectionPill({ direction }: { direction: 'call' | 'put' }) {
 
 function StatusBadge({ status }: { status: CardStatus }) {
   const map: Record<CardStatus, { label: string; cls: string }> = {
-    forming:    { label: 'FORMING',    cls: 'bg-white/5 text-white/30 border-white/10' },
-    triggering: { label: 'TRIGGERING', cls: 'bg-sky-500/15 text-sky-400 border-sky-500/25 animate-pulse' },
-    active:     { label: 'ACTIVE',     cls: 'bg-emerald-500/15 text-emerald-400 border-emerald-500/25' },
-    blocked:    { label: 'BLOCKED',    cls: 'bg-rose-500/15 text-rose-400 border-rose-500/25' },
+    forming:    { label: 'FORMING',    cls: 'bg-white/5 text-dim border-white/10' },
+    triggering: { label: 'TRIGGERING', cls: 'bg-amb/15 text-amb border-amb/25 animate-pulse' },
+    active:     { label: 'ACTIVE',     cls: 'bg-col-g/15 text-col-g border-col-g/25' },
+    blocked:    { label: 'BLOCKED',    cls: 'bg-col-r/15 text-col-r border-col-r/25' },
     ghost:      { label: 'GHOST',      cls: 'bg-white/5 text-white/20 border-white/10' },
   };
   const { label, cls } = map[status];
@@ -1763,11 +1908,11 @@ function StatusBadge({ status }: { status: CardStatus }) {
 
 function SignalTypeBadge({ type, confidence }: { type: Signal['type']; confidence: number }) {
   const map: Record<Signal['type'], string> = {
-    ENTER:    'bg-emerald-500/15 text-emerald-400',
-    BREAKOUT: 'bg-sky-500/15 text-sky-400',
-    REVERSAL: 'bg-purple-500/15 text-purple-400',
-    RIP:      'bg-amber-500/15 text-amber-400',
-    DUMP:     'bg-rose-500/15 text-rose-400',
+    ENTER:    'bg-col-g/15 text-col-g',
+    BREAKOUT: 'bg-amb/15 text-amb',
+    REVERSAL: 'bg-white/5 text-white/40',
+    RIP:      'bg-amb/15 text-amb',
+    DUMP:     'bg-col-r/15 text-col-r',
     EXIT:     'bg-white/10 text-white/40',
   };
   return (
@@ -1775,16 +1920,16 @@ function SignalTypeBadge({ type, confidence }: { type: Signal['type']; confidenc
       <span className={`text-[9px] font-bold px-1.5 py-0.5 rounded uppercase tracking-wider ${map[type]}`}>
         {type}
       </span>
-      <span className="text-[10px] text-white/30">{confidence}/100</span>
+      <span className="text-[10px] text-dim">{confidence}/100</span>
     </div>
   );
 }
 
 function DteBadge({ dte }: { dte: DteRecommendation }) {
   const colors: Record<DteCategory, string> = {
-    '0DTE':   'bg-rose-500/15 text-rose-400 border-rose-500/25',
-    '1-2DTE': 'bg-amber-500/15 text-amber-400 border-amber-500/25',
-    '3-5DTE': 'bg-blue-500/15 text-blue-400 border-blue-500/25',
+    '0DTE':   'bg-col-r/15 text-col-r border-col-r/25',
+    '1-2DTE': 'bg-amb/15 text-amb border-amb/25',
+    '3-5DTE': 'bg-white/5 text-white/40 border-white/10',
   };
   return (
     <span className={`text-[9px] font-bold px-1.5 py-0.5 rounded border uppercase tracking-wider ${colors[dte.category]}`}>
@@ -1796,7 +1941,7 @@ function DteBadge({ dte }: { dte: DteRecommendation }) {
 function CriterionDot({ pass, label }: { pass: boolean; label: string }) {
   return (
     <span className={`text-[9px] font-bold px-1 py-0.5 rounded
-      ${pass ? 'text-emerald-400 bg-emerald-500/10' : 'text-rose-400/60 bg-rose-500/10'}`}>
+      ${pass ? 'text-col-g bg-col-g/10' : 'text-col-r/60 bg-col-r/10'}`}>
       {label} {pass ? '✓' : '✗'}
     </span>
   );
@@ -1815,9 +1960,9 @@ function EconRow({
 }) {
   return (
     <div className="flex items-center justify-between">
-      <span className="text-white/30">{label}</span>
+      <span className="text-dim">{label}</span>
       <span className={
-        warn ? 'text-rose-400 font-bold' :
+        warn ? 'text-col-r font-bold' :
         highlight ? 'text-white font-bold' :
         'text-white/60'
       }>
@@ -1828,9 +1973,9 @@ function EconRow({
 }
 
 function gexColor(regime: string): string {
-  if (regime === 'positive') return 'text-emerald-400';
-  if (regime === 'negative') return 'text-rose-400';
-  return 'text-amber-400';
+  if (regime === 'positive') return 'text-col-g';
+  if (regime === 'negative') return 'text-col-r';
+  return 'text-amb';
 }
 
 

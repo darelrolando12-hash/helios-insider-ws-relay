@@ -91,9 +91,14 @@ function _onFundamentalsUpdate() {
 }
 
 function _getTrackedTickers(): string[] {
-  // Derive from _state — any ticker we've scored before
-  // plus any ticker in fundamentalsStore that has shortInterest data
-  return Array.from(_state.keys());
+  // Union of: tickers already scored (_state) + tickers with fundamentals data
+  // (fundamentalsStore). The second set catches tickers whose boot-time
+  // scoreTicker() hit the early-return gate because fundamentals weren't
+  // available yet — without this union, _onFundamentalsUpdate would loop an
+  // empty set the first time fundamentalsStore gets real writers.
+  const fromState   = Array.from(_state.keys());
+  const fromFundamentals = fundamentalsStore.getTickers();
+  return Array.from(new Set([...fromState, ...fromFundamentals]));
 }
 
 /**

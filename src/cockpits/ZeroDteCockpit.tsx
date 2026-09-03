@@ -47,12 +47,13 @@ import {
   TICKER_BETA_TABLE,
   getDirectionState,
   subscribe as subscribeDirection,
+  computeTradeType,
 }                             from '../state/directionState';
-import type { DirectionState, SessionBias } from '../state/directionState';
+import type { DirectionState, SessionBias, TradeType } from '../state/directionState';
 import type { Bar }           from '../stores/types';
 import type { CvdState }      from '../stores/cvdStore';
 import type { MarketContext } from '../stores/marketStore';
-import { timeOfDayBucket }    from '../ledger/brainStore';
+import { timeOfDayBucket, vixBucket } from '../ledger/brainStore';
 import type { SetupFingerprint, BaseRate } from '../ledger/brainStore';
 import { computeEma }         from '../engines/confluenceEngine';
 import { HeliosChart }        from '../components/HeliosChart';
@@ -61,7 +62,6 @@ import { HeliosChart }        from '../components/HeliosChart';
 
 const MAX_ACTIVE       = 5;
 const SNAPSHOT_MS      = 30_000;
-const CONTINUATION_GAP = 90 * 60 * 1000; // 90 min same-direction = continuation
 
 const SELECTABLE = FEED_TICKERS.filter(t => !CONTEXT_ONLY_TICKERS.has(t));
 
@@ -70,9 +70,8 @@ const W = { c1: 128, c2: 64, c3: 32, c4: 16, c5: 8, c6: 4, c7: 2, c8: 1 };
 
 // ── Types ──────────────────────────────────────────────────────────────────────
 
-type TradeType = 'with_session' | 'counter_session' | 'continuation';
 type MonitorPhase = 'watching' | 'mae-guard' | 'continuation' | 'pullback' | 'exited';
-type RowPhase = 'no-signal' | 'forming' | 'triggering' | 'active';
+type RowPhase = 'no-signal' | 'forming' | 'triggering' | 'consolidating' | 'active';
 type ExhaustionLevel = 0 | 1 | 2 | 3 | 4;
 type PullbackClass = 'normal' | 'concerning' | 'reversal';
 type ConsolidationState = 'unclear' | 'consolidating' | 'continuation' | 'exit-signal';
@@ -141,28 +140,6 @@ interface StackRow {
 }
 
 // ── Pure helpers ───────────────────────────────────────────────────────────────
-
-function computeTradeType(
-  direction: 'call' | 'put',
-  sessionBias: SessionBias,
-  priorDirection: 'call' | 'put' | null,
-  priorResolvedAt: number | null,
-): TradeType {
-  // Continuation: same direction as a resolved signal within 90 min
-  if (
-    priorDirection === direction &&
-    priorResolvedAt !== null &&
-    Date.now() - priorResolvedAt < CONTINUATION_GAP
-  ) return 'continuation';
-
-  const biasMatchesCalls = sessionBias === 'bullish';
-  const biasMatchesPuts  = sessionBias === 'bearish';
-
-  if (direction === 'call' && biasMatchesCalls) return 'with_session';
-  if (direction === 'put'  && biasMatchesPuts)  return 'with_session';
-  if (sessionBias === 'neutral')                return 'with_session';
-  return 'counter_session';
-}
 
 function convictionMultiplier(t: TradeType): number {
   if (t === 'continuation')   return 1.05;
@@ -417,7 +394,7 @@ function buildStackRow(ticker: string): StackRow | null {
       midPremium = (bid + ask) / 2;
       spread     = ask - bid;
       delta      = direction === 'call' ? atm.callDelta : atm.putDelta;
-      gamma      = atm.callDelta * 0.02; // approximation
+      gamma      = direction === 'call' ? atm.callGamma : atm.putGamma;
       theta      = direction === 'call' ? atm.callTheta : atm.putTheta;
       ivRank     = atm.callIV > 0 ? atm.callIV / 100 : null;
     }
@@ -447,12 +424,16 @@ function buildStackRow(ticker: string): StackRow | null {
   // Fingerprint for brain
   const nowCT  = toCentralTime(Date.now());
   const tradeType = computeTradeType(direction, dir?.sessionBias ?? 'neutral', null, null);
+  const vixR = barsStore.getResult('I:VIX');
+  const vixClose = vixR.status === 'ready' && vixR.data.length > 0
+    ? vixR.data[vixR.data.length - 1].close
+    : null;
 
   const fingerprint: ExtFingerprint = {
     ticker,
     direction,
     gexRegime,
-    vixBucket: '<15',
+    vixBucket: vixClose !== null ? vixBucket(vixClose) : '<15',
     timeOfDay: timeOfDayBucket(nowCT.ctMs),
     tradeType,
   };
@@ -479,8 +460,10 @@ function buildStackRow(ticker: string): StackRow | null {
     (c5 ? W.c5 : 0) + (c6 ? W.c6 : 0) + (c7 ? W.c7 : 0) + (c8 ? W.c8 : 0);
 
   let rowPhase: RowPhase = 'no-signal';
-  if (!dir || dir.playDirection === 'none' || dir.playDirection === 'consolidating') {
+  if (!dir || dir.playDirection === 'none') {
     rowPhase = 'no-signal';
+  } else if (dir.playDirection === 'consolidating') {
+    rowPhase = 'consolidating';
   } else if (score >= W.c1 + W.c2) {
     rowPhase = 'triggering';
   } else if (score > 0) {
@@ -553,9 +536,9 @@ function GlobalHeader({
 
   const verdict = globalVerdict(spyState, qqqState, activeCount);
   const verdictCfg: Record<Verdict, { bg: string; text: string; label: string }> = {
-    'TRADE':      { bg: 'bg-emerald-500',    text: 'text-white', label: 'TRADE' },
-    'REDUCE':     { bg: 'bg-amber-500',      text: 'text-black', label: 'REDUCE' },
-    'STAND DOWN': { bg: 'bg-rose-600',       text: 'text-white', label: 'STAND DOWN' },
+    'TRADE':      { bg: 'bg-col-g',    text: 'text-void', label: 'TRADE' },
+    'REDUCE':     { bg: 'bg-amb',      text: 'text-void', label: 'REDUCE' },
+    'STAND DOWN': { bg: 'bg-col-r',    text: 'text-void', label: 'STAND DOWN' },
   };
   const vc = verdictCfg[verdict];
 
@@ -565,30 +548,30 @@ function GlobalHeader({
     : vixPrice >= 16                        ? 'NORMAL'
     :                                         'COMPLACENT';
   const vixPillCfg =
-    vixRegime === 'EXTREME FEAR' ? { bg: 'bg-red-700',   text: 'text-white',      pulse: 'animate-pulse' } :
-    vixRegime === 'FEAR'         ? { bg: 'bg-rose-600',  text: 'text-white',      pulse: '' } :
-    vixRegime === 'NORMAL'       ? { bg: 'bg-slate-700', text: 'text-white/70',   pulse: '' } :
-    vixRegime === 'COMPLACENT'   ? { bg: 'bg-amber-600', text: 'text-white',      pulse: '' } :
-                                   { bg: 'bg-slate-800', text: 'text-white/30',   pulse: '' };
+    vixRegime === 'EXTREME FEAR' ? { bg: 'bg-col-r',     text: 'text-void',    pulse: 'animate-pulse' } :
+    vixRegime === 'FEAR'         ? { bg: 'bg-col-r/80',  text: 'text-void',    pulse: '' } :
+    vixRegime === 'NORMAL'       ? { bg: 'bg-white/10',  text: 'text-white/70', pulse: '' } :
+    vixRegime === 'COMPLACENT'   ? { bg: 'bg-amb',       text: 'text-void',    pulse: '' } :
+                                   { bg: 'bg-white/5',   text: 'text-dim', pulse: '' };
 
   return (
     <div className="sticky top-0 z-40 bg-[#0a0a0f]/95 backdrop-blur border-b border-white/8">
       {/* Halt strip */}
       {haltedTickers.length > 0 && (
-        <div className="bg-rose-600 text-white text-[10px] font-bold px-4 py-1 flex items-center gap-2">
+        <div className="bg-col-r text-void text-[10px] font-bold px-4 py-1 flex items-center gap-2">
           <span className="animate-pulse">⚠ HALTED:</span>
           <span>{haltedTickers.join(' · ')}</span>
         </div>
       )}
 
-      <div className="flex items-center gap-3 px-4 py-2.5">
+      <div className="flex items-center gap-2 px-3 py-2 min-w-0">
         {/* Verdict badge */}
-        <div className={`${vc.bg} ${vc.text} px-3 py-1 rounded-md font-black text-xs tracking-widest shrink-0`}>
+        <div className={`${vc.bg} ${vc.text} px-2.5 py-1 rounded font-black text-[11px] tracking-wider shrink-0`}>
           {vc.label}
         </div>
 
-        {/* Index badges */}
-        <div className="flex gap-1.5">
+        {/* Index badges — hidden on very narrow screens via min-w-0 */}
+        <div className="flex gap-1 shrink-0">
           {([['SPY', spyState], ['QQQ', qqqState], ['IWM', iwmState]] as [string, DirectionState | null][]).map(
             ([sym, state]) => (
               <IndexMini key={sym} sym={sym} state={state} />
@@ -596,24 +579,24 @@ function GlobalHeader({
           )}
         </div>
 
-        <div className="flex-1" />
+        <div className="flex-1 min-w-0" />
 
         {/* VIX regime pill */}
         {vixPrice !== null && vixRegime !== null && (
-          <div className={`px-2 py-0.5 rounded text-[10px] font-bold shrink-0 ${vixPillCfg.bg} ${vixPillCfg.text} ${vixPillCfg.pulse}`}>
-            VIX {vixPrice.toFixed(1)} · {vixRegime}
+          <div className={`px-1.5 py-0.5 rounded text-[9px] font-bold shrink-0 ${vixPillCfg.bg} ${vixPillCfg.text} ${vixPillCfg.pulse}`}>
+            VIX {vixPrice.toFixed(0)} {vixRegime}
           </div>
         )}
 
         {/* Candles remaining */}
-        <div className="flex items-center gap-1 text-[10px] text-white/40">
+        <div className="flex items-center gap-0.5 text-[10px] text-white/40 shrink-0">
           <span className="tabular-nums font-bold text-white/60">{candlesRemaining}</span>
-          <span>candles</span>
+          <span>c</span>
         </div>
 
         {/* Active count */}
-        <div className={`text-[10px] font-bold tabular-nums ${activeCount >= MAX_ACTIVE ? 'text-rose-400' : 'text-white/40'}`}>
-          {activeCount}/{MAX_ACTIVE} active
+        <div className={`text-[10px] font-bold tabular-nums shrink-0 ${activeCount >= MAX_ACTIVE ? 'text-col-r' : 'text-white/40'}`}>
+          {activeCount}/{MAX_ACTIVE}
         </div>
       </div>
     </div>
@@ -621,24 +604,17 @@ function GlobalHeader({
 }
 
 function IndexMini({ sym, state }: { sym: string; state: DirectionState | null }) {
-  const bias  = state?.sessionBias  ?? 'neutral';
-  const play  = state?.playDirection ?? 'none';
-  const biasCfg: Record<string, string> = {
-    bullish: 'text-emerald-400',
-    bearish: 'text-rose-400',
-    neutral: 'text-white/35',
-  };
-  const playCfg: Record<string, string> = {
-    calls:         'text-emerald-300',
-    puts:          'text-rose-300',
-    consolidating: 'text-amber-300',
-    none:          'text-white/20',
-  };
+  const bias = state?.sessionBias ?? 'neutral';
+  const play = state?.playDirection ?? 'none';
+  const dotColor =
+    bias === 'bullish' ? 'bg-col-g' :
+    bias === 'bearish' ? 'bg-col-r' :
+    play === 'consolidating' ? 'bg-amb' :
+    'bg-white/20';
   return (
-    <div className="flex flex-col items-center px-2 py-0.5 rounded bg-white/4 border border-white/8">
+    <div className="flex items-center gap-1 px-1.5 py-0.5 rounded bg-white/4 border border-white/8 shrink-0">
+      <div className={`w-1.5 h-1.5 rounded-full ${dotColor}`} />
       <span className="text-[9px] text-white/50 font-bold">{sym}</span>
-      <span className={`text-[9px] font-bold uppercase ${biasCfg[bias]}`}>{bias.slice(0, 4)}</span>
-      <span className={`text-[9px] font-bold uppercase ${playCfg[play]}`}>{play.slice(0, 4)}</span>
     </div>
   );
 }
@@ -678,10 +654,10 @@ function ActiveWidget({
 
   const phaseCfg: Record<MonitorPhase, { border: string; badge: string; label: string }> = {
     watching:     { border: 'border-white/12',    badge: 'bg-white/8 text-white/50',         label: 'WATCHING' },
-    'mae-guard':  { border: 'border-rose-500/50', badge: 'bg-rose-500/15 text-rose-400',     label: 'MAE GUARD' },
-    continuation: { border: 'border-emerald-500/40', badge: 'bg-emerald-500/10 text-emerald-400', label: 'CONTINUATION' },
-    pullback:     { border: 'border-amber-500/40', badge: 'bg-amber-500/10 text-amber-400',  label: 'PULLBACK' },
-    exited:       { border: 'border-white/8',     badge: 'bg-white/5 text-white/30',         label: 'EXITED' },
+    'mae-guard':  { border: 'border-col-r/50', badge: 'bg-col-r/15 text-col-r',     label: 'MAE GUARD' },
+    continuation: { border: 'border-col-g/40', badge: 'bg-col-g/10 text-col-g', label: 'CONTINUATION' },
+    pullback:     { border: 'border-amb/40',   badge: 'bg-amb/10 text-amb',        label: 'PULLBACK' },
+    exited:       { border: 'border-white/8',     badge: 'bg-white/5 text-dim',         label: 'EXITED' },
   };
   const pc = phaseCfg[monitor.phase];
 
@@ -705,8 +681,8 @@ function ActiveWidget({
     ? 'DEGRADING'
     : 'STABLE';
   const convStatusCfg: Record<string, string> = {
-    STRENGTHENING: 'text-emerald-400',
-    DEGRADING:     'text-amber-400',
+    STRENGTHENING: 'text-col-g',
+    DEGRADING:     'text-amb',
     STABLE:        'text-white/50',
   };
 
@@ -729,7 +705,7 @@ function ActiveWidget({
   }, [exitPrice, exitResult, exitNotes, monitor.signalId, onExit]);
 
   return (
-    <div className={`rounded-xl border ${pc.border} bg-white/2 overflow-hidden transition-all`}>
+    <div className={`border ${pc.border} bg-white/2 overflow-hidden transition-all`}>
       {/* Compact header — always visible */}
       <button
         className="w-full flex items-center gap-3 px-3 py-2.5 text-left hover:bg-white/3 transition-colors"
@@ -738,14 +714,14 @@ function ActiveWidget({
         <DirectionPill direction={monitor.direction} />
         <span className="font-bold text-white text-sm">{monitor.ticker}</span>
         {CASH_SETTLED_TICKERS.has(monitor.ticker) && (
-          <span className="text-[9px] bg-yellow-500/20 text-yellow-400 px-1 py-0.5 rounded border border-yellow-500/30">CASH</span>
+          <span className="text-[9px] bg-amb/10 text-amb px-1 py-0.5 rounded border border-amb/30">CASH</span>
         )}
         <span className={`text-[9px] px-1.5 py-0.5 rounded font-bold uppercase ${pc.badge}`}>{pc.label}</span>
 
         <div className="flex-1" />
 
         {/* P&L */}
-        <span className={`text-xs font-bold tabular-nums ${favPct >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
+        <span className={`text-xs font-bold tabular-nums ${favPct >= 0 ? 'text-col-g' : 'text-col-r'}`}>
           {favPct >= 0 ? '+' : ''}{favPct.toFixed(2)}%
         </span>
         <span className="text-white/20 text-xs ml-1">{monitor.candleCount}c</span>
@@ -757,12 +733,12 @@ function ActiveWidget({
         <div className="border-t border-white/8 px-3 pb-3 space-y-3">
           {/* Conviction banner */}
           {monitor.currentConviction < 30 && (
-            <div className="mt-2 bg-rose-500/15 border border-rose-500/25 rounded p-2 text-[10px] text-rose-400 font-bold">
+            <div className="mt-2 bg-col-r/15 border border-col-r/25 rounded p-2 text-[10px] text-col-r font-bold">
               LOW CONVICTION ({monitor.currentConviction}) — Consider exiting
             </div>
           )}
           {monitor.currentConviction >= 30 && monitor.currentConviction < 50 && (
-            <div className="mt-2 bg-amber-500/15 border border-amber-500/25 rounded p-2 text-[10px] text-amber-400 font-bold">
+            <div className="mt-2 bg-amb/15 border border-amb/25 rounded p-2 text-[10px] text-amb font-bold">
               WEAKENING CONVICTION ({monitor.currentConviction})
             </div>
           )}
@@ -770,23 +746,23 @@ function ActiveWidget({
           {/* Price row */}
           <div className="mt-2 grid grid-cols-4 gap-2">
             <MiniStat label="ENTRY"   value={`$${monitor.entryPrice.toFixed(2)}`}   color="text-white/50" />
-            <MiniStat label="CURRENT" value={`$${monitor.currentPrice.toFixed(2)}`} color={favPct >= 0 ? 'text-emerald-400' : 'text-rose-400'} />
-            <MiniStat label="MAE"     value={`${(monitor.maePct * 100).toFixed(2)}%`} color="text-rose-400" />
-            <MiniStat label="MFE"     value={`${(monitor.mfePct * 100).toFixed(2)}%`} color="text-emerald-400" />
+            <MiniStat label="CURRENT" value={`$${monitor.currentPrice.toFixed(2)}`} color={favPct >= 0 ? 'text-col-g' : 'text-col-r'} />
+            <MiniStat label="MAE"     value={`${(monitor.maePct * 100).toFixed(2)}%`} color="text-col-r" />
+            <MiniStat label="MFE"     value={`${(monitor.mfePct * 100).toFixed(2)}%`} color="text-col-g" />
           </div>
 
           {/* Premium P&L estimate */}
           {monitor.entryPremium > 0 && (
             <div className="grid grid-cols-2 gap-2">
               <MiniStat label="PREM EST" value={`$${Math.max(0, premiumEst).toFixed(2)}`} color="text-white/70" />
-              <MiniStat label="P&L EST"  value={`${pnlEst >= 0 ? '+' : ''}$${pnlEst.toFixed(2)}`} color={pnlEst >= 0 ? 'text-emerald-400' : 'text-rose-400'} />
+              <MiniStat label="P&L EST"  value={`${pnlEst >= 0 ? '+' : ''}$${pnlEst.toFixed(2)}`} color={pnlEst >= 0 ? 'text-col-g' : 'text-col-r'} />
             </div>
           )}
 
           {/* Conviction sparkline */}
           <div className="space-y-1">
             <div className="flex items-center justify-between">
-              <span className="text-[9px] text-white/30 uppercase tracking-wider">Conviction</span>
+              <span className="text-[9px] text-dim uppercase tracking-wider">Conviction</span>
               <span className={`text-[9px] font-bold ${convStatusCfg[convStatus]}`}>{convStatus}</span>
             </div>
             <ConvictionSparkline history={convHistory} current={monitor.currentConviction} />
@@ -816,7 +792,7 @@ function ActiveWidget({
 
           {/* Exit form */}
           <div className="space-y-2 pt-1">
-            <p className="text-[10px] text-white/30 uppercase tracking-wider">Exit Trade</p>
+            <p className="text-[10px] text-dim uppercase tracking-wider">Exit Trade</p>
             <div className="flex gap-2">
               <input
                 type="number"
@@ -845,7 +821,7 @@ function ActiveWidget({
 
             {/* Discipline Mirror */}
             <button
-              className="w-full text-left text-[10px] text-white/30 hover:text-white/50 transition-colors"
+              className="w-full text-left text-[10px] text-dim hover:text-white/50 transition-colors"
               onClick={() => setMirrorOpen(m => !m)}
             >
               {mirrorOpen ? '▲' : '▼'} Discipline Mirror
@@ -855,7 +831,7 @@ function ActiveWidget({
             )}
 
             <button
-              className="w-full py-2.5 rounded-lg bg-rose-600 hover:bg-rose-500 text-white text-sm font-bold transition-colors"
+              className="w-full py-2.5 rounded-lg bg-col-r hover:bg-col-r/80 text-void text-sm font-bold transition-colors"
               onClick={handleExit}
             >
               Confirm Exit
@@ -898,17 +874,17 @@ function DisciplineMirror({
       </div>
       <div className="flex justify-between">
         <span className="text-white/40">MAE drawn down</span>
-        <span className={`font-bold ${monitor.maePct > 0.008 ? 'text-rose-400' : 'text-white/60'}`}>
+        <span className={`font-bold ${monitor.maePct > 0.008 ? 'text-col-r' : 'text-white/60'}`}>
           {(monitor.maePct * 100).toFixed(2)}%
         </span>
       </div>
       <div className="flex justify-between">
         <span className="text-white/40">Trade type</span>
         <span className={`font-bold ${
-          monitor.tradeType === 'counter_session' ? 'text-amber-400'
-            : monitor.tradeType === 'continuation' ? 'text-blue-400'
-            : 'text-emerald-400'
-        }`}>{monitor.tradeType.replace('_', ' ').toUpperCase()}</span>
+          monitor.tradeType === 'counter_session' ? 'text-amb'
+            : monitor.tradeType === 'continuation' ? 'text-white/40'
+            : 'text-col-g'
+        }`}>{monitor.tradeType ?? '—'}</span>
       </div>
     </div>
   );
@@ -932,42 +908,48 @@ function OpportunityRow({
   onOpenTV:      (ticker: string) => void;
 }) {
   const phaseCfg: Record<RowPhase, { border: string; pill: string; label: string }> = {
-    'no-signal':  { border: 'border-white/5',        pill: 'bg-white/5 text-white/20',             label: 'NO SIGNAL' },
-    'forming':    { border: 'border-white/10',        pill: 'bg-white/8 text-white/40',             label: 'FORMING' },
-    'triggering': { border: 'border-emerald-500/35',  pill: 'bg-emerald-500/15 text-emerald-400',   label: 'TRIGGERING' },
-    'active':     { border: 'border-blue-500/35',     pill: 'bg-blue-500/10 text-blue-400',         label: 'ACTIVE' },
+    'no-signal':     { border: 'border-white/5',   pill: 'bg-white/5 text-white/20',                                    label: 'NO SIGNAL' },
+    'forming':       { border: 'border-line',      pill: 'bg-panel2 text-mut',                                          label: 'WATCHING' },
+    'consolidating': { border: 'border-amb/25',    pill: 'bg-amb-dim text-amb',                                         label: 'CONSOLIDATING' },
+    'triggering':    { border: 'border-col-g/50',  pill: 'bg-col-g text-[rgb(2,21,13)] !font-black animate-vbpulse',    label: 'ENTER NOW' },
+    'active':        { border: 'border-amb/35',    pill: 'bg-amb/10 text-amb',                                         label: 'ACTIVE' },
   };
   const pc = phaseCfg[row.rowPhase];
 
+  const sessionLabel = row.tradeType === 'counter_session' ? 'COUNTER SESSION' : 'WITH SESSION';
+  const sessionColor = row.tradeType === 'counter_session' ? 'text-amb'
+    : row.tradeType === 'continuation' ? 'text-white/40'
+    : 'text-col-g';
+
   const rowBg = isActive
-    ? 'bg-blue-900/10'
+    ? 'bg-amb/5'
     : row.rowPhase === 'triggering'
-    ? 'bg-emerald-900/6 hover:bg-emerald-900/10'
+    ? 'bg-col-g/5 hover:bg-col-g/8'
     : 'hover:bg-white/2';
 
   return (
-    <div className={`rounded-xl border ${pc.border} ${rowBg} overflow-hidden transition-all`}>
+    <div className={`border ${pc.border} ${rowBg} overflow-hidden transition-all`}>
       {/* Compact row */}
       <button
         className="w-full flex items-center gap-2 px-3 py-2.5 text-left"
         onClick={onExpand}
-        disabled={row.rowPhase === 'no-signal'}
+        disabled={row.rowPhase === 'no-signal' || row.rowPhase === 'consolidating'}
       >
         {/* Score badge */}
         <div className={`w-8 text-center text-[9px] font-black tabular-nums rounded px-1 py-0.5 shrink-0 ${
-          row.score >= 200 ? 'bg-emerald-500/20 text-emerald-400'
-          : row.score >= 100 ? 'bg-amber-500/20 text-amber-400'
+          row.score >= 200 ? 'bg-col-g/20 text-col-g'
+          : row.score >= 100 ? 'bg-amb/20 text-amb'
           : 'bg-white/5 text-white/20'
         }`}>
           {row.score}
         </div>
 
-        <span className={`font-bold text-sm w-12 shrink-0 ${row.rowPhase === 'no-signal' ? 'text-white/30' : 'text-white'}`}>
+        <span className={`font-bold text-sm w-12 shrink-0 ${row.rowPhase === 'no-signal' ? 'text-dim' : 'text-white'}`}>
           {row.ticker}
         </span>
 
         {row.cashSettled && (
-          <span className="text-[8px] bg-yellow-500/15 text-yellow-400/70 px-1 rounded border border-yellow-500/20 shrink-0">CASH</span>
+          <span className="text-[8px] bg-amb/15 text-amb px-1 rounded border border-amb/25 shrink-0">CASH</span>
         )}
 
         <DirectionPill direction={row.direction} dim={row.rowPhase === 'no-signal'} />
@@ -976,6 +958,12 @@ function OpportunityRow({
           {pc.label}
         </span>
 
+        {row.rowPhase !== 'no-signal' && row.rowPhase !== 'consolidating' && (
+          <span className={`text-[8px] font-bold uppercase shrink-0 ${sessionColor}`}>
+            {sessionLabel}
+          </span>
+        )}
+
         <div className="flex-1" />
 
         {/* Criteria dots */}
@@ -983,7 +971,7 @@ function OpportunityRow({
           {([row.c1, row.c2, row.c3, row.c4, row.c5, row.c6, row.c7, row.c8] as boolean[]).map((v, i) => (
             <div
               key={i}
-              className={`w-1.5 h-1.5 rounded-full ${v ? 'bg-emerald-400' : 'bg-white/10'}`}
+              className={`w-1.5 h-1.5 rounded-full ${v ? 'bg-col-g' : 'bg-white/10'}`}
             />
           ))}
         </div>
@@ -994,13 +982,13 @@ function OpportunityRow({
           </span>
         )}
 
-        {row.rowPhase !== 'no-signal' && (
+        {row.rowPhase !== 'no-signal' && row.rowPhase !== 'consolidating' && (
           <span className="text-white/15 text-xs">{isExpanded ? '▲' : '▼'}</span>
         )}
       </button>
 
       {/* Expanded: pre-entry card */}
-      {isExpanded && !isActive && row.rowPhase !== 'no-signal' && (
+      {isExpanded && !isActive && row.rowPhase !== 'no-signal' && row.rowPhase !== 'consolidating' && (
         <InlinePreEntryCard
           row={row}
           onImIn={onImIn}
@@ -1036,9 +1024,9 @@ function InlinePreEntryCard({
   const cvdStep3 = cvdStep1 && cvdStep2;
 
   const tradeTypeCfg: Record<TradeType, { color: string; label: string; desc: string }> = {
-    with_session:    { color: 'text-emerald-400', label: 'WITH SESSION',    desc: `Target: GEX wall ${(row.direction === 'call' ? row.callWall : row.putWall).toFixed(2)}` },
-    counter_session: { color: 'text-amber-400',   label: 'COUNTER SESSION', desc: 'Target: VWAP reversion — tighter sizing' },
-    continuation:    { color: 'text-blue-400',    label: 'CONTINUATION',    desc: `Target: next GEX wall — ×1.05 conviction` },
+    with_session:    { color: 'text-col-g',  label: 'WITH SESSION',    desc: `Target: GEX wall ${(row.direction === 'call' ? row.callWall : row.putWall).toFixed(2)}` },
+    counter_session: { color: 'text-amb',    label: 'COUNTER SESSION', desc: 'Target: VWAP reversion — tighter sizing' },
+    continuation:    { color: 'text-white/40', label: 'WITH SESSION',  desc: `Re-entry within 90 min — ×1.05 conviction, size down` },
   };
   const ttc = tradeTypeCfg[row.tradeType];
 
@@ -1047,9 +1035,9 @@ function InlinePreEntryCard({
       {/* Section A: Trade type */}
       <div className="mt-2 flex items-center gap-2">
         <span className={`text-[10px] font-bold px-2 py-1 rounded border ${
-          row.tradeType === 'counter_session' ? 'border-amber-500/30 bg-amber-500/8 text-amber-400'
-          : row.tradeType === 'continuation'  ? 'border-blue-500/30 bg-blue-500/8 text-blue-400'
-          : 'border-emerald-500/30 bg-emerald-500/8 text-emerald-400'
+          row.tradeType === 'counter_session' ? 'border-amb/30 bg-amb/8 text-amb'
+          : row.tradeType === 'continuation'  ? 'border-white/15 bg-white/5 text-white/40'
+          : 'border-col-g/30 bg-col-g/8 text-col-g'
         }`}>{ttc.label}</span>
         <span className="text-[10px] text-white/35">{ttc.desc}</span>
       </div>
@@ -1070,7 +1058,7 @@ function InlinePreEntryCard({
           ].map(({ label, pass }) => (
             <div key={label} className="flex items-center gap-1.5">
               <span className={`w-3 h-3 rounded-full flex-shrink-0 flex items-center justify-center text-[8px] ${
-                pass ? 'bg-emerald-500/20 text-emerald-400' : 'bg-white/5 text-white/20'
+                pass ? 'bg-col-g/20 text-col-g' : 'bg-white/5 text-white/20'
               }`}>
                 {pass ? '✓' : '×'}
               </span>
@@ -1090,9 +1078,9 @@ function InlinePreEntryCard({
             { label: 'Dual confirmed', pass: cvdStep3, val: cvdStep3 ? 'YES' : 'NO' },
           ].map(({ label, pass, val }) => (
             <div key={label} className={`flex-1 rounded-lg p-2 text-center border ${
-              pass ? 'border-emerald-500/25 bg-emerald-500/6' : 'border-white/8 bg-white/2'
+              pass ? 'border-col-g/25 bg-col-g/6' : 'border-white/8 bg-white/2'
             }`}>
-              <p className={`text-[9px] font-bold ${pass ? 'text-emerald-400' : 'text-white/25'}`}>{val}</p>
+              <p className={`text-[9px] font-bold ${pass ? 'text-col-g' : 'text-white/25'}`}>{val}</p>
               <p className="text-[8px] text-white/25 mt-0.5">{label}</p>
             </div>
           ))}
@@ -1104,10 +1092,10 @@ function InlinePreEntryCard({
         <div className="space-y-1">
           <p className="text-[9px] text-white/25 uppercase tracking-wider">Options Flow</p>
           <div className="h-3 rounded-full overflow-hidden bg-white/5 flex">
-            <div className="h-full bg-emerald-500/60 transition-all" style={{ width: `${cvd.callPct.toFixed(0)}%` }} />
-            <div className="h-full bg-rose-500/60 transition-all" style={{ width: `${cvd.putPct.toFixed(0)}%` }} />
+            <div className="h-full bg-col-g/60 transition-all" style={{ width: `${cvd.callPct.toFixed(0)}%` }} />
+            <div className="h-full bg-col-r/60 transition-all" style={{ width: `${cvd.putPct.toFixed(0)}%` }} />
           </div>
-          <div className="flex justify-between text-[9px] text-white/30">
+          <div className="flex justify-between text-[9px] text-dim">
             <span>{cvd.callPct.toFixed(0)}% call</span>
             <span>{cvd.putPct.toFixed(0)}% put</span>
           </div>
@@ -1117,16 +1105,19 @@ function InlinePreEntryCard({
       {/* Section E: Contract card */}
       {row.midPremium > 0 && (
         <div className="bg-white/3 rounded-lg p-2.5 space-y-1.5">
-          <p className="text-[9px] text-white/25 uppercase tracking-wider">Contract Economics</p>
+          <div className="flex items-center justify-between">
+            <p className="text-[9px] text-white/25 uppercase tracking-wider">Contract Economics</p>
+            <BrainDots n={row.baseRate?.n} />
+          </div>
           <div className="grid grid-cols-4 gap-2">
             <MiniStat label="MID"   value={`$${row.midPremium.toFixed(2)}`}       color="text-white/70" />
             <MiniStat label="DELTA" value={row.delta.toFixed(2)}                  color="text-white/70" />
-            <MiniStat label="THETA" value={row.theta.toFixed(2)}                  color="text-rose-400" />
-            <MiniStat label="SPRD"  value={`$${row.spread.toFixed(2)}`}           color={row.c5 ? 'text-white/50' : 'text-amber-400'} />
+            <MiniStat label="THETA" value={row.theta.toFixed(2)}                  color="text-col-r" />
+            <MiniStat label="SPRD"  value={`$${row.spread.toFixed(2)}`}           color={row.c5 ? 'text-white/50' : 'text-amb'} />
           </div>
           {row.ivRank !== null && (
             <div className="text-[9px] text-white/35">
-              IV rank: <span className={row.c7 ? 'text-white/50' : 'text-amber-400'}>{(row.ivRank * 100).toFixed(0)}th pct</span>
+              IV rank: <span className={row.c7 ? 'text-white/50' : 'text-amb'}>{(row.ivRank * 100).toFixed(0)}th pct</span>
             </div>
           )}
         </div>
@@ -1136,33 +1127,28 @@ function InlinePreEntryCard({
       <div className="bg-white/3 border border-white/8 rounded-lg p-2.5 space-y-1">
         <p className="text-[9px] text-white/25 uppercase tracking-wider">Entry Trigger</p>
         <p className="text-xs text-white/80">{row.entryTrigger}</p>
-        <p className="text-[9px] text-rose-400/70 mt-1">⚡ Invalidation: {row.invalidation}</p>
+        <p className="text-[9px] text-col-r/70 mt-1">⚡ Invalidation: {row.invalidation}</p>
       </div>
 
       {/* Section G: News alert */}
       {row.hasNews && (
-        <div className="bg-rose-500/10 border border-rose-500/25 rounded-lg p-2 text-[10px] text-rose-400 font-bold">
+        <div className="bg-col-r/10 border border-col-r/25 rounded-lg p-2 text-[10px] text-col-r font-bold">
           EARNINGS / NEWS EVENT — Binary risk active
         </div>
       )}
 
-      {/* Section H: Brain context */}
-      {row.baseRate && (
-        <BrainContext baseRate={row.baseRate} tradeType={row.tradeType} />
-      )}
-
-      {/* Section I: Adaptive risk line + I'm In */}
+      {/* Section H+I: Discipline line + I'm In */}
       <div className="pt-1 space-y-2">
-        <AdaptiveRiskLine row={row} />
+        <DisciplineLine row={row} />
         <div className="flex gap-2">
           <button
-            className="flex-1 py-3 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white font-black text-sm tracking-wide transition-colors"
+            className="flex-1 py-3 bg-col-g/80 hover:bg-col-g text-void font-black text-sm tracking-wide transition-colors"
             onClick={() => onImIn(row, row.midPremium, row.delta, row.gamma, row.theta)}
           >
             I'M IN
           </button>
           <button
-            className="px-4 py-3 rounded-xl bg-white/5 border border-white/10 text-white/40 text-xs hover:bg-white/8 transition-colors"
+            className="px-4 py-3 bg-white/5 border border-white/10 text-white/40 text-xs hover:bg-white/8 transition-colors"
             onClick={() => onOpenTV(row.ticker)}
           >
             TV
@@ -1173,52 +1159,115 @@ function InlinePreEntryCard({
   );
 }
 
-function AdaptiveRiskLine({ row }: { row: StackRow }) {
-  const stopDist = row.direction === 'call'
-    ? Math.abs(row.price - row.flipLevel)
-    : Math.abs(row.flipLevel - row.price);
-  const riskPct  = row.price > 0 ? (stopDist / row.price) * 100 : 0;
-  const mult     = convictionMultiplier(row.tradeType);
+// ── Brain confidence dots: n → 0–5 filled dots ───────────────────────────────
+// Thresholds: 0=no data, 1=1–14 (thin), 2=15–24 (just valid),
+//             3=25–49 (moderate), 4=50–99 (solid), 5=100+ (high confidence)
+function brainConfidenceDots(n: number | null | undefined): number {
+  if (!n || n <= 0)  return 0;
+  if (n < 15)        return 1;
+  if (n < 25)        return 2;
+  if (n < 50)        return 3;
+  if (n < 100)       return 4;
+  return 5;
+}
 
+function BrainDots({ n }: { n: number | null | undefined }) {
+  const filled = brainConfidenceDots(n);
   return (
-    <div className="bg-white/3 border border-white/8 rounded-lg p-2.5">
-      <div className="flex items-center justify-between mb-1">
-        <span className="text-[9px] text-white/25 uppercase tracking-wider">Adaptive Risk</span>
-        <span className={`text-[9px] font-bold ${
-          row.tradeType === 'counter_session' ? 'text-amber-400'
-          : row.tradeType === 'continuation'  ? 'text-blue-400'
-          : 'text-white/50'
-        }`}>×{mult.toFixed(2)} {row.tradeType.replace('_', ' ')}</span>
-      </div>
-      <p className="text-xs text-white/70">
-        Stop at flip level <span className="font-bold text-white">${row.flipLevel.toFixed(2)}</span>
-        {' '}— risk <span className={`font-bold ${riskPct > 1.5 ? 'text-amber-400' : 'text-white'}`}>{riskPct.toFixed(2)}%</span>
-        {row.tradeType === 'counter_session' && (
-          <span className="text-amber-400/70"> — size down for counter-session</span>
-        )}
-      </p>
+    <div className="flex items-center gap-0.5" title={`Brain confidence: ${filled}/5 (n=${n ?? 0})`}>
+      {[0, 1, 2, 3, 4].map(i => (
+        <div
+          key={i}
+          className={`w-1.5 h-1.5 rounded-full ${i < filled ? 'bg-amb' : 'bg-white/10'}`}
+        />
+      ))}
     </div>
   );
 }
 
-function BrainContext({ baseRate, tradeType }: { baseRate: BaseRate; tradeType: TradeType }) {
-  const mult = convictionMultiplier(tradeType);
-  const adjWinRate = Math.min(1, (baseRate.winRate ?? 0) * mult);
+// ── DisciplineLine: consolidated one-line gate replacing AdaptiveRiskLine + BrainContext ──
+// Shows: MAX LOSS {riskPct}% · AVG P&L {avgPnl}% · WIN RATE {adjWinRate}% (n={n}) · session tag
+function DisciplineLine({ row }: { row: StackRow }) {
+  const stopDist   = row.direction === 'call'
+    ? Math.abs(row.price - row.flipLevel)
+    : Math.abs(row.flipLevel - row.price);
+  const riskPct    = row.price > 0 ? (stopDist / row.price) * 100 : 0;
+  const mult       = convictionMultiplier(row.tradeType);
+
+  const br         = row.baseRate;
+  const adjWinRate = br ? Math.min(1, (br.winRate ?? 0) * mult) : null;
+  const hasData    = br && br.isStatisticallyValid;
+
+  // counter_session = amber (caution); continuation folds into with_session display label
+  // (it IS a with_session trade, just a re-entry) + gets grey color to signal caution.
+  // with_session = emerald. Blue is not a Helios accent — never used here.
+  const ttColor = row.tradeType === 'counter_session' ? 'text-amb'
+    : row.tradeType === 'continuation'               ? 'text-white/40'
+    : 'text-col-g';
+  // Spec: only two display labels — WITH SESSION and COUNTER SESSION.
+  // continuation renders as WITH SESSION (it is one) + note below.
+  const ttLabel = row.tradeType === 'counter_session' ? 'COUNTER SESSION'
+    : 'WITH SESSION';
 
   return (
-    <div className="bg-white/3 border border-white/8 rounded-lg p-2.5 space-y-2">
-      <p className="text-[9px] text-white/25 uppercase tracking-wider">Brain Context</p>
-      {baseRate.isStatisticallyValid ? (
-        <div className="grid grid-cols-3 gap-2">
-          <MiniStat label="WIN RATE" value={`${(adjWinRate * 100).toFixed(0)}%`}
-            color={adjWinRate >= 0.6 ? 'text-emerald-400' : adjWinRate >= 0.5 ? 'text-amber-400' : 'text-rose-400'} />
-          <MiniStat label="N" value={`${baseRate.n}`} color="text-white/50" />
-          <MiniStat label="AVG P&L" value={`${(baseRate.avgPnl * 100).toFixed(1)}%`}
-            color={baseRate.avgPnl >= 0 ? 'text-emerald-400' : 'text-rose-400'} />
+    <div className="bg-white/3 border border-white/8 px-3 py-2 space-y-1.5" style={{ borderRadius: 2 }}>
+      {/* Label row */}
+      <div className="flex items-center justify-between">
+        <span className="text-[9px] text-white/25 uppercase tracking-wider">Discipline Gate</span>
+        <span className={`text-[9px] font-bold uppercase ${ttColor}`}>
+          {ttLabel}
+        </span>
+      </div>
+
+      {/* Stats line */}
+      <div className="flex items-center gap-2 flex-wrap">
+        {/* MAX LOSS */}
+        <span className="text-[10px] text-white/40">MAX LOSS</span>
+        <span className={`text-[10px] font-bold tabular-nums ${riskPct > 1.5 ? 'text-amb' : 'text-white/70'}`}>
+          {riskPct.toFixed(2)}%
+        </span>
+
+        <span className="text-white/15">·</span>
+
+        {/* AVG P&L */}
+        <span className="text-[10px] text-white/40">AVG P&L</span>
+        {hasData && adjWinRate !== null ? (
+          <span className={`text-[10px] font-bold tabular-nums ${br!.avgPnl >= 0 ? 'text-col-g' : 'text-col-r'}`}>
+            {(br!.avgPnl * 100).toFixed(1)}%
+          </span>
+        ) : (
+          <span className="text-[10px] text-white/20">—</span>
+        )}
+
+        <span className="text-white/15">·</span>
+
+        {/* WIN RATE (n) */}
+        <span className="text-[10px] text-white/40">WIN RATE</span>
+        {hasData && adjWinRate !== null ? (
+          <span className={`text-[10px] font-bold tabular-nums ${adjWinRate >= 0.6 ? 'text-col-g' : adjWinRate >= 0.5 ? 'text-amb' : 'text-col-r'}`}>
+            {(adjWinRate * 100).toFixed(0)}%
+            <span className="text-dim font-normal"> (n={br!.n})</span>
+          </span>
+        ) : (
+          <span className="text-[10px] text-white/20">no data{br ? ` (n=${br.n})` : ''}</span>
+        )}
+
+        {/* Brain confidence dots */}
+        <div className="ml-auto shrink-0">
+          <BrainDots n={br?.n} />
         </div>
-      ) : (
-        <p className="text-[10px] text-white/25">Insufficient data (n={baseRate.n})</p>
-      )}
+      </div>
+
+      {/* Stop level sub-line */}
+      <p className="text-[9px] text-dim">
+        Stop @ flip level <span className="text-white/50 font-mono">${row.flipLevel.toFixed(2)}</span>
+        {row.tradeType === 'counter_session' && (
+          <span className="text-amb/60"> — size down for counter-session</span>
+        )}
+        {row.tradeType === 'continuation' && (
+          <span className="text-dim"> — re-entry within 90 min, size down</span>
+        )}
+      </p>
     </div>
   );
 }
@@ -1227,11 +1276,11 @@ function BrainContext({ baseRate, tradeType }: { baseRate: BaseRate; tradeType: 
 
 function ExhaustionBar({ level }: { level: ExhaustionLevel }) {
   const labels: Record<ExhaustionLevel, { label: string; color: string }> = {
-    0: { label: 'CONTINUATION (0/4)', color: 'text-emerald-400' },
+    0: { label: 'CONTINUATION (0/4)', color: 'text-col-g' },
     1: { label: 'MONITORING (1/4)',   color: 'text-white/50' },
-    2: { label: 'MONITORING (2/4)',   color: 'text-amber-300' },
-    3: { label: 'EXHAUSTION FORMING (3/4)', color: 'text-amber-400' },
-    4: { label: 'MOVE LIKELY COMPLETE (4/4)', color: 'text-rose-400' },
+    2: { label: 'MONITORING (2/4)',   color: 'text-amb' },
+    3: { label: 'EXHAUSTION FORMING (3/4)', color: 'text-amb' },
+    4: { label: 'MOVE LIKELY COMPLETE (4/4)', color: 'text-col-r' },
   };
   const cfg = labels[level];
   return (
@@ -1244,7 +1293,7 @@ function ExhaustionBar({ level }: { level: ExhaustionLevel }) {
         {[0, 1, 2, 3].map(i => (
           <div
             key={i}
-            className={`flex-1 h-1.5 rounded-full ${i < level ? (level >= 3 ? 'bg-rose-400' : 'bg-amber-400') : 'bg-white/10'}`}
+            className={`flex-1 h-1.5 rounded-full ${i < level ? (level >= 3 ? 'bg-col-r' : 'bg-amb') : 'bg-white/10'}`}
           />
         ))}
       </div>
@@ -1254,9 +1303,9 @@ function ExhaustionBar({ level }: { level: ExhaustionLevel }) {
 
 function PullbackDisplay({ cls }: { cls: PullbackClass }) {
   const cfg: Record<PullbackClass, { color: string; label: string; sub: string }> = {
-    normal:     { color: 'text-emerald-400', label: 'NORMAL PULLBACK',     sub: 'EMA held — do not exit' },
-    concerning: { color: 'text-amber-400',   label: 'CONCERNING PULLBACK', sub: 'EMA21 broken — tighten stop' },
-    reversal:   { color: 'text-rose-400',    label: 'REVERSAL SIGNAL',     sub: 'CVD crossed — consider exit' },
+    normal:     { color: 'text-col-g', label: 'NORMAL PULLBACK',     sub: 'EMA held — do not exit' },
+    concerning: { color: 'text-amb',     label: 'CONCERNING PULLBACK', sub: 'EMA21 broken — tighten stop' },
+    reversal:   { color: 'text-col-r',   label: 'REVERSAL SIGNAL',     sub: 'CVD crossed — consider exit' },
   };
   const c = cfg[cls];
   return (
@@ -1264,7 +1313,7 @@ function PullbackDisplay({ cls }: { cls: PullbackClass }) {
       <span className="text-[9px] text-white/25 uppercase tracking-wider">Pullback</span>
       <div className="text-right">
         <span className={`text-[9px] font-bold ${c.color}`}>{c.label}</span>
-        <p className="text-[8px] text-white/30">{c.sub}</p>
+        <p className="text-[8px] text-dim">{c.sub}</p>
       </div>
     </div>
   );
@@ -1273,9 +1322,9 @@ function PullbackDisplay({ cls }: { cls: PullbackClass }) {
 function ConsolidationDisplay({ state }: { state: ConsolidationState }) {
   const cfg: Record<ConsolidationState, { color: string; label: string }> = {
     unclear:      { color: 'text-white/25',   label: '—' },
-    consolidating: { color: 'text-amber-400',  label: 'CONSOLIDATING — hold' },
-    continuation:  { color: 'text-emerald-400', label: 'CONTINUATION BREAK — add' },
-    'exit-signal': { color: 'text-rose-400',   label: 'BREAK AGAINST — exit' },
+    consolidating: { color: 'text-amb',      label: 'CONSOLIDATING — hold' },
+    continuation:  { color: 'text-col-g',    label: 'CONTINUATION BREAK — add' },
+    'exit-signal': { color: 'text-col-r',    label: 'BREAK AGAINST — exit' },
   };
   const c = cfg[state];
   return (
@@ -1301,9 +1350,9 @@ function ConvictionSparkline({
         const h = Math.max(4, (v / max) * 24);
         const isLast = i === all.length - 1;
         const color = isLast
-          ? current < 30 ? 'bg-rose-400'
-          : current < 50 ? 'bg-amber-400'
-          : 'bg-emerald-400'
+          ? current < 30 ? 'bg-col-r'
+          : current < 50 ? 'bg-amb'
+          : 'bg-col-g'
           : 'bg-white/15';
         return (
           <div key={i} className={`flex-1 rounded-sm ${color} transition-all`} style={{ height: h }} />
@@ -1418,8 +1467,8 @@ function DirectionPill({
       dim
         ? 'bg-white/4 text-white/20 border border-white/8'
         : direction === 'call'
-        ? 'bg-emerald-500/15 text-emerald-400 border border-emerald-500/25'
-        : 'bg-rose-500/15 text-rose-400 border border-rose-500/25'
+        ? 'bg-col-g/15 text-col-g border border-col-g/25'
+        : 'bg-col-r/15 text-col-r border border-col-r/25'
     }`}>
       {direction}
     </span>

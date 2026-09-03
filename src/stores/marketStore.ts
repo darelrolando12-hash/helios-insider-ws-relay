@@ -117,15 +117,6 @@ export function writeContext(ticker: string, ctx: MarketContext) {
   _notify();
 }
 
-/**
- * Clear the context for `ticker` — called when a ticker is unsubscribed
- * or when the GEX engine detects an unrecoverable chain error.
- */
-export function clearContext(ticker: string) {
-  _state.delete(ticker);
-  _notify();
-}
-
 // ── Internal ──────────────────────────────────────────────────────────────────
 
 function _notify() {

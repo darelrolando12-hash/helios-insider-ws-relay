@@ -39,6 +39,9 @@ export interface StrikeData {
   callGamma: number;
   putGamma:  number;
 
+  /** YYYY-MM-DD expiration date from Massive details.expiration_date */
+  expiry?: string;
+
   // Full chain fields — populated from the ingestion layer's options snapshot.
   // Optional so that callers that only provide OI/gamma (e.g. backtestEngine)
   // don't break; ChainCockpit renders these columns only when present.
@@ -117,6 +120,7 @@ export function processChainSnapshot(
       const pGex = perStrikePutGex(s, spotPrice);
       return {
         strike:     s.strike,
+        expiry:     s.expiry ?? '',
         callBid:    s.callBid    ?? 0,
         callAsk:    s.callAsk    ?? 0,
         callLast:   s.callLast   ?? 0,

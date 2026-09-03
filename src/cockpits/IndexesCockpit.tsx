@@ -68,6 +68,8 @@ interface TileData {
   gex:         MarketContext | null;
   direction:   DirectionState | null;
   halted:      boolean;
+  /** False when this ticker's exchange never publishes LULD halt/resume data (see luldStore.hasHaltCoverage). */
+  hasHaltCoverage: boolean;
   asOf:        string;       // last bar time formatted
   loading:     boolean;
   error:       string | null;
@@ -93,12 +95,14 @@ function _buildTile(ticker: string): TileData {
   const cvdR   = cvdStore.getResult(ticker);
   const mktR   = marketStore.getResult(ticker);
   const halted = luldStore.isHalted(ticker) === true;
+  const haltCoverage = luldStore.hasHaltCoverage(ticker);
   const dir    = getDirectionState(ticker);
 
   if (barsR.status === 'loading') {
     return {
       ticker, price: null, changePct: null, vwap: null, ema8: null,
       ema21: null, cvd: null, gex: null, direction: null, halted,
+      hasHaltCoverage: haltCoverage,
       asOf: '', loading: true, error: null,
     };
   }
@@ -107,6 +111,7 @@ function _buildTile(ticker: string): TileData {
     return {
       ticker, price: null, changePct: null, vwap: null, ema8: null,
       ema21: null, cvd: null, gex: null, direction: null, halted,
+      hasHaltCoverage: haltCoverage,
       asOf: '', loading: false, error: barsR.reason,
     };
   }
@@ -137,6 +142,7 @@ function _buildTile(ticker: string): TileData {
     gex:       mktR.status === 'ready'  ? mktR.data   : null,
     direction: dir,
     halted,
+    hasHaltCoverage: haltCoverage,
     asOf,
     loading:   false,
     error:     null,
@@ -166,9 +172,9 @@ function _rollingCorr(a: number[], b: number[], n: number): number | null {
 
 function BiasPill({ bias }: { bias: SessionBias }) {
   const cfg: Record<SessionBias, { label: string; cls: string }> = {
-    bullish: { label: 'BULLISH',  cls: 'bg-emerald-900/60 text-emerald-300 border border-emerald-700' },
-    bearish: { label: 'BEARISH',  cls: 'bg-red-900/60    text-red-300    border border-red-700'     },
-    neutral: { label: 'NEUTRAL',  cls: 'bg-zinc-800      text-zinc-400   border border-zinc-700'    },
+    bullish: { label: 'BULLISH',  cls: 'bg-col-g/15 text-col-g border border-col-g/30' },
+    bearish: { label: 'BEARISH',  cls: 'bg-col-r/15 text-col-r border border-col-r/30' },
+    neutral: { label: 'NEUTRAL',  cls: 'bg-white/5 text-white/40 border border-white/10' },
   };
   const { label, cls } = cfg[bias];
   return (
@@ -179,10 +185,10 @@ function BiasPill({ bias }: { bias: SessionBias }) {
 }
 
 function PlayArrow({ dir }: { dir: string }) {
-  if (dir === 'calls')         return <span className="text-emerald-400 text-xs font-bold">▲ CALLS</span>;
-  if (dir === 'puts')          return <span className="text-red-400    text-xs font-bold">▼ PUTS</span>;
-  if (dir === 'consolidating') return <span className="text-amber-400  text-xs font-bold">◆ COIL</span>;
-  return                              <span className="text-zinc-500   text-xs">— NONE</span>;
+  if (dir === 'calls')         return <span className="text-col-g text-xs font-bold">▲ CALLS</span>;
+  if (dir === 'puts')          return <span className="text-col-r text-xs font-bold">▼ PUTS</span>;
+  if (dir === 'consolidating') return <span className="text-amb  text-xs font-bold">◆ COIL</span>;
+  return                              <span className="text-white/25   text-xs">— NONE</span>;
 }
 
 function CvdBar({ cvd }: { cvd: CvdState }) {
@@ -193,16 +199,16 @@ function CvdBar({ cvd }: { cvd: CvdState }) {
   return (
     <div className="w-full">
       <div className="flex justify-between text-[9px] font-mono mb-0.5">
-        <span className={bull ? 'text-emerald-400' : 'text-zinc-500'}>C {callW}%</span>
-        <span className={bear ? 'text-red-400'     : 'text-zinc-500'}>P {putW}%</span>
+        <span className={bull ? 'text-col-g' : 'text-white/20'}>C {callW}%</span>
+        <span className={bear ? 'text-col-r'     : 'text-white/20'}>P {putW}%</span>
       </div>
       <div className="flex h-1.5 rounded overflow-hidden">
         <div
-          className={`transition-all duration-500 ${bull ? 'bg-emerald-500' : 'bg-emerald-900'}`}
+          className={`transition-all duration-500 ${bull ? 'bg-col-g' : 'bg-col-g/20'}`}
           style={{ width: `${callW}%` }}
         />
         <div
-          className={`transition-all duration-500 flex-1 ${bear ? 'bg-red-500' : 'bg-red-900'}`}
+          className={`transition-all duration-500 flex-1 ${bear ? 'bg-col-r' : 'bg-col-r/20'}`}
         />
       </div>
     </div>
@@ -210,19 +216,19 @@ function CvdBar({ cvd }: { cvd: CvdState }) {
 }
 
 function GexBadge({ regime }: { regime: string }) {
-  if (regime === 'positive') return <span className="text-[9px] font-bold px-1.5 py-0.5 rounded bg-emerald-900/50 text-emerald-400 border border-emerald-800">+GEX</span>;
-  if (regime === 'negative') return <span className="text-[9px] font-bold px-1.5 py-0.5 rounded bg-red-900/50    text-red-400    border border-red-800   ">−GEX</span>;
-  return                            <span className="text-[9px] font-bold px-1.5 py-0.5 rounded bg-zinc-800       text-zinc-400   border border-zinc-700  ">NEU</span>;
+  if (regime === 'positive') return <span className="text-[9px] font-bold px-1.5 py-0.5 rounded bg-col-g/15 text-col-g border border-col-g/30">+GEX</span>;
+  if (regime === 'negative') return <span className="text-[9px] font-bold px-1.5 py-0.5 rounded bg-col-r/15 text-col-r border border-col-r/30">−GEX</span>;
+  return                            <span className="text-[9px] font-bold px-1.5 py-0.5 rounded bg-white/5  text-white/40 border border-white/10">NEU</span>;
 }
 
 function PriceLevel({ label, value, highlight }: { label: string; value: number; highlight?: 'green' | 'red' | 'amber' }) {
-  const cls = highlight === 'green' ? 'text-emerald-400'
-            : highlight === 'red'   ? 'text-red-400'
-            : highlight === 'amber' ? 'text-amber-400'
-            : 'text-zinc-400';
+  const cls = highlight === 'green' ? 'text-col-g'
+            : highlight === 'red'   ? 'text-col-r'
+            : highlight === 'amber' ? 'text-amb'
+            : 'text-white/40';
   return (
     <div className="flex justify-between items-center">
-      <span className="text-[9px] text-zinc-500 uppercase tracking-wider">{label}</span>
+      <span className="text-[9px] text-white/25 uppercase tracking-wider">{label}</span>
       <span className={`text-[11px] font-mono font-semibold ${cls}`}>{value.toFixed(2)}</span>
     </div>
   );
@@ -230,11 +236,11 @@ function PriceLevel({ label, value, highlight }: { label: string; value: number;
 
 function SkeletonTile() {
   return (
-    <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-4 animate-pulse space-y-2">
-      <div className="h-3 w-20 bg-zinc-800 rounded" />
-      <div className="h-6 w-28 bg-zinc-800 rounded" />
-      <div className="h-2 w-full bg-zinc-800 rounded" />
-      <div className="h-2 w-3/4 bg-zinc-800 rounded" />
+    <div className="bg-panel border border-line p-4 animate-pulse space-y-2">
+      <div className="h-3 w-20 bg-white/8 rounded" />
+      <div className="h-6 w-28 bg-white/8 rounded" />
+      <div className="h-2 w-full bg-white/8 rounded" />
+      <div className="h-2 w-3/4 bg-white/8 rounded" />
     </div>
   );
 }
@@ -245,10 +251,10 @@ function IndexTile({ tile }: { tile: TileData }) {
 
   if (tile.loading) return <SkeletonTile />;
 
-  const priceColor = tile.changePct === null ? 'text-zinc-300'
-    : tile.changePct > 0  ? 'text-emerald-400'
-    : tile.changePct < 0  ? 'text-red-400'
-    : 'text-zinc-300';
+  const priceColor = tile.changePct === null ? 'text-white/60'
+    : tile.changePct > 0  ? 'text-col-g'
+    : tile.changePct < 0  ? 'text-col-r'
+    : 'text-white/60';
 
   const changeSign = tile.changePct === null ? '' : tile.changePct >= 0 ? '+' : '';
 
@@ -258,15 +264,15 @@ function IndexTile({ tile }: { tile: TileData }) {
 
   return (
     <div className={`
-      relative bg-zinc-900 border rounded-xl p-4 flex flex-col gap-3 min-h-[220px]
+      relative bg-panel border p-4 flex flex-col gap-3 min-h-[220px]
       transition-colors duration-300
       ${tile.halted
-        ? 'border-amber-600 shadow-[0_0_12px_rgba(217,119,6,0.15)]'
-        : 'border-zinc-800 hover:border-zinc-700'}
+        ? 'border-amb/40 shadow-[0_0_12px_rgba(var(--amb),0.15)]'
+        : 'border-line hover:border-white/15'}
     `}>
       {/* Halt strip */}
       {tile.halted && (
-        <div className="absolute top-0 left-0 right-0 h-1 rounded-t-xl bg-amber-500 animate-pulse" />
+        <div className="absolute top-0 left-0 right-0 h-1 bg-amb animate-pulse" />
       )}
 
       {/* Header row */}
@@ -275,10 +281,18 @@ function IndexTile({ tile }: { tile: TileData }) {
           <div className="flex items-center gap-2">
             <span className="text-sm font-bold text-white tracking-wide">{tile.ticker}</span>
             {tile.halted && (
-              <span className="text-[9px] font-bold px-1.5 py-0.5 bg-amber-900/60 text-amber-300 border border-amber-700 rounded tracking-widest">HALT</span>
+              <span className="text-[9px] font-bold px-1.5 py-0.5 bg-amb/15 text-amb border border-amb/30 rounded tracking-widest">HALT</span>
+            )}
+            {!tile.hasHaltCoverage && (
+              <span
+                className="text-[9px] text-white/25 border border-white/10 px-1.5 py-0.5 rounded"
+                title="This exchange doesn't publish halt data — not the same as confirmed trading"
+              >
+                NO HALT DATA
+              </span>
             )}
             {isContext && (
-              <span className="text-[9px] text-zinc-500 border border-zinc-700 px-1.5 py-0.5 rounded">CTX</span>
+              <span className="text-[9px] text-white/25 border border-white/10 px-1.5 py-0.5 rounded">CTX</span>
             )}
           </div>
           <div className="flex items-baseline gap-2 mt-0.5">
@@ -292,7 +306,7 @@ function IndexTile({ tile }: { tile: TileData }) {
             )}
           </div>
           {tile.asOf && (
-            <div className="text-[9px] text-zinc-600 mt-0.5">{tile.asOf} CT</div>
+            <div className="text-[9px] text-white/20 mt-0.5">{tile.asOf} CT</div>
           )}
         </div>
 
@@ -308,7 +322,7 @@ function IndexTile({ tile }: { tile: TileData }) {
       {!isContext && tile.direction && (
         <div className="flex items-center gap-2">
           <PlayArrow dir={tile.direction.playDirection} />
-          <span className="text-[9px] text-zinc-500 truncate max-w-[140px]" title={tile.direction.playDirectionReason}>
+          <span className="text-[9px] text-white/25 truncate max-w-[140px]" title={tile.direction.playDirectionReason}>
             {tile.direction.playDirectionReason}
           </span>
         </div>
@@ -341,7 +355,7 @@ function IndexTile({ tile }: { tile: TileData }) {
 
       {/* Error strip */}
       {tile.error && (
-        <div className="text-[9px] text-red-400 border border-red-900 rounded px-2 py-1 bg-red-950/40">
+        <div className="text-[9px] text-col-r border border-col-r/20 rounded px-2 py-1 bg-col-r/5">
           {tile.error}
         </div>
       )}
@@ -350,13 +364,13 @@ function IndexTile({ tile }: { tile: TileData }) {
 }
 
 function CorrCell({ corr }: { corr: number | null }) {
-  if (corr === null) return <td className="px-3 py-2 text-center text-zinc-600 text-xs">—</td>;
+  if (corr === null) return <td className="px-3 py-2 text-center text-white/20 text-xs">—</td>;
   const pct = Math.round(corr * 100);
-  const cls = corr >  0.7 ? 'text-emerald-400'
-            : corr >  0.3 ? 'text-emerald-600'
-            : corr < -0.7 ? 'text-red-400'
-            : corr < -0.3 ? 'text-red-600'
-            : 'text-zinc-400';
+  const cls = corr >  0.7 ? 'text-col-g'
+            : corr >  0.3 ? 'text-col-g/60'
+            : corr < -0.7 ? 'text-col-r'
+            : corr < -0.3 ? 'text-col-r/60'
+            : 'text-white/40';
   return (
     <td className={`px-3 py-2 text-center text-xs font-mono ${cls}`}>{pct}%</td>
   );
@@ -390,17 +404,17 @@ function NetMarketGex() {
 
   return (
     <div className={`
-      rounded-xl border p-4 space-y-2
-      ${allNeg ? 'bg-red-950/30 border-red-800' : allPos ? 'bg-emerald-950/30 border-emerald-900' : 'bg-zinc-900 border-zinc-800'}
+      border p-4 space-y-2
+      ${allNeg ? 'bg-col-r/10 border-col-r/30' : allPos ? 'bg-col-g/10 border-col-g/20' : 'bg-panel border-line'}
     `}>
       <div className="flex items-center justify-between">
-        <span className="text-[10px] text-zinc-500 uppercase tracking-widest font-semibold">Net Market GEX</span>
+        <span className="text-[10px] text-white/25 uppercase tracking-widest font-semibold">Net Market GEX</span>
         {net !== null && (
-          <span className={`text-2xl font-mono font-bold ${allNeg ? 'text-red-400' : allPos ? 'text-emerald-400' : 'text-zinc-200'}`}>
+          <span className={`text-2xl font-mono font-bold ${allNeg ? 'text-col-r' : allPos ? 'text-col-g' : 'text-ink'}`}>
             {_formatGex(net)}
           </span>
         )}
-        {net === null && <span className="text-zinc-600 text-sm">—</span>}
+        {net === null && <span className="text-white/20 text-sm">—</span>}
       </div>
 
       {/* Per-index breakdown */}
@@ -409,8 +423,8 @@ function NetMarketGex() {
           const g = [spyGex, qqqGex, iwmGex][i];
           return (
             <div key={t} className="flex items-center gap-1.5">
-              <span className="text-[9px] text-zinc-500">{t}</span>
-              <span className={`text-[11px] font-mono font-semibold ${g === null ? 'text-zinc-600' : g < 0 ? 'text-red-400' : 'text-emerald-400'}`}>
+              <span className="text-[9px] text-white/25">{t}</span>
+              <span className={`text-[11px] font-mono font-semibold ${g === null ? 'text-white/20' : g < 0 ? 'text-col-r' : 'text-col-g'}`}>
                 {g !== null ? _formatGex(g) : '—'}
               </span>
             </div>
@@ -420,20 +434,20 @@ function NetMarketGex() {
 
       {/* Regime label */}
       {allNeg && (
-        <p className="text-xs text-red-300 font-semibold leading-snug">
+        <p className="text-xs text-col-r font-semibold leading-snug">
           ALL THREE NEG GEX — DEALERS SHORT GAMMA MARKET-WIDE. Every move amplifies. Best 0DTE environment.
         </p>
       )}
       {allPos && (
-        <p className="text-xs text-emerald-300 font-semibold leading-snug">
+        <p className="text-xs text-col-g font-semibold leading-snug">
           POSITIVE GAMMA MARKET-WIDE — moves dampened, pin risk elevated.
         </p>
       )}
       {!allNeg && !allPos && net !== null && (
-        <p className="text-[10px] text-zinc-500">Mixed GEX regime — sector divergence present.</p>
+        <p className="text-[10px] text-white/25">Mixed GEX regime — sector divergence present.</p>
       )}
       {net === null && (
-        <p className="text-[10px] text-zinc-600">Waiting for GEX engine data…</p>
+        <p className="text-[10px] text-white/20">Waiting for GEX engine data…</p>
       )}
     </div>
   );
@@ -498,21 +512,21 @@ function SpyCandlePattern({ bars, cvdCallPct }: { bars: Bar[]; cvdCallPct: numbe
 
   type PatternCfg = { label: string; sub: string; border: string; bg: string; text: string };
   const cfg: Record<CandlePattern, PatternCfg> = {
-    TRENDING_BULLISH:    { label: 'TRENDING BULLISH',   sub: 'Closes escalating, volume increasing, CVD confirming.',           border: 'border-emerald-700', bg: 'bg-emerald-950/30', text: 'text-emerald-300' },
-    TRENDING_BEARISH:    { label: 'TRENDING BEARISH',   sub: 'Closes cascading, volume increasing, CVD confirming.',            border: 'border-red-700',     bg: 'bg-red-950/30',     text: 'text-red-300'     },
-    CONSOLIDATING:       { label: 'CONSOLIDATING',      sub: 'Wait for the break.',                                             border: 'border-amber-700',   bg: 'bg-amber-950/20',   text: 'text-amber-300'   },
-    FALSE_BREAK:         { label: 'FALSE BREAK',        sub: 'CVD not confirming. High false-positive rate.',                   border: 'border-orange-700',  bg: 'bg-orange-950/20',  text: 'text-orange-300'  },
-    REVERSAL:            { label: 'REVERSAL CANDLE DETECTED', sub: 'Thesis reassessment required.',                             border: 'border-rose-600',    bg: 'bg-rose-950/30',    text: 'text-rose-300'    },
-    INSUFFICIENT_DATA:   { label: 'INSUFFICIENT DATA',  sub: 'Waiting for 8 bars.',                                             border: 'border-zinc-700',    bg: 'bg-zinc-900',       text: 'text-zinc-500'    },
+    TRENDING_BULLISH:    { label: 'TRENDING BULLISH',   sub: 'Closes escalating, volume increasing, CVD confirming.',           border: 'border-col-g/30',  bg: 'bg-col-g/10',   text: 'text-col-g'   },
+    TRENDING_BEARISH:    { label: 'TRENDING BEARISH',   sub: 'Closes cascading, volume increasing, CVD confirming.',            border: 'border-col-r/30',  bg: 'bg-col-r/10',   text: 'text-col-r'   },
+    CONSOLIDATING:       { label: 'CONSOLIDATING',      sub: 'Wait for the break.',                                             border: 'border-amb/30',    bg: 'bg-amb/10',     text: 'text-amb'     },
+    FALSE_BREAK:         { label: 'FALSE BREAK',        sub: 'CVD not confirming. High false-positive rate.',                   border: 'border-amb/20',    bg: 'bg-amb/5',      text: 'text-amb/70'  },
+    REVERSAL:            { label: 'REVERSAL CANDLE DETECTED', sub: 'Thesis reassessment required.',                             border: 'border-col-r/40',  bg: 'bg-col-r/10',   text: 'text-col-r'   },
+    INSUFFICIENT_DATA:   { label: 'INSUFFICIENT DATA',  sub: 'Waiting for 8 bars.',                                             border: 'border-line',      bg: 'bg-panel',      text: 'text-white/25'},
   };
 
   const { label, sub, border, bg, text } = cfg[pattern];
 
   return (
-    <div className={`rounded-xl border p-4 space-y-1 ${border} ${bg}`}>
-      <div className="text-[10px] text-zinc-500 uppercase tracking-widest font-semibold mb-1">SPY 5m — Last 8 Candles</div>
+    <div className={`border p-4 space-y-1 ${border} ${bg}`}>
+      <div className="text-[10px] text-white/25 uppercase tracking-widest font-semibold mb-1">SPY 5m — Last 8 Candles</div>
       <div className={`text-sm font-bold ${text}`}>{label}</div>
-      <div className="text-[11px] text-zinc-400">{sub}</div>
+      <div className="text-[11px] text-white/40">{sub}</div>
     </div>
   );
 }
@@ -583,22 +597,22 @@ export default function IndexesCockpit() {
   const spyCvdPct = spyCvdR.status === 'ready' ? spyCvdR.data.callPct : null;
 
   return (
-    <section id="indexes" className="min-h-screen bg-zinc-950 text-white p-4 space-y-6">
+    <section id="indexes" className="min-h-screen bg-void text-ink p-4 space-y-6">
 
       {/* Page header */}
       <div className="flex items-center justify-between">
         <div>
           <h1 className="text-lg font-bold tracking-wide text-white">Indexes</h1>
-          <p className="text-xs text-zinc-500 mt-0.5">Macro context · Session structure · Flow</p>
+          <p className="text-xs text-mut mt-0.5">Macro context · Session structure · Flow</p>
         </div>
         {lastRefresh && (
-          <span className="text-[10px] text-zinc-600 font-mono">Updated {lastRefresh}</span>
+          <span className="text-[10px] text-dim font-mono">Updated {lastRefresh}</span>
         )}
       </div>
 
       {/* Primary index tiles — SPY / QQQ / IWM */}
       <div>
-        <div className="text-[10px] text-zinc-600 uppercase tracking-widest mb-2">Tradeable Indexes</div>
+        <div className="text-[10px] text-dim uppercase tracking-widest mb-2">Tradeable Indexes</div>
         <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
           {indexTiles.map(t => <IndexTile key={t.ticker} tile={t} />)}
         </div>
@@ -612,7 +626,7 @@ export default function IndexesCockpit() {
 
       {/* Context tiles — TLT / HYG / VIX */}
       <div>
-        <div className="text-[10px] text-zinc-600 uppercase tracking-widest mb-2">Macro Context</div>
+        <div className="text-[10px] text-dim uppercase tracking-widest mb-2">Macro Context</div>
         <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
           {contextTiles.map(t => <IndexTile key={t.ticker} tile={t} />)}
         </div>
@@ -620,42 +634,42 @@ export default function IndexesCockpit() {
 
       {/* Correlation matrix */}
       <div>
-        <div className="text-[10px] text-zinc-600 uppercase tracking-widest mb-2">
+        <div className="text-[10px] text-dim uppercase tracking-widest mb-2">
           20-Bar Rolling Correlation
         </div>
-        <div className="bg-zinc-900 border border-zinc-800 rounded-xl overflow-hidden">
+        <div className="bg-panel border border-line overflow-hidden">
           <table className="w-full text-xs">
             <thead>
-              <tr className="border-b border-zinc-800">
-                <th className="px-3 py-2 text-left text-zinc-500 font-normal"></th>
-                <th className="px-3 py-2 text-center text-zinc-400 font-semibold">SPY</th>
-                <th className="px-3 py-2 text-center text-zinc-400 font-semibold">QQQ</th>
-                <th className="px-3 py-2 text-center text-zinc-400 font-semibold">IWM</th>
+              <tr className="border-b border-line">
+                <th className="px-3 py-2 text-left text-white/25 font-normal"></th>
+                <th className="px-3 py-2 text-center text-white/40 font-semibold">SPY</th>
+                <th className="px-3 py-2 text-center text-white/40 font-semibold">QQQ</th>
+                <th className="px-3 py-2 text-center text-white/40 font-semibold">IWM</th>
               </tr>
             </thead>
             <tbody>
-              <tr className="border-b border-zinc-800/50">
-                <td className="px-3 py-2 text-zinc-400 font-semibold">SPY</td>
-                <td className="px-3 py-2 text-center text-zinc-700 text-xs">100%</td>
+              <tr className="border-b border-line/50">
+                <td className="px-3 py-2 text-white/40 font-semibold">SPY</td>
+                <td className="px-3 py-2 text-center text-white/15 text-xs">100%</td>
                 <CorrCell corr={corrQQQ} />
                 <CorrCell corr={corrIWM} />
               </tr>
-              <tr className="border-b border-zinc-800/50">
-                <td className="px-3 py-2 text-zinc-400 font-semibold">QQQ</td>
+              <tr className="border-b border-line/50">
+                <td className="px-3 py-2 text-white/40 font-semibold">QQQ</td>
                 <CorrCell corr={corrQQQ} />
-                <td className="px-3 py-2 text-center text-zinc-700 text-xs">100%</td>
+                <td className="px-3 py-2 text-center text-white/15 text-xs">100%</td>
                 <CorrCell corr={corrQQQIWM} />
               </tr>
               <tr>
-                <td className="px-3 py-2 text-zinc-400 font-semibold">IWM</td>
+                <td className="px-3 py-2 text-white/40 font-semibold">IWM</td>
                 <CorrCell corr={corrIWM} />
                 <CorrCell corr={corrQQQIWM} />
-                <td className="px-3 py-2 text-center text-zinc-700 text-xs">100%</td>
+                <td className="px-3 py-2 text-center text-white/15 text-xs">100%</td>
               </tr>
             </tbody>
           </table>
         </div>
-        <p className="text-[9px] text-zinc-700 mt-1.5">
+        <p className="text-[9px] text-white/15 mt-1.5">
           Rolling {CORR_WINDOW}-bar Pearson correlation of close prices. Green = moving together, Red = diverging.
         </p>
       </div>

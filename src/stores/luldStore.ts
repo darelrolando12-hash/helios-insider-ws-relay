@@ -20,6 +20,7 @@
  */
 
 import { massiveBus, type WSMessageWithCT } from '../lib/massive/websocket';
+import { NASDAQ_LISTED_TICKERS } from '../state/directionState';
 import { type LuldEvent, type LuldEventType, type Result, ready, loading } from './types';
 
 // ── Extended LuldEvent for store consumers ────────────────────────────────────
@@ -95,11 +96,32 @@ export function isDataReady(ticker: string): boolean {
 /**
  * Quick halt check without unpacking a Result.
  * Returns null if no data yet (not the same as false — caller must handle null).
+ *
+ * IMPORTANT: for a ticker with no halt coverage (see hasHaltCoverage below),
+ * this returns null FOREVER — not "no event yet", but "this ticker can
+ * never report a halt over this channel". Callers must not read a null
+ * result as "confirmed trading normally" for those tickers. Use
+ * hasHaltCoverage() to tell the two apart before displaying status.
  */
 export function isHalted(ticker: string): boolean | null {
   const state = _state.get(ticker);
   if (!state || state.events.length === 0) return null;
   return state.isCurrentlyHalted;
+}
+
+/**
+ * Whether `ticker` can ever report a LULD halt/resume event at all.
+ *
+ * Per Massive's Conditions & Indicators glossary, halt/resume indicators
+ * (i codes 17/18) are published ONLY for Nasdaq-listed securities. For a
+ * NYSE/NYSE Arca-listed ticker or an index ticker (SPX, NDX), isHalted()
+ * will always return null — not because it hasn't happened yet, but
+ * because the data simply doesn't exist on this channel. That's data
+ * unavailability, not a confirmed "not halted" state, and UI/engine code
+ * must treat the two differently.
+ */
+export function hasHaltCoverage(ticker: string): boolean {
+  return NASDAQ_LISTED_TICKERS.has(ticker);
 }
 
 export function subscribe(listener: () => void): () => void {
@@ -110,16 +132,20 @@ export function subscribe(listener: () => void): () => void {
 // ── Message handler ───────────────────────────────────────────────────────────
 
 function _handleLuld(msg: WSMessageWithCT) {
-  const ticker = msg.sym;
+  // Massive LULD messages carry the ticker in `T`, not `sym` — every
+  // message in a live capture had no `sym` field at all, so this always
+  // resolved to undefined before the fix.
+  const ticker = (msg.T as string) ?? '';
   const state  = _state.get(ticker);
   if (!state) return;
 
   // Massive LULD fields:
-  //   T = event type string (not to be confused with trades 'T' channel)
+  //   T = ticker symbol (not to be confused with the trades 'T' channel name)
+  //   i = indicator code array — the actual halt/band/pause type
   //   h = high band price
   //   l = low band price
-  //   i = indicator code
-  const rawType    = (msg.T as string) ?? '';
+  const indicatorCodes = Array.isArray(msg.i) ? (msg.i as unknown[]) : [];
+  const rawType    = indicatorCodes.length > 0 ? String(indicatorCodes[0]) : '';
   const eventType  = _normaliseEventType(rawType);
   const upperBand  = (msg.h as number) ?? undefined;
   const lowerBand  = (msg.l as number) ?? undefined;
@@ -152,10 +178,18 @@ function _handleLuld(msg: WSMessageWithCT) {
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 function _normaliseEventType(rawType: string): LuldEventType {
-  // Massive LULD indicator codes — normalise to app union
+  // Massive LULD `i` indicator codes — normalise to app union.
+  //
+  // Numeric codes 17 (halt) and 18 (resume) are confirmed per Massive's
+  // Conditions & Indicators glossary. Any other numeric or string code
+  // that doesn't match a known form below falls through to 'luld_band' —
+  // the conservative choice, since misreading an unconfirmed code as a
+  // halt would incorrectly flip isCurrentlyHalted. Revisit if Massive
+  // documents the remaining numeric codes (e.g. 22, seen in live capture).
   switch (rawType.toUpperCase()) {
     case 'H':
     case 'HALT':
+    case '17':  // confirmed: trading halt
     case 'T1':  // regulatory halt
     case 'T2':  // non-regulatory halt
     case 'T6':  // extraordinary market activity
@@ -164,6 +198,7 @@ function _normaliseEventType(rawType: string): LuldEventType {
 
     case 'R':
     case 'RESUME':
+    case '18':  // confirmed: resume after halt
     case 'T3':  // resume after T1
     case 'T7':  // resume after T6
       return 'resume';

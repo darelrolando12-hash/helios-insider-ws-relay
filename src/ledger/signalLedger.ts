@@ -14,7 +14,8 @@
  *     thing that ever updates the parent signal's `status`.
  *   - Direction ('call'/'put') is inferred from SignalType:
  *       ENTER / BREAKOUT → call  (engine only fires these in bullish context)
- *       EXIT  / DUMP     → put   (bearish / exit-short signal)
+ *       EXIT             → inferred from live CVD classification
+ *       DUMP             → put   (bearish-only signal type)
  *       RIP              → call  (LULD bounce = bullish)
  *       REVERSAL         → inferred from live CVD classification
  */
@@ -27,6 +28,10 @@ import * as marketStore                from '../stores/marketStore';
 import * as luldStore                  from '../stores/luldStore';
 import * as fundamentalsStore          from '../stores/fundamentalsStore';
 import * as catalystGate               from '../engines/catalystGate';
+import { getDirectionState, computeTradeType } from '../state/directionState';
+import type { TradeType }              from '../state/directionState';
+import { vixBucket }                   from '../ledger/brainStore';
+import type { VixBucket }              from '../ledger/brainStore';
 import type { Signal, SignalType }     from '../stores/types';
 
 // ── Exported types ─────────────────────────────────────────────────────────────
@@ -52,11 +57,31 @@ export interface SignalFactors {
   /** 'bull' | 'bear' | 'mixed' — EMA8 / EMA21 / EMA55 alignment */
   emaStack:     string | null;
   catalystTags: CatalystTagsBlob | null;
+  /**
+   * Whether catalyst's input data was actually available at scoring time
+   * ('real') or missing entirely ('absent') — carried over from the
+   * originating Signal's `catalystDataQuality` (set by confluenceEngine at
+   * the exact moment of scoring). Distinguishes a genuine "no catalyst
+   * today" zero from "fundamentals hadn't loaded yet, so it couldn't even
+   * be checked" — both previously looked identical as `catalystTags: null`.
+   * Optional/undefined for signals that bypass scoreConfluence entirely
+   * (DUMP/RIP), which never set this field on the Signal.
+   */
+  catalystDataQuality?: 'real' | 'absent';
   luld: {
-    isHalted:   boolean | null;
+    isHalted:   boolean;
     upperBand:  number | null;
     lowerBand:  number | null;
   };
+  /** VIX bucket at signal-fire time, from the real I:VIX feed. */
+  vixBucket:    VixBucket | null;
+  /**
+   * Trade type relative to session bias at signal-fire time.
+   * NOTE: computed with priorDirection/priorResolvedAt = null/null — see
+   * the TODO on computeTradeType() in directionState.ts. 'continuation' is
+   * not reachable yet because prior-signal tracking isn't wired anywhere.
+   */
+  tradeType:    TradeType | null;
 }
 
 interface CatalystTagsBlob {
@@ -117,6 +142,18 @@ async function _onSignal(signal: Signal): Promise<void> {
   const factors   = _captureFactors(signal.ticker);
   const direction = _inferDirection(signal.type, factors);
 
+  // Carry over the data-quality flag confluenceEngine computed at the exact
+  // scoring moment — more reliable than recomputing here, since a tiny gap
+  // could exist between when the engine scored and when the ledger captures.
+  factors.catalystDataQuality = signal.catalystDataQuality;
+
+  // tradeType depends on direction, which is only known after _inferDirection
+  // runs — compute it here and fold it into the factors blob before writing.
+  // priorDirection/priorResolvedAt are null/null: prior-signal tracking is not
+  // wired anywhere yet (see TODO on computeTradeType in directionState.ts).
+  const sessionBias = getDirectionState(signal.ticker)?.sessionBias ?? 'neutral';
+  factors.tradeType = computeTradeType(direction, sessionBias, null, null);
+
   const row = {
     id:          signal.id,
     ticker:      signal.ticker,
@@ -132,7 +169,7 @@ async function _onSignal(signal: Signal): Promise<void> {
 
   const { error: dbError } = await supabase
     .from('signals')
-    .insert(row);
+    .upsert(row, { onConflict: 'id', ignoreDuplicates: true });
 
   if (dbError) {
     // Log but never throw — a ledger write failure must never propagate back
@@ -193,7 +230,10 @@ function _captureFactors(ticker: string): SignalFactors {
   }
 
   // ── LULD / Halt State ─────────────────────────────────────────────────────
-  const isHalted   = luldStore.isHalted(ticker);
+  // Store a definitive boolean at write time — null (no halt data yet) is a
+  // store-layer "unknown" state, but a persisted signal record should commit
+  // to a real answer: no confirmed halt event means "not halted".
+  const isHalted   = luldStore.isHalted(ticker) === true;
   const luldResult = luldStore.getResult(ticker);
   const lastLuld   = luldResult.status === 'ready'
     ? luldResult.data.events[luldResult.data.events.length - 1]
@@ -214,6 +254,13 @@ function _captureFactors(ticker: string): SignalFactors {
     };
   }
 
+  // ── VIX Bucket ────────────────────────────────────────────────────────────
+  const vixResult = barsStore.getResult('I:VIX');
+  const vixClose = vixResult.status === 'ready' && vixResult.data.length > 0
+    ? vixResult.data[vixResult.data.length - 1].close
+    : null;
+  const vixBucketVal = vixClose !== null ? vixBucket(vixClose) : null;
+
   return {
     gexRegime,
     flipLevel,
@@ -224,6 +271,9 @@ function _captureFactors(ticker: string): SignalFactors {
     emaStack,
     catalystTags,
     luld: { isHalted, upperBand, lowerBand },
+    vixBucket: vixBucketVal,
+    // tradeType is filled in by _onSignal after direction is inferred.
+    tradeType: null,
   };
 }
 
@@ -233,7 +283,10 @@ function _captureFactors(ticker: string): SignalFactors {
  * Infer the dominant direction (call / put) from signal type and live CVD.
  *
  * ENTER / BREAKOUT → call  (engine only fires these in bullish context)
- * EXIT  / DUMP     → put   (exit long or short-side signal)
+ * EXIT              → inferred from live CVD classification (weakening
+ *                      confluence on an existing position, not inherently
+ *                      bearish — see REVERSAL below for the same pattern)
+ * DUMP              → put   (genuinely bearish-only signal type)
  * RIP              → call  (LULD bounce from halt-down = bullish)
  * REVERSAL         → use CVD classification as tiebreaker
  */
@@ -247,6 +300,8 @@ function _inferDirection(
       return 'call';
 
     case 'EXIT':
+      return factors.cvdClass === 'bearish' ? 'put' : 'call';
+
     case 'DUMP':
       return 'put';
 

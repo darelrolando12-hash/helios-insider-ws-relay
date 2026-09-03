@@ -43,6 +43,7 @@ import { toCentralTime }       from '../lib/time';
 import {
   getDirectionState,
   subscribe as subscribeDirection,
+  computeTradeType,
   FEED_TICKERS,
   CONTEXT_ONLY_TICKERS,
   CASH_SETTLED_TICKERS,
@@ -107,12 +108,11 @@ function _earningsWithinDays(disclosures: EightKDisclosure[], days: number): num
 
 function _lastDiscretionaryBuy(fd: FundamentalsData): number | null {
   if (!fd.insiderTransactions || fd.insiderTransactions.length === 0) return null;
-  const buys = fd.insiderTransactions.filter(t => !t.is10b51);
+  const buys = fd.insiderTransactions.filter(t => t.transactionType === 'buy' && !t.is10b51);
   return buys.length > 0 ? buys[0].transactedAt : null;
 }
 
 function _buildCard(ticker: string): SwingCard | null {
-  const barsR    = barsStore.getResult(ticker);
   const cvdR     = cvdStore.getResult(ticker);
   const mktR     = marketStore.getResult(ticker);
   const fundR    = fundamentalsStore.getResult(ticker);
@@ -121,10 +121,13 @@ function _buildCard(ticker: string): SwingCard | null {
   const cashSettled = CASH_SETTLED_TICKERS.has(ticker);
   const leaderTicker = TICKER_BETA_TABLE[ticker]?.leader ?? 'SPY';
 
-  // Need at least bars to be ready for any useful card
-  if (barsR.status !== 'ready') return null;
+  // Need at least bars to score. After market close bars are stale (not 'ready')
+  // but historical data is still valid for swing analysis. Use hasHistoricalData
+  // so cards continue rendering after 7 PM CT instead of all going blank.
+  if (!barsStore.hasHistoricalData(ticker)) return null;
 
-  const bars   = barsR.data;
+  const bars = barsStore.getBarsRaw(ticker);
+  if (bars.length < 2) return null;
   const closes = bars.map(b => b.close);
   const last   = bars[bars.length - 1];
 
@@ -171,19 +174,24 @@ function _buildCard(ticker: string): SwingCard | null {
     : 'neutral';
 
   // ── Brain base rate (F1) ─────────────────────────────────────────────────
-  const vixBucket = '<15' as brainStore.VixBucket;
+  const vixR = barsStore.getResult('I:VIX');
+  const vixClose = vixR.status === 'ready' && vixR.data.length > 0
+    ? vixR.data[vixR.data.length - 1].close
+    : null;
+  const vixBucket = vixClose !== null ? brainStore.vixBucket(vixClose) : ('<15' as brainStore.VixBucket);
   const now       = toCentralTime(Date.now());
   const hour      = now.hour;
   const todBucket: brainStore.TimeOfDayBucket =
     hour < 10.5 ? 'open' : hour < 14 ? 'midday' : 'close';
 
+  const cardDirection = direction === 'neutral' ? 'call' : direction;
   const fingerprint: brainStore.SetupFingerprint = {
     ticker,
-    direction: direction === 'neutral' ? 'call' : direction,
+    direction: cardDirection,
     gexRegime: mktCtx?.gexRegime ?? 'neutral',
     vixBucket,
     timeOfDay: todBucket,
-    tradeType: 'with_session',
+    tradeType: computeTradeType(cardDirection, dir?.sessionBias ?? 'neutral', null, null),
   };
   const brainR    = brainStore.getBaseRate(fingerprint);
   const brainData = brainR.status === 'ready' ? brainR.data : null;
@@ -231,8 +239,7 @@ function _buildCard(ticker: string): SwingCard | null {
   const ratios      = fd?.ratios ?? null;
   const ratioPass   = ratios !== null && (
     (direction === 'call' && ratios.pe !== undefined && ratios.pe > 0 && ratios.pe < 50) ||
-    (direction === 'put'  && ratios.pe !== undefined && ratios.pe > 50) ||
-    true // if no ratio data, soft pass — don't penalise
+    (direction === 'put'  && ratios.pe !== undefined && ratios.pe > 50)
   );
   const ratioDetail = ratios
     ? [
@@ -287,12 +294,12 @@ function _buildStack(): SwingCard[] {
 
 function ScoreBadge({ score }: { score: number }) {
   const pct = Math.round((score / MAX_SCORE) * 100);
-  const cls = pct >= 75 ? 'bg-emerald-900/70 text-emerald-300 border-emerald-700'
-            : pct >= 50 ? 'bg-amber-900/60   text-amber-300   border-amber-700'
-            : pct >= 25 ? 'bg-zinc-800       text-zinc-400    border-zinc-700'
-            :             'bg-zinc-900       text-zinc-600    border-zinc-800';
+  const cls = pct >= 75 ? 'bg-col-g/40 text-col-g border-col-g/40'
+            : pct >= 50 ? 'bg-amb/35   text-amb   border-amb/40'
+            : pct >= 25 ? 'bg-white/8  text-white/40 border-white/15'
+            :             'bg-panel2 text-white/20 border-white/8';
   return (
-    <div className={`flex flex-col items-center justify-center w-14 h-14 rounded-xl border font-mono ${cls}`}>
+    <div className={`flex flex-col items-center justify-center w-14 h-14 border font-mono ${cls}`}>
       <span className="text-lg font-bold leading-none">{pct}</span>
       <span className="text-[9px] opacity-70">/ 100</span>
     </div>
@@ -302,27 +309,27 @@ function ScoreBadge({ score }: { score: number }) {
 function FactorDot({ factor }: { factor: FactorResult }) {
   return (
     <div className="group relative">
-      <div className={`w-2 h-2 rounded-full ${factor.pass ? 'bg-emerald-500' : 'bg-zinc-700'}`} />
+      <div className={`w-2 h-2 rounded-full ${factor.pass ? 'bg-col-g' : 'bg-white/15'}`} />
       <div className="absolute left-1/2 -translate-x-1/2 bottom-4 z-10 hidden group-hover:block
-                      bg-zinc-800 border border-zinc-700 rounded-lg px-3 py-2 text-[10px] text-zinc-200
-                      whitespace-nowrap shadow-xl pointer-events-none min-w-[160px]">
-        <div className="font-semibold text-zinc-100 mb-0.5">{factor.label}</div>
-        <div className="text-zinc-400">{factor.detail}</div>
+                      bg-panel border rounded-lg px-3 py-2 text-[10px] text-ink whitespace-nowrap shadow-xl pointer-events-none min-w-[160px]"
+              style={{ borderColor: 'var(--line)' }}>
+        <div className="font-semibold text-ink mb-0.5">{factor.label}</div>
+        <div className="text-mut">{factor.detail}</div>
       </div>
     </div>
   );
 }
 
 function DirectionBadge({ dir }: { dir: 'call' | 'put' | 'neutral' }) {
-  if (dir === 'call') return <span className="text-[9px] font-bold px-1.5 py-0.5 rounded bg-emerald-900/60 text-emerald-300 border border-emerald-700 tracking-widest">▲ CALLS</span>;
-  if (dir === 'put')  return <span className="text-[9px] font-bold px-1.5 py-0.5 rounded bg-red-900/60    text-red-300    border border-red-700    tracking-widest">▼ PUTS</span>;
-  return                     <span className="text-[9px] font-bold px-1.5 py-0.5 rounded bg-zinc-800       text-zinc-400   border border-zinc-700   tracking-widest">◆ COIL</span>;
+  if (dir === 'call') return <span className="text-[9px] font-bold px-1.5 py-0.5 rounded bg-col-g/15 text-col-g border border-col-g/30 tracking-widest">▲ CALLS</span>;
+  if (dir === 'put')  return <span className="text-[9px] font-bold px-1.5 py-0.5 rounded bg-col-r/15 text-col-r border border-col-r/30 tracking-widest">▼ PUTS</span>;
+  return                     <span className="text-[9px] font-bold px-1.5 py-0.5 rounded bg-white/5 text-white/40 border border-white/10 tracking-widest">◆ COIL</span>;
 }
 
 function EarningsGate({ msUntil }: { msUntil: number }) {
   const days = Math.ceil(msUntil / 86400000);
   return (
-    <span className="text-[9px] font-bold px-1.5 py-0.5 rounded bg-rose-950/60 text-rose-300 border border-rose-800 tracking-widest">
+    <span className="text-[9px] font-bold px-1.5 py-0.5 rounded bg-col-r/15 text-col-r border border-col-r/25 tracking-widest">
       EARNINGS {days}d
     </span>
   );
@@ -330,27 +337,27 @@ function EarningsGate({ msUntil }: { msUntil: number }) {
 
 function BrainBadge({ winRate, n, bestWindow }: { winRate: number; n: number; bestWindow: string }) {
   const pct = Math.round(winRate * 100);
-  const cls = pct >= 65 ? 'text-emerald-400' : pct >= 55 ? 'text-amber-400' : 'text-zinc-400';
+  const cls = pct >= 65 ? 'text-col-g' : pct >= 55 ? 'text-amb' : 'text-white/35';
   return (
     <div className="flex items-center gap-1 text-[10px] font-mono">
-      <span className="text-zinc-500">Brain</span>
+      <span className="text-mut">Brain</span>
       <span className={`font-bold ${cls}`}>{pct}%</span>
-      <span className="text-zinc-600">n={n}</span>
-      <span className="text-zinc-600">/{bestWindow}</span>
+      <span className="text-dim">n={n}</span>
+      <span className="text-dim">/{bestWindow}</span>
     </div>
   );
 }
 
 function FactorRow({ factor, weight }: { factor: FactorResult; weight: number }) {
   return (
-    <div className="flex items-start gap-2 py-1.5 border-b border-zinc-800/50 last:border-0">
-      <div className={`mt-0.5 w-2 h-2 rounded-full flex-shrink-0 ${factor.pass ? 'bg-emerald-500' : 'bg-zinc-700'}`} />
+    <div className="flex items-start gap-2 py-1.5 border-b border-white/5 last:border-0">
+      <div className={`mt-0.5 w-2 h-2 rounded-full flex-shrink-0 ${factor.pass ? 'bg-col-g' : 'bg-white/15'}`} />
       <div className="flex-1 min-w-0">
         <div className="flex items-center gap-2">
-          <span className="text-[10px] font-semibold text-zinc-300">{factor.label}</span>
-          <span className="text-[9px] text-zinc-600">W{weight}</span>
+          <span className="text-[10px] font-semibold text-ink">{factor.label}</span>
+          <span className="text-[9px] text-dim">W{weight}</span>
         </div>
-        <div className="text-[10px] text-zinc-500 leading-snug">{factor.detail}</div>
+        <div className="text-[10px] text-mut leading-snug">{factor.detail}</div>
       </div>
     </div>
   );
@@ -372,10 +379,10 @@ function SwingCardComponent({ card, rank }: { card: SwingCard; rank: number }) {
 
   return (
     <div className={`
-      rounded-xl border transition-colors duration-200
+      border transition-colors duration-200
       ${card.halted
-        ? 'border-amber-600 bg-amber-950/10'
-        : 'border-zinc-800 bg-zinc-900 hover:border-zinc-700'}
+        ? 'border-amb/40 bg-amb/5'
+        : 'border-white/8 bg-panel2 hover:border-white/15'}
     `}>
       {/* Compact header — always visible */}
       <button
@@ -384,7 +391,7 @@ function SwingCardComponent({ card, rank }: { card: SwingCard; rank: number }) {
         aria-expanded={expanded}
       >
         {/* Rank */}
-        <span className="text-[10px] font-mono text-zinc-600 w-4 flex-shrink-0">#{rank}</span>
+        <span className="text-[10px] font-mono text-dim w-4 flex-shrink-0">#{rank}</span>
 
         {/* Score badge */}
         <ScoreBadge score={card.score} />
@@ -395,10 +402,10 @@ function SwingCardComponent({ card, rank }: { card: SwingCard; rank: number }) {
             <span className="text-sm font-bold text-white tracking-wide">{card.ticker}</span>
             <DirectionBadge dir={card.direction} />
             {card.cashSettled && (
-              <span className="text-[9px] px-1.5 py-0.5 rounded bg-zinc-800 text-zinc-400 border border-zinc-700">CASH</span>
+              <span className="text-[9px] px-1.5 py-0.5 rounded bg-white/5 text-white/40 border border-white/10">CASH</span>
             )}
             {card.halted && (
-              <span className="text-[9px] font-bold px-1.5 py-0.5 rounded bg-amber-900/60 text-amber-300 border border-amber-700">HALT</span>
+              <span className="text-[9px] font-bold px-1.5 py-0.5 rounded bg-amb/15 text-amb border border-amb/30">HALT</span>
             )}
             {card.nearestEarnings !== null && (
               <EarningsGate msUntil={card.nearestEarnings - Date.now()} />
@@ -416,31 +423,31 @@ function SwingCardComponent({ card, rank }: { card: SwingCard; rank: number }) {
         </div>
 
         {/* Expand chevron */}
-        <span className={`text-zinc-600 text-xs transition-transform duration-200 ${expanded ? 'rotate-180' : ''}`}>▼</span>
+        <span className={`text-white/40 text-xs transition-transform duration-200 ${expanded ? 'rotate-180' : ''}`}>▼</span>
       </button>
 
       {/* Expanded detail */}
       {expanded && (
-        <div className="border-t border-zinc-800 px-4 py-3 space-y-0">
+        <div className="border-t pt-3 space-y-0" style={{ borderColor: 'var(--line)' }}>
           {/* Factor breakdown */}
           <div className="mb-3">
-            <div className="text-[9px] text-zinc-600 uppercase tracking-widest mb-1">Factor Breakdown</div>
+            <div className="text-[9px] text-dim uppercase tracking-widest mb-1">Factor Breakdown</div>
             {factors.map(({ factor, weight }) => (
               <FactorRow key={factor.label} factor={factor} weight={weight} />
             ))}
           </div>
 
           {/* Leader index context */}
-          <div className="pt-2 text-[10px] text-zinc-500 flex items-center gap-1">
-            <span className="text-zinc-600">Leader index:</span>
-            <span className="text-zinc-300 font-semibold">{card.leaderTicker}</span>
+          <div className="pt-2 text-[10px] text-mut flex items-center gap-1">
+            <span className="text-dim">Leader index:</span>
+            <span className="text-ink font-semibold">{card.leaderTicker}</span>
           </div>
 
           {/* Insider buy recency */}
           {card.latestInsiderBuy !== null && (
-            <div className="pt-1 text-[10px] text-zinc-500">
+            <div className="pt-1 text-[10px] text-mut">
               Last insider buy:&nbsp;
-              <span className="text-amber-400 font-semibold">
+              <span className="text-amb font-semibold">
                 {Math.floor((Date.now() - card.latestInsiderBuy) / 86400000)}d ago
               </span>
             </div>
@@ -453,11 +460,11 @@ function SwingCardComponent({ card, rank }: { card: SwingCard; rank: number }) {
 
 function SkeletonCard() {
   return (
-    <div className="rounded-xl border border-zinc-800 bg-zinc-900 p-4 animate-pulse flex gap-3">
-      <div className="w-14 h-14 rounded-xl bg-zinc-800 flex-shrink-0" />
+    <div className="border bg-panel p-4 animate-pulse flex gap-3" style={{ borderColor: 'var(--line)' }}>
+      <div className="w-14 h-14 bg-white/8 flex-shrink-0" />
       <div className="flex-1 space-y-2">
-        <div className="h-4 w-24 bg-zinc-800 rounded" />
-        <div className="h-3 w-40 bg-zinc-800 rounded" />
+        <div className="h-4 w-24 bg-white/8 rounded" />
+        <div className="h-3 w-40 bg-white/5 rounded" />
       </div>
     </div>
   );
@@ -513,21 +520,21 @@ export default function SwingCockpit() {
   const displayCards = showAll ? stack : topCards;
 
   return (
-    <section id="swing" className="min-h-screen bg-zinc-950 text-white p-4 space-y-5">
+    <section id="swing" className="min-h-screen bg-void text-ink p-4 space-y-5">
 
       {/* Page header */}
       <div className="flex items-center justify-between">
         <div>
           <h1 className="text-lg font-bold tracking-wide text-white">Swing</h1>
-          <p className="text-xs text-zinc-500 mt-0.5">Multi-day setups · 1–3 week expiry · Fundamentals + technicals</p>
+          <p className="text-xs text-mut mt-0.5">Multi-day setups · 1–3 week expiry · Fundamentals + technicals</p>
         </div>
         {lastRefresh && (
-          <span className="text-[10px] text-zinc-600 font-mono">Updated {lastRefresh}</span>
+          <span className="text-[10px] text-dim font-mono">Updated {lastRefresh}</span>
         )}
       </div>
 
       {/* Scoring legend */}
-      <div className="bg-zinc-900 border border-zinc-800 rounded-xl px-4 py-2.5 flex flex-wrap gap-x-4 gap-y-1">
+      <div className="bg-panel border px-4 py-2.5 flex flex-wrap gap-x-4 gap-y-1" style={{ borderColor: 'var(--line)' }}>
         {[
           { label: 'Brain',     weight: WEIGHTS.f1, desc: '≥55% win rate, n≥15' },
           { label: 'Technical', weight: WEIGHTS.f2, desc: 'EMA stack, VWAP' },
@@ -539,9 +546,9 @@ export default function SwingCockpit() {
           { label: 'Ratios',    weight: WEIGHTS.f8, desc: 'P/E, EV/EBITDA, FCF' },
         ].map(({ label, weight, desc }) => (
           <div key={label} className="flex items-center gap-1.5">
-            <span className="text-[9px] text-zinc-500 font-mono">W{weight}</span>
-            <span className="text-[10px] text-zinc-400 font-semibold">{label}</span>
-            <span className="text-[9px] text-zinc-600">{desc}</span>
+            <span className="text-[9px] text-dim font-mono">W{weight}</span>
+            <span className="text-[10px] text-mut font-semibold">{label}</span>
+            <span className="text-[9px] text-dim">{desc}</span>
           </div>
         ))}
       </div>
@@ -561,7 +568,8 @@ export default function SwingCockpit() {
             ))}
             {restCards.length > 0 && !showAll && (
               <button
-                className="w-full py-2 text-xs text-zinc-500 hover:text-zinc-300 border border-zinc-800 rounded-xl transition-colors"
+                className="w-full py-2 text-xs text-mut hover:text-ink border transition-colors"
+                style={{ borderColor: 'var(--line)' }}
                 onClick={() => setShowAll(true)}
               >
                 Show {restCards.length} more tickers ▾
@@ -569,7 +577,8 @@ export default function SwingCockpit() {
             )}
             {showAll && restCards.length > 0 && (
               <button
-                className="w-full py-2 text-xs text-zinc-500 hover:text-zinc-300 border border-zinc-800 rounded-xl transition-colors"
+                className="w-full py-2 text-xs text-mut hover:text-ink border transition-colors"
+                style={{ borderColor: 'var(--line)' }}
                 onClick={() => setShowAll(false)}
               >
                 Show fewer ▴

@@ -30,6 +30,7 @@ import * as barsStore    from '../stores/barsStore';
 import * as marketStore  from '../stores/marketStore';
 import * as cvdStore     from '../stores/cvdStore';
 import { computeEma }    from '../engines/confluenceEngine';
+import { formatError }   from '../lib/errors';
 
 // ── Exported types ─────────────────────────────────────────────────────────────
 
@@ -63,6 +64,52 @@ export interface DirectionState {
 
   /** ctMs of the last sessionBias update. */
   biasAsOf:           number;
+}
+
+// ── Trade type classification ───────────────────────────────────────────────────
+
+/**
+ * Trade type relative to the macro session bias.
+ *   with_session    — direction agrees with sessionBias (or bias is neutral)
+ *   counter_session — direction disagrees with sessionBias
+ *   continuation    — same direction as a prior resolved signal within the
+ *                      continuation window (see computeTradeType below)
+ */
+export type TradeType = 'with_session' | 'counter_session' | 'continuation';
+
+/** Same-direction window for the 'continuation' trade type. */
+const CONTINUATION_GAP_MS = 90 * 60 * 1000; // 90 min
+
+/**
+ * Classify a signal's trade type relative to session bias and any prior
+ * resolved signal on the same ticker/direction.
+ *
+ * TODO: priorDirection/priorResolvedAt are currently always passed as
+ * null/null by every real caller (signalLedger, ScannerCockpit,
+ * SwingCockpit, ZeroDteCockpit) — prior-signal tracking has not been built
+ * anywhere yet, so the 'continuation' branch below is genuinely unreachable
+ * in the live system today. Wiring real prior-signal lookups is a separate,
+ * not-yet-scheduled task.
+ */
+export function computeTradeType(
+  direction: 'call' | 'put',
+  sessionBias: SessionBias,
+  priorDirection: 'call' | 'put' | null,
+  priorResolvedAt: number | null,
+): TradeType {
+  if (
+    priorDirection === direction &&
+    priorResolvedAt !== null &&
+    Date.now() - priorResolvedAt < CONTINUATION_GAP_MS
+  ) return 'continuation';
+
+  const biasMatchesCalls = sessionBias === 'bullish';
+  const biasMatchesPuts  = sessionBias === 'bearish';
+
+  if (direction === 'call' && biasMatchesCalls) return 'with_session';
+  if (direction === 'put'  && biasMatchesPuts)  return 'with_session';
+  if (sessionBias === 'neutral')                return 'with_session';
+  return 'counter_session';
 }
 
 // ── Ticker beta table ──────────────────────────────────────────────────────────
@@ -101,6 +148,24 @@ export const CONTEXT_ONLY_TICKERS = new Set(['HYG', 'TLT', 'I:VIX']);
 
 /** Cash-settled index options — labeled "CASH SETTLED" everywhere they appear. */
 export const CASH_SETTLED_TICKERS = new Set(['SPX', 'NDX']);
+
+/**
+ * Tickers whose PRIMARY listing exchange is Nasdaq. Per Massive's
+ * Conditions & Indicators glossary, LULD halt/resume indicators (i codes
+ * 17/18) are published ONLY for Nasdaq-listed securities — NYSE and
+ * NYSE Arca/AMEX-listed tickers never receive a halt/resume event, even
+ * during a real halt, and index tickers (SPX, NDX) have no underlying
+ * listing at all. luldStore.isHalted() uses this set to distinguish
+ * "confirmed not halted" from "no halt data available for this ticker" —
+ * see luldStore.ts.
+ *
+ * NYSE/NYSE Arca-listed FEED_TICKERS with NO halt coverage: SPY, IWM,
+ * GLD, JPM, BAC, PLTR. Index tickers with NO halt coverage: SPX, NDX.
+ */
+export const NASDAQ_LISTED_TICKERS = new Set([
+  'QQQ', 'AAPL', 'TSLA', 'NVDA', 'MSFT', 'AMZN', 'META', 'AMD', 'GOOGL',
+  'NFLX', 'MSTR', 'SMCI', 'COIN', 'HOOD', 'SOFI',
+]);
 
 /**
  * The 23 feed tickers. Cockpits iterate this to subscribe and render.
@@ -439,6 +504,6 @@ export function betaAlignmentMultiplier(
 function _notify(ticker: string, state: DirectionState) {
   for (const fn of _listeners) {
     try { fn(ticker, state); }
-    catch (e) { console.error('[directionState] Listener error:', e); }
+    catch (e) { console.error(`[directionState] Listener error: ${formatError(e)}`); }
   }
 }

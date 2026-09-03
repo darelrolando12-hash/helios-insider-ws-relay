@@ -78,15 +78,15 @@ function _formatDate(ctMs: number): string {
 }
 
 function _winRateColor(wr: number): string {
-  if (wr >= 0.65) return 'text-emerald-400';
-  if (wr >= 0.50) return 'text-amber-400';
-  return 'text-rose-400';
+  if (wr >= 0.65) return 'text-col-g';
+  if (wr >= 0.50) return 'text-amb';
+  return 'text-col-r';
 }
 
 function _pnlColor(pnl: number): string {
-  if (pnl > 0)  return 'text-emerald-400';
-  if (pnl < 0)  return 'text-rose-400';
-  return 'text-slate-400';
+  if (pnl > 0)  return 'text-col-g';
+  if (pnl < 0)  return 'text-col-r';
+  return 'text-white/40';
 }
 
 /** Build auto-generated pattern insights from live outcomes. */
@@ -158,25 +158,25 @@ function _buildInsights(
 function HeaderBar() {
   const tickers = ['SPY', 'QQQ', 'IWM'];
   return (
-    <div className="sticky top-0 z-20 bg-slate-950 border-b border-slate-800">
+    <div className="sticky top-0 z-20 bg-void border-b" style={{ borderColor: 'var(--line)' }}>
       <div className="flex items-center gap-4 px-4 py-2 flex-wrap">
-        <span className="text-xs text-slate-500 uppercase tracking-wider font-bold">BRAIN</span>
+        <span className="text-xs text-mut uppercase tracking-wider font-bold">BRAIN</span>
         {tickers.map(t => {
           const ds = getDirectionState(t);
           if (!ds) return null;
           const bc = ds.sessionBias === 'bullish'
-            ? 'bg-emerald-900/60 text-emerald-300 border-emerald-700'
+            ? 'bg-col-g/15 text-col-g border-col-g/30'
             : ds.sessionBias === 'bearish'
-            ? 'bg-rose-900/60 text-rose-300 border-rose-700'
-            : 'bg-slate-800 text-slate-400 border-slate-700';
+            ? 'bg-col-r/15 text-col-r border-col-r/30'
+            : 'bg-white/5 text-white/40 border-white/10';
           const pc = ds.playDirection === 'calls'
-            ? 'bg-emerald-900/60 text-emerald-300 border-emerald-700'
+            ? 'bg-col-g/15 text-col-g border-col-g/30'
             : ds.playDirection === 'puts'
-            ? 'bg-rose-900/60 text-rose-300 border-rose-700'
-            : 'bg-slate-800 text-slate-400 border-slate-700';
+            ? 'bg-col-r/15 text-col-r border-col-r/30'
+            : 'bg-white/5 text-white/40 border-white/10';
           return (
             <div key={t} className="flex items-center gap-1">
-              <span className="text-xs text-slate-500 font-mono">{t}</span>
+              <span className="text-xs text-mut font-mono">{t}</span>
               <span className={`text-[10px] px-1.5 py-0.5 rounded font-bold uppercase border ${bc}`}>{ds.sessionBias}</span>
               <span className={`text-[10px] px-1.5 py-0.5 rounded font-bold uppercase border ${pc}`}>{ds.playDirection}</span>
             </div>
@@ -190,10 +190,10 @@ function HeaderBar() {
 function SectionLabel({ children }: { children: React.ReactNode }) {
   return (
     <div className="flex items-center gap-3 mb-3">
-      <span className="text-[10px] font-bold uppercase tracking-widest text-slate-500">
+      <span className="text-[10px] font-bold uppercase tracking-widest text-mut">
         {children}
       </span>
-      <div className="flex-1 border-t border-slate-800" />
+      <div className="flex-1 border-t" style={{ borderColor: 'var(--line)' }} />
     </div>
   );
 }
@@ -207,11 +207,11 @@ function WindowBars({ windowWinRates }: { windowWinRates: Record<string, number>
         const wr  = windowWinRates[w];
         if (wr === undefined) return null;
         const pct = Math.round(wr * 100);
-        const fill = wr >= 0.65 ? 'bg-emerald-500' : wr >= 0.50 ? 'bg-amber-500' : 'bg-rose-500';
+        const fill = wr >= 0.65 ? 'bg-col-g' : wr >= 0.50 ? 'bg-amb' : 'bg-col-r';
         return (
           <div key={w} className="flex items-center gap-2">
-            <span className="text-[10px] text-slate-500 w-6 shrink-0">{w}</span>
-            <div className="flex-1 h-1.5 bg-slate-800 rounded-full overflow-hidden">
+            <span className="text-[10px] text-mut w-6 shrink-0">{w}</span>
+            <div className="flex-1 h-1.5 bg-white/8 rounded-full overflow-hidden">
               <div className={`h-full ${fill} rounded-full`} style={{ width: `${pct}%` }} />
             </div>
             <span className={`text-[10px] w-8 text-right ${_winRateColor(wr)}`}>{pct}%</span>
@@ -226,37 +226,43 @@ function WindowBars({ windowWinRates }: { windowWinRates: Record<string, number>
 function BaseRateCard({ rate }: { rate: BaseRate }) {
   const [expanded, setExpanded] = useState(false);
   const fp = rate.fingerprint;
+  const excluded = !rate.isStatisticallyValid;
 
-  const dirColor   = fp.direction === 'call' ? 'text-emerald-400' : 'text-rose-400';
+  const dirColor   = fp.direction === 'call' ? 'text-col-g' : 'text-col-r';
   const regimeBadge = fp.gexRegime === 'negative'
-    ? 'bg-rose-900/50 text-rose-300 border-rose-800'
+    ? 'bg-col-r/15 text-col-r border-col-r/30'
     : fp.gexRegime === 'positive'
-    ? 'bg-emerald-900/50 text-emerald-300 border-emerald-800'
-    : 'bg-slate-800 text-slate-400 border-slate-700';
+    ? 'bg-col-g/15 text-col-g border-col-g/30'
+    : 'bg-white/5 text-white/40 border-white/10';
 
   return (
-    <div className="bg-slate-900 border border-slate-800 rounded-xl p-4">
+    <div className={`bg-panel border rounded-xl p-4 transition-opacity ${excluded ? 'opacity-40' : ''}`} style={{ borderColor: 'var(--line)' }}>
       <div className="flex items-start justify-between gap-2 flex-wrap">
         <div className="flex items-center gap-2 flex-wrap">
-          <span className="font-mono text-sm font-bold text-slate-100">{fp.ticker}</span>
+          <span className="font-mono text-sm font-bold text-ink">{fp.ticker}</span>
           <span className={`text-xs font-bold uppercase ${dirColor}`}>{fp.direction}</span>
           <span className={`text-[10px] px-1.5 py-0.5 rounded border ${regimeBadge}`}>
             {fp.gexRegime} GEX
           </span>
-          <span className="text-[10px] px-1.5 py-0.5 rounded bg-slate-800 border border-slate-700 text-slate-400">
+          <span className="text-[10px] px-1.5 py-0.5 rounded bg-white/5 border border-white/10 text-mut">
             {fp.timeOfDay}
           </span>
+          {excluded && (
+            <span className="text-[9px] font-bold uppercase tracking-widest text-white/25 border border-white/10 rounded px-1.5 py-0.5">
+              EXCLUDED · n={rate.n}
+            </span>
+          )}
         </div>
 
         <div className="flex items-center gap-4">
           {!rate.isStatisticallyValid && (
-            <span className="text-[10px] text-amber-500 border border-amber-800 rounded px-1.5 py-0.5">
+            <span className="text-[10px] text-amb border border-amb/30 rounded px-1.5 py-0.5">
               n={rate.n} · insuff.
             </span>
           )}
           <button
             onClick={() => setExpanded(e => !e)}
-            className="text-slate-500 hover:text-slate-300 transition-colors"
+            className="text-mut hover:text-ink transition-colors"
           >
             <svg className={`w-4 h-4 transition-transform ${expanded ? 'rotate-180' : ''}`} fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
@@ -271,27 +277,27 @@ function BaseRateCard({ rate }: { rate: BaseRate }) {
           <div className={`text-2xl font-extrabold tabular-nums ${_winRateColor(rate.winRate)}`}>
             {rate.isStatisticallyValid ? _pct(rate.winRate) : '—'}
           </div>
-          <div className="text-[10px] text-slate-500 mt-0.5">win rate</div>
+          <div className="text-[10px] text-mut mt-0.5">win rate</div>
         </div>
         <div>
           <div className={`text-lg font-bold tabular-nums ${_pnlColor(rate.avgPnl)}`}>
             {rate.isStatisticallyValid ? _formatPnl(rate.avgPnl) : '—'}
           </div>
-          <div className="text-[10px] text-slate-500 mt-0.5">avg P&L</div>
+          <div className="text-[10px] text-mut mt-0.5">avg P&L</div>
         </div>
         <div>
-          <div className="text-lg font-bold text-slate-200">{rate.n}</div>
-          <div className="text-[10px] text-slate-500 mt-0.5">signals</div>
+          <div className="text-lg font-bold text-ink">{rate.n}</div>
+          <div className="text-[10px] text-mut mt-0.5">signals</div>
         </div>
         <div>
-          <div className="text-lg font-bold text-sky-400">{rate.bestWindow}</div>
-          <div className="text-[10px] text-slate-500 mt-0.5">best window</div>
+          <div className="text-lg font-bold text-amb">{rate.bestWindow}</div>
+          <div className="text-[10px] text-mut mt-0.5">best window</div>
         </div>
       </div>
 
       {expanded && (
-        <div className="mt-3 border-t border-slate-800 pt-3">
-          <div className="text-[10px] text-slate-500 uppercase mb-1">Win rate by window</div>
+        <div className="mt-3 border-t pt-3" style={{ borderColor: 'var(--line)' }}>
+          <div className="text-[10px] text-mut uppercase mb-1">Win rate by window</div>
           <WindowBars windowWinRates={rate.windowWinRates} />
         </div>
       )}
@@ -308,7 +314,7 @@ function LiveTradeRow({
   outcomes: LiveOutcomeRow[];
 }) {
   const [expanded, setExpanded] = useState(false);
-  const dirColor = signal.direction === 'call' ? 'text-emerald-400' : 'text-rose-400';
+  const dirColor = signal.direction === 'call' ? 'text-col-g' : 'text-col-r';
 
   // Best outcome across windows
   const bestOutcome = outcomes.reduce<LiveOutcomeRow | null>((best, o) => {
@@ -317,19 +323,19 @@ function LiveTradeRow({
   }, null);
 
   const statusColor = signal.status === 'resolved'
-    ? 'text-slate-400'
+    ? 'text-white/40'
     : signal.status === 'pending'
-    ? 'text-amber-400'
-    : 'text-slate-600';
+    ? 'text-amb'
+    : 'text-white/20';
 
   return (
-    <div className="bg-slate-900 border border-slate-800 rounded-lg px-3 py-2">
+    <div className="bg-panel border rounded-lg px-3 py-2" style={{ borderColor: 'var(--line)' }}>
       <div className="flex items-center gap-2 flex-wrap justify-between">
         <div className="flex items-center gap-2 flex-wrap">
-          <span className="font-mono text-xs font-bold text-slate-200">{signal.ticker}</span>
+          <span className="font-mono text-xs font-bold text-ink">{signal.ticker}</span>
           <span className={`text-xs font-bold uppercase ${dirColor}`}>{signal.direction}</span>
-          <span className="text-xs text-slate-500">${signal.entry_price.toFixed(2)}</span>
-          <span className="text-[10px] text-slate-600">{_formatDate(signal.entry_tct)}</span>
+          <span className="text-xs text-mut">${signal.entry_price.toFixed(2)}</span>
+          <span className="text-[10px] text-dim">{_formatDate(signal.entry_tct)}</span>
         </div>
         <div className="flex items-center gap-2">
           <span className={`text-[10px] font-semibold uppercase ${statusColor}`}>{signal.status}</span>
@@ -341,7 +347,7 @@ function LiveTradeRow({
           {outcomes.length > 0 && (
             <button
               onClick={() => setExpanded(e => !e)}
-              className="text-slate-500 hover:text-slate-300 transition-colors"
+              className="text-mut hover:text-ink transition-colors"
             >
               <svg className={`w-3.5 h-3.5 transition-transform ${expanded ? 'rotate-180' : ''}`} fill="none" stroke="currentColor" viewBox="0 0 24 24">
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
@@ -352,7 +358,7 @@ function LiveTradeRow({
       </div>
 
       {expanded && outcomes.length > 0 && (
-        <div className="mt-2 border-t border-slate-800 pt-2 space-y-1">
+        <div className="mt-2 border-t pt-2 space-y-1" style={{ borderColor: 'var(--line)' }}>
           {outcomes.sort((a, b) => a.window_ms - b.window_ms).map((o, i) => {
             const wLabel = o.window_ms >= 3600000 ? '60m'
               : o.window_ms >= 1800000 ? '30m'
@@ -360,13 +366,13 @@ function LiveTradeRow({
               : '5m';
             return (
               <div key={i} className="flex items-center gap-3 text-[10px]">
-                <span className="text-slate-500 w-6">{wLabel}</span>
-                <span className={o.result === 'win' ? 'text-emerald-400' : o.result === 'loss' ? 'text-rose-400' : 'text-slate-400'}>
+                <span className="text-mut w-6">{wLabel}</span>
+                <span className={o.result === 'win' ? 'text-col-g' : o.result === 'loss' ? 'text-col-r' : 'text-white/40'}>
                   {o.result.toUpperCase()}
                 </span>
                 <span className={`tabular-nums ${_pnlColor(o.pnl_pct)}`}>{_formatPnl(o.pnl_pct)}</span>
                 {o.mae_pct != null && (
-                  <span className="text-rose-500 tabular-nums">MAE {_formatPnl(o.mae_pct)}</span>
+                  <span className="text-col-r tabular-nums">MAE {_formatPnl(o.mae_pct)}</span>
                 )}
               </div>
             );
@@ -392,22 +398,22 @@ function ExecQualityRow({
   engineN:  number;
 }) {
   const delta = liveWr - engineWr;
-  const deltaColor = delta >= 0 ? 'text-emerald-400' : 'text-rose-400';
+  const deltaColor = delta >= 0 ? 'text-col-g' : 'text-col-r';
   const sign = delta >= 0 ? '+' : '';
 
   return (
-    <div className="flex items-center gap-3 py-1.5 border-b border-slate-800 last:border-0 flex-wrap">
-      <span className="font-mono text-xs font-bold text-slate-200 w-12 shrink-0">{ticker}</span>
+    <div className="flex items-center gap-3 py-1.5 border-b last:border-0 flex-wrap" style={{ borderColor: 'var(--line)' }}>
+      <span className="font-mono text-xs font-bold text-ink w-12 shrink-0">{ticker}</span>
       <div className="flex gap-4 text-xs flex-wrap">
         <span>
-          <span className="text-slate-500">Live </span>
+          <span className="text-mut">Live </span>
           <span className={`font-bold ${_winRateColor(liveWr)}`}>{_pct(liveWr)}</span>
-          <span className="text-slate-600 ml-1">n={liveN}</span>
+          <span className="text-dim ml-1">n={liveN}</span>
         </span>
         <span>
-          <span className="text-slate-500">Engine </span>
-          <span className="font-bold text-slate-300">{_pct(engineWr)}</span>
-          <span className="text-slate-600 ml-1">n={engineN}</span>
+          <span className="text-mut">Engine </span>
+          <span className="font-bold text-ink/70">{_pct(engineWr)}</span>
+          <span className="text-dim ml-1">n={engineN}</span>
         </span>
         <span className={`font-bold ${deltaColor}`}>
           {sign}{(delta * 100).toFixed(1)}pp
@@ -425,7 +431,7 @@ function MaePanel({ outcomes }: { outcomes: LiveOutcomeRow[] }) {
 
   if (maeValues.length < 3) {
     return (
-      <div className="text-xs text-slate-600 py-2">
+      <div className="text-xs text-dim py-2">
         Need at least 3 resolved trades with MAE data for stop calibration.
       </div>
     );
@@ -444,16 +450,16 @@ function MaePanel({ outcomes }: { outcomes: LiveOutcomeRow[] }) {
           { label: 'p75 MAE', value: p75, note: 'Moderate stop' },
           { label: 'p90 MAE', value: p90, note: 'Wide stop' },
         ].map(({ label, value, note }) => (
-          <div key={label} className="bg-slate-800/60 rounded-lg px-3 py-2">
-            <div className="text-rose-400 text-lg font-extrabold tabular-nums">
+          <div key={label} className="bg-panel2 rounded-lg px-3 py-2">
+            <div className="text-col-r text-lg font-extrabold tabular-nums">
               {(value * 100).toFixed(2)}%
             </div>
-            <div className="text-[10px] text-slate-500 mt-0.5">{label}</div>
-            <div className="text-[10px] text-slate-600">{note}</div>
+            <div className="text-[10px] text-mut mt-0.5">{label}</div>
+            <div className="text-[10px] text-dim">{note}</div>
           </div>
         ))}
       </div>
-      <p className="text-[10px] text-slate-500">
+      <p className="text-[10px] text-mut">
         Based on {maeValues.length} resolved outcomes. Set your hard stop at p75 MAE ({(p75 * 100).toFixed(2)}%) to avoid the typical adverse excursion while staying in winning trades.
       </p>
     </div>
@@ -463,7 +469,7 @@ function MaePanel({ outcomes }: { outcomes: LiveOutcomeRow[] }) {
 /** Ticker win rate leaderboard from DB view */
 function TickerLeaderboard({ rows }: { rows: TickerWinRateRow[] }) {
   if (rows.length === 0) {
-    return <div className="text-xs text-slate-600 py-2">No ticker win rate data yet.</div>;
+    return <div className="text-xs text-dim py-2">No ticker win rate data yet.</div>;
   }
 
   const sorted = [...rows].sort((a, b) => b.win_rate_pct - a.win_rate_pct);
@@ -473,20 +479,21 @@ function TickerLeaderboard({ rows }: { rows: TickerWinRateRow[] }) {
       {sorted.map((row, i) => (
         <div
           key={row.ticker}
-          className="flex items-center gap-3 py-2 border-b border-slate-800 last:border-0"
+          className="flex items-center gap-3 py-2 border-b last:border-0"
+          style={{ borderColor: 'var(--line)' }}
         >
-          <span className="text-[10px] text-slate-600 w-4 shrink-0">{i + 1}</span>
-          <span className="font-mono text-xs font-bold text-slate-200 w-14 shrink-0">{row.ticker}</span>
-          <div className="flex-1 h-1.5 bg-slate-800 rounded-full overflow-hidden">
+          <span className="text-[10px] text-dim w-4 shrink-0">{i + 1}</span>
+          <span className="font-mono text-xs font-bold text-ink w-14 shrink-0">{row.ticker}</span>
+          <div className="flex-1 h-1.5 bg-white/8 rounded-full overflow-hidden">
             <div
-              className={`h-full rounded-full ${row.win_rate_pct >= 0.65 ? 'bg-emerald-500' : row.win_rate_pct >= 0.50 ? 'bg-amber-500' : 'bg-rose-500'}`}
+              className={`h-full rounded-full ${row.win_rate_pct >= 0.65 ? 'bg-col-g' : row.win_rate_pct >= 0.50 ? 'bg-amb' : 'bg-col-r'}`}
               style={{ width: `${Math.round(row.win_rate_pct * 100)}%` }}
             />
           </div>
           <span className={`text-xs font-bold tabular-nums w-12 text-right ${_winRateColor(row.win_rate_pct)}`}>
             {_pct(row.win_rate_pct)}
           </span>
-          <span className="text-[10px] text-slate-500 w-8 text-right">n={row.total_signals}</span>
+          <span className="text-[10px] text-mut w-8 text-right">n={row.total_signals}</span>
           <span className={`text-[10px] tabular-nums w-14 text-right ${_pnlColor(row.avg_pnl_pct)}`}>
             {_formatPnl(row.avg_pnl_pct)}
           </span>
@@ -498,15 +505,15 @@ function TickerLeaderboard({ rows }: { rows: TickerWinRateRow[] }) {
 
 function PatternInsightCard({ insight }: { insight: PatternInsight }) {
   const color = insight.strength === 'strong'
-    ? 'border-emerald-800 bg-emerald-900/20'
+    ? 'border-col-g/30 bg-col-g/8'
     : insight.strength === 'moderate'
-    ? 'border-amber-800 bg-amber-900/20'
-    : 'border-rose-900 bg-rose-900/20';
+    ? 'border-amb/30 bg-amb/8'
+    : 'border-col-r/20 bg-col-r/8';
 
   return (
     <div className={`border rounded-lg px-3 py-2 ${color}`}>
-      <div className="text-xs font-semibold text-slate-200">{insight.label}</div>
-      <div className="text-xs text-slate-400 mt-0.5">{insight.observation}</div>
+      <div className="text-xs font-semibold text-ink">{insight.label}</div>
+      <div className="text-xs text-mut mt-0.5">{insight.observation}</div>
     </div>
   );
 }
@@ -530,7 +537,7 @@ export default function BrainCockpit() {
   const refreshBrain = useCallback(() => {
     const res = brainStore.getAllBaseRates();
     if (res.status === 'ready') {
-      setBaseRates(res.data.filter(r => r.isStatisticallyValid));
+      setBaseRates(res.data); // show all — invalid ones are dimmed in BaseRateCard
       setBrainStatus('ready');
     } else if (res.status === 'error') {
       setBrainError(res.reason);
@@ -648,7 +655,7 @@ export default function BrainCockpit() {
   ];
 
   return (
-    <div className="flex flex-col min-h-screen bg-slate-950 text-slate-100 font-mono">
+    <div className="flex flex-col min-h-screen bg-void text-ink font-mono">
       <HeaderBar />
 
       <div className="flex-1 max-w-5xl w-full mx-auto px-4 py-4 space-y-4">
@@ -662,8 +669,8 @@ export default function BrainCockpit() {
                 onClick={() => setActiveTab(tab.id)}
                 className={`flex-shrink-0 px-3 py-1.5 rounded-lg text-xs font-semibold transition-colors ${
                   activeTab === tab.id
-                    ? 'bg-sky-700 text-white'
-                    : 'bg-slate-800 text-slate-400 hover:bg-slate-700'
+                    ? 'bg-amb text-void'
+                    : 'bg-white/5 text-mut hover:bg-white/8'
                 }`}
               >
                 {tab.label}
@@ -678,19 +685,19 @@ export default function BrainCockpit() {
             <SectionLabel>Engine History — Backtested Base Rates</SectionLabel>
 
             {brainStatus === 'loading' && (
-              <div className="text-center py-10 text-slate-600 text-sm animate-pulse">
+              <div className="text-center py-10 text-dim text-sm animate-pulse">
                 Loading engine base rates...
               </div>
             )}
 
             {brainStatus === 'error' && (
-              <div className="text-center py-6 text-rose-400 text-sm">
+              <div className="text-center py-6 text-col-r text-sm">
                 Failed to load engine data: {brainError}
               </div>
             )}
 
             {brainStatus === 'ready' && baseRates.length === 0 && (
-              <div className="text-center py-12 text-slate-600 text-sm">
+              <div className="text-center py-12 text-dim text-sm">
                 No statistically valid setups yet (need n ≥ 15 per fingerprint).
               </div>
             )}
@@ -710,13 +717,13 @@ export default function BrainCockpit() {
             <SectionLabel>Your Trades — Live Signal History</SectionLabel>
 
             {dbLoading && (
-              <div className="text-center py-8 text-slate-600 text-sm animate-pulse">
+              <div className="text-center py-8 text-dim text-sm animate-pulse">
                 Loading trades...
               </div>
             )}
 
             {!dbLoading && liveSignals.length === 0 && (
-              <div className="text-center py-12 text-slate-600 text-sm">
+              <div className="text-center py-12 text-dim text-sm">
                 No live signals recorded yet. Signals are logged automatically when confluenceEngine fires.
               </div>
             )}
@@ -737,12 +744,12 @@ export default function BrainCockpit() {
             <SectionLabel>Execution Quality — Live vs Engine</SectionLabel>
 
             {execRows.length === 0 && (
-              <div className="text-center py-10 text-slate-600 text-sm">
+              <div className="text-center py-10 text-dim text-sm">
                 Need resolved live trades that match engine fingerprints to compare.
               </div>
             )}
 
-            <div className="bg-slate-900 border border-slate-800 rounded-xl px-4 py-3">
+            <div className="bg-panel border rounded-xl px-4 py-3" style={{ borderColor: 'var(--line)' }}>
               {execRows
                 .sort((a, b) => (b.liveWr - b.engineWr) - (a.liveWr - a.engineWr))
                 .map(row => (
@@ -759,7 +766,7 @@ export default function BrainCockpit() {
             </div>
 
             {execRows.length > 0 && (
-              <p className="text-[10px] text-slate-600 mt-2">
+              <p className="text-[10px] text-dim mt-2">
                 Positive pp = you are outperforming the backtested base rate for this setup.
                 Negative pp = entry timing or discipline is below the engine expectation.
               </p>
@@ -771,7 +778,7 @@ export default function BrainCockpit() {
         {activeTab === 'mae' && (
           <section id="mae-stops">
             <SectionLabel>MAE Analysis — Stop Loss Calibration</SectionLabel>
-            <div className="bg-slate-900 border border-slate-800 rounded-xl p-4">
+            <div className="bg-panel border rounded-xl p-4" style={{ borderColor: 'var(--line)' }}>
               <MaePanel outcomes={resolvedOutcomes} />
             </div>
           </section>
@@ -783,14 +790,14 @@ export default function BrainCockpit() {
             <SectionLabel>Ticker Win Rate Leaderboard</SectionLabel>
 
             {dbLoading ? (
-              <div className="text-center py-8 text-slate-600 text-sm animate-pulse">Loading...</div>
+              <div className="text-center py-8 text-dim text-sm animate-pulse">Loading...</div>
             ) : (
-              <div className="bg-slate-900 border border-slate-800 rounded-xl px-4 py-2">
+              <div className="bg-panel border rounded-xl px-4 py-2" style={{ borderColor: 'var(--line)' }}>
                 <TickerLeaderboard rows={leaderboard} />
               </div>
             )}
 
-            <p className="text-[10px] text-slate-600 mt-2">
+            <p className="text-[10px] text-dim mt-2">
               Source: ticker_win_rates DB view. Includes all resolved signals.
             </p>
           </section>
@@ -802,7 +809,7 @@ export default function BrainCockpit() {
             <SectionLabel>Pattern Insights</SectionLabel>
 
             {insights.length === 0 && (
-              <div className="text-center py-10 text-slate-600 text-sm">
+              <div className="text-center py-10 text-dim text-sm">
                 {liveSignals.length < 5
                   ? 'Need at least 5 live signals to generate insights.'
                   : 'No significant patterns detected yet in this dataset.'}
@@ -814,7 +821,7 @@ export default function BrainCockpit() {
             ))}
 
             {insights.length > 0 && (
-              <p className="text-[10px] text-slate-600">
+              <p className="text-[10px] text-dim">
                 Auto-generated from live trade history. Updated on each Brain refresh.
               </p>
             )}

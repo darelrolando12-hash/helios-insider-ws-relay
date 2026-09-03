@@ -2,7 +2,295 @@
 @tailwind components;
 @tailwind utilities;
 
-/* ── Scanner cockpit scrollable columns ─────────────────────────────────────── */
+/* ── Helios Design Token System ──────────────────────────────────────────────
+   Exactly as defined in helios-full-mockup.html + helios-full-platform-prompt.md
+   Blue is NOT a Helios color — never use blue for any UI state.
+   Corners: squared/institutional — no rounded-xl anywhere.
+   Green/red reserved strictly for directional price data and P&L.
+   Amber (#f5a623) is the SOLE UI accent.
+────────────────────────────────────────────────────────────────────────────── */
+
+:root {
+  /* Backgrounds */
+  --void:    #020304;
+  --panel:   #0a0c0e;
+  --panel2:  #0d0f12;
+  --line:    #15181b;
+
+  /* Text */
+  --ink:     #dde1e7;
+  --mut:     #6b7480;
+  --dim:     #454b53;
+
+  /* Accent — amber only */
+  /* RGB channels (no #) required for Tailwind opacity modifier syntax: bg-amb/20 */
+  --amb:       245 166 35;           /* #f5a623 — raw channels for Tailwind opacity modifiers */
+  --amb-solid: rgb(245, 166, 35);    /* #f5a623 — use this for inline CSS color/background/border */
+  --amb-dim:   #3a2c10;
+
+  /* Directional — reserved for price/P&L data only */
+  /* RGB channels required for Tailwind opacity modifier syntax */
+  --col-g:     0 217 126;  /* #00d97e  (was --g) */
+  --col-g-dim: #0a2a1e;    /* (was --g-dim) */
+  --col-r:     240 76 90;  /* #f04c5a  (was --r) */
+  --col-r-dim: #2c0f13;    /* (was --r-dim) */
+
+  /* Legacy aliases — kept for any inline style={{ color: 'var(--g)' }} usages */
+  --g:       rgb(var(--col-g));
+  --g-dim:   var(--col-g-dim);
+  --r:       rgb(var(--col-r));
+  --r-dim:   var(--col-r-dim);
+
+  /* Chart-specific */
+  --chart-bg:     #0a0d11;
+  --chart-up:     #3ee08f;
+  --chart-down:   #ff5c6c;
+  --chart-grid:   rgba(255,255,255,0.045);
+  --chart-border: #1c1f26;
+  --chart-text:   #c7c7cf;
+
+  /* Derived surfaces (keep backward compat) */
+  --surface-0: var(--void);
+  --surface-1: var(--panel);
+  --surface-2: var(--panel2);
+  --surface-3: var(--line);
+
+  /* Derived borders */
+  --border-dim:    rgba(255,255,255,0.06);
+  --border-mid:    rgba(255,255,255,0.10);
+  --border-bright: rgba(255,255,255,0.18);
+
+  /* Derived text (backward compat aliases) */
+  --text-primary:   var(--ink);
+  --text-secondary: var(--mut);
+  --text-tertiary:  var(--dim);
+  --text-disabled:  rgba(255,255,255,0.14);
+
+  /* Shell geometry */
+  --nav-h:    60px;
+  --header-h: 48px;
+}
+
+/* ── Base reset ──────────────────────────────────────────────────────────────── */
+
+*, *::before, *::after {
+  box-sizing: border-box;
+}
+
+html, body, #root {
+  height: 100%;
+  width: 100%;
+  overflow: hidden;
+}
+
+body {
+  background-color: var(--void);
+  color: var(--ink);
+  font-family: 'Inter', system-ui, -apple-system, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  overscroll-behavior: none;
+}
+
+/* ── Mono utility — JetBrains Mono for all numerals/tickers ─────────────────── */
+
+.mono {
+  font-family: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', monospace;
+  font-variant-numeric: tabular-nums;
+}
+
+/* ── Shell layout ────────────────────────────────────────────────────────────── */
+
+.helios-shell {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  max-width: 430px;
+  margin: 0 auto;
+  background: var(--void);
+  overflow: hidden;
+}
+
+.helios-screen {
+  flex: 1;
+  overflow-y: auto;
+  overflow-x: hidden;
+  width: 100%;
+  min-width: 0;
+  -webkit-overflow-scrolling: touch;
+}
+
+/* ── Header ──────────────────────────────────────────────────────────────────── */
+
+.helios-header {
+  height: var(--header-h);
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  padding: 0 14px;
+  gap: 10px;
+  background: var(--void);
+  border-bottom: 1px solid var(--border-dim);
+  position: relative;
+  z-index: 20;
+}
+
+/* ── Bottom nav ──────────────────────────────────────────────────────────────── */
+
+.helios-nav {
+  height: var(--nav-h);
+  flex-shrink: 0;
+  display: flex;
+  align-items: stretch;
+  background: var(--void);
+  border-top: 1px solid var(--border-dim);
+  position: relative;
+  z-index: 20;
+}
+
+.helios-nav-item {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 3px;
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--dim);
+  cursor: pointer;
+  transition: color 0.15s ease;
+  -webkit-tap-highlight-color: transparent;
+  user-select: none;
+}
+
+.helios-nav-item.active {
+  color: var(--amb-solid);
+}
+
+.helios-nav-item svg {
+  width: 20px;
+  height: 20px;
+  flex-shrink: 0;
+}
+
+/* ── Pulse dot ───────────────────────────────────────────────────────────────── */
+
+.helios-pulse {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--g);
+  animation: helios-pulse-anim 2s ease-in-out infinite;
+}
+
+@keyframes helios-pulse-anim {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50%       { opacity: 0.4; transform: scale(0.75); }
+}
+
+/* ── Cards / pills ───────────────────────────────────────────────────────────── */
+
+.h-card {
+  background: var(--panel);
+  border: 1px solid var(--border-dim);
+  border-radius: 2px;
+}
+
+.h-pill {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 6px;
+  border-radius: 2px;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+
+.h-pill-amb { background: var(--amb-dim); color: var(--amb-solid); }
+.h-pill-g   { background: var(--g-dim);   color: var(--g);   }
+.h-pill-r   { background: var(--r-dim);   color: var(--r);   }
+.h-pill-dim { background: rgba(255,255,255,0.06); color: var(--dim); }
+
+/* ── Section label ───────────────────────────────────────────────────────────── */
+
+.h-section-label {
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--dim);
+}
+
+/* ── Regime banner ───────────────────────────────────────────────────────────── */
+
+.h-regime-banner {
+  border-left: 3px solid var(--amb-solid);
+  background: var(--panel);
+  padding: 10px 12px;
+  margin: 8px 10px;
+  border-radius: 0 2px 2px 0;
+}
+
+/* ── Watchlist row ───────────────────────────────────────────────────────────── */
+
+.h-watchlist-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--border-dim);
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+  transition: background 0.1s ease;
+}
+
+.h-watchlist-row:active {
+  background: rgba(255,255,255,0.03);
+}
+
+.h-avatar {
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  background: var(--panel2);
+  border: 1px solid var(--border-mid);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 10px;
+  font-weight: 700;
+  color: var(--ink);
+  flex-shrink: 0;
+}
+
+/* ── Gamma snapshot card ─────────────────────────────────────────────────────── */
+
+.h-gamma-card {
+  background: var(--panel);
+  border: 1px solid var(--border-dim);
+  border-radius: 2px;
+  margin: 0 10px 8px;
+  padding: 12px;
+}
+
+/* ── Scrollbar — universal thin style ──────────────────────────────────────── */
+
+* {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255,255,255,0.08) transparent;
+}
+
+*::-webkit-scrollbar        { width: 3px; height: 3px; }
+*::-webkit-scrollbar-track  { background: transparent; }
+*::-webkit-scrollbar-thumb  { background: rgba(255,255,255,0.1); border-radius: 2px; }
+
+/* ── Scanner cockpit scrollable columns ──────────────────────────────────────── */
 .scanner-col-scroll {
   scrollbar-width: thin;
   scrollbar-color: rgba(255,255,255,0.08) transparent;

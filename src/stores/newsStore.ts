@@ -15,8 +15,9 @@
  *   getStatus()                     → 'idle' | 'polling' | 'error'
  */
 
-import * as marketStore from './marketStore';
+import * as barsStore from './barsStore';
 import { FEED_TICKERS } from '../state/directionState';
+import { formatError }  from '../lib/errors';
 
 // ── NewsArticle ────────────────────────────────────────────────────────────────
 
@@ -74,7 +75,7 @@ const ALIAS_MAP: Array<{ pattern: RegExp; ticker: string }> = [
 // ── Internal state ─────────────────────────────────────────────────────────────
 
 let _articles:  NewsArticle[]            = [];
-let _listeners: Set<() => void>          = new Set();
+const _listeners: Set<() => void>          = new Set();
 let _status:    'idle' | 'polling' | 'error' = 'idle';
 let _timer:     ReturnType<typeof setInterval> | null = null;
 
@@ -211,15 +212,17 @@ function _transform(raw: _MassiveNewsItem): NewsArticle {
 // ── API fetch ──────────────────────────────────────────────────────────────────
 
 /**
- * Determines if the market is currently open by checking whether any
- * SPY market context is available and fresh. If bars are streaming → open.
+ * Determines if the market is currently open by checking whether SPY bars
+ * are available and fresh in barsStore. This is the correct gate — barsStore
+ * is populated from REST backfill + WS AM.* messages and doesn't depend on
+ * gexEngine having run first (unlike marketStore, which was the previous gate).
  */
 function _isMarketOpen(): boolean {
-  return marketStore.getResult('SPY').status === 'ready';
+  return barsStore.getResult('SPY').status === 'ready';
 }
 
 const _API_KEY = import.meta.env.VITE_MASSIVE_API_KEY ?? '';
-const _BASE_URL = 'https://api.polygon.io';
+const _BASE_URL = 'https://api.massive.com';
 
 async function _poll(): Promise<void> {
   if (!_isMarketOpen()) return;
@@ -249,7 +252,7 @@ async function _poll(): Promise<void> {
 
     _status = 'polling';
   } catch (err) {
-    console.error('[newsStore] Poll failed:', err);
+    console.error(`[newsStore] Poll failed: ${formatError(err)}`);
     _status = 'error';
     _notify();
   }
@@ -282,7 +285,21 @@ export function subscribe(listener: () => void): () => void {
 export function startPolling(): void {
   if (_timer !== null) return;
   _status = 'polling';
-  void _poll();
+
+  // Fire immediately if bars are ready; otherwise subscribe for the first
+  // ready event and fire then — prevents the first poll from being skipped
+  // when barsStore backfill hasn't completed yet at startup.
+  if (_isMarketOpen()) {
+    void _poll();
+  } else {
+    const unsub = barsStore.subscribe(() => {
+      if (_isMarketOpen()) {
+        unsub();
+        void _poll();
+      }
+    });
+  }
+
   _timer = setInterval(() => void _poll(), POLL_INTERVAL_MS);
 }
 

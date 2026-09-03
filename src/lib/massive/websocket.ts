@@ -1,5 +1,44 @@
-import { toCentralTime } from '../time';
+import { toCentralTime, normaliseTimestampMs, isFeedScheduleActive } from '../time';
 import { OptionSubscriptionBudgetManager } from './budgetManager';
+import { RELAY_WS_URL } from '../../config';
+import { formatError } from '../errors';
+
+// ── Staleness watchdog thresholds ────────────────────────────────────────────
+// A socket can be technically OPEN while Massive has silently stopped sending
+// data (half-open failure) — onclose/onerror never fire in that case. This
+// watchdog tracks the last time a real data message actually arrived and
+// force-closes the sockets if too much time passes, letting the existing
+// onclose reconnect logic take over.
+const STALE_THRESHOLD_MS_MARKET_HOURS = 90_000;
+const STALE_THRESHOLD_MS_OFF_HOURS    = 180_000;
+const WATCHDOG_INTERVAL_MS            = 60_000;
+
+// ── Reconnect backoff ────────────────────────────────────────────────────────
+// Flat 5s retry forever hammers the connection at a fixed rate. Step up the
+// delay on repeated failures, capping (and repeating) at 30s. Resets to 0 on
+// a successful onopen. Stocks and options are tracked independently — they
+// can fail and recover on different schedules.
+const RECONNECT_DELAYS_MS = [5_000, 10_000, 15_000, 20_000, 30_000];
+
+function _nextReconnectDelay(attempt: number): number {
+  return RECONNECT_DELAYS_MS[Math.min(attempt, RECONNECT_DELAYS_MS.length - 1)];
+}
+
+// ── Diagnostic: tab visibility correlation ──────────────────────────────────
+// Temporary instrumentation to correlate WS lifecycle events against
+// document.visibilityState — used to confirm/deny whether Chrome's background
+// tab timer throttling is causing delayed pong responses / delayed onclose
+// firing. Read-only logging, does not alter any connection behavior.
+
+function _visibility(): string {
+  return typeof document !== 'undefined' ? document.visibilityState : 'unknown';
+}
+
+if (typeof document !== 'undefined') {
+  document.addEventListener('visibilitychange', () => {
+    console.log(`[MassiveWS:DIAG] ${new Date().toISOString()} VISIBILITY_CHANGE state=${document.visibilityState}`);
+  });
+}
 
 // ── Message types ────────────────────────────────────────────────────────────
 
@@ -24,17 +63,29 @@ export type WSMessageHandler = (msg: WSMessageWithCT) => void;
 type StockChannel  = 'AM' | 'A' | 'T' | 'Q' | 'LULD';
 type OptionChannel = 'AM' | 'A' | 'T' | 'Q';
 
+// ── Redundant dual-connection types ─────────────────────────────────────────
+// Each feed (stocks, options) maintains TWO independent browser↔relay
+// connections ("A" and "B"), staggered on startup so Railway's periodic
+// connection-cycling never has a good chance of dropping both at once. When
+// one is quiet or closed, the other keeps delivering — no visible data gap.
+type SourceKey = 'stocks' | 'options';
+type ConnId = 'stocksA' | 'stocksB' | 'optionsA' | 'optionsB';
+
+const CONN_IDS: ConnId[] = ['stocksA', 'stocksB', 'optionsA', 'optionsB'];
+
 // ── MassiveWebSocketBus ──────────────────────────────────────────────────────
 
 export class MassiveWebSocketBus {
-  private _stocksWs:  WebSocket | null = null;
-  private _optionsWs: WebSocket | null = null;
+  private _sockets: Record<ConnId, WebSocket | null> = {
+    stocksA: null, stocksB: null, optionsA: null, optionsB: null,
+  };
 
   private readonly _apiKey:      string;
   private readonly _stocksUrl:  string;
   private readonly _optionsUrl: string;
 
-  // Subscription registries — rebuilt on reconnect
+  // Subscription registries — shared by both connections in a pair, rebuilt
+  // on each connection's own reconnect via its own onopen.
   private readonly _stocksSubs  = new Set<string>();
   private readonly _optionsSubs = new Set<string>();
 
@@ -48,25 +99,100 @@ export class MassiveWebSocketBus {
   // Listeners notified after successful re-auth (used by barStore reconnect logic)
   private readonly _reconnectListeners = new Set<() => void>();
 
+  // Listeners notified on any connection state change
+  private readonly _statusListeners = new Set<() => void>();
+
+  // Per-connection auth flag — each of the four sockets authenticates with
+  // the relay independently.
+  private _authenticated: Record<ConnId, boolean> = {
+    stocksA: false, stocksB: false, optionsA: false, optionsB: false,
+  };
+
+  // Reconnect backoff attempt counters — independent per connection, reset on
+  // that connection's own onopen. A cycle on stocksA never affects stocksB.
+  private _reconnectAttempt: Record<ConnId, number> = {
+    stocksA: 0, stocksB: 0, optionsA: 0, optionsB: 0,
+  };
+
+  // Per-connection last-data-received time. The watchdog uses this to isolate
+  // exactly which socket in a redundant pair has gone stale, so a healthy
+  // partner covering for a quiet one is never mistaken for a dead feed.
+  private _connLastMessageTime: Record<ConnId, number> = {
+    stocksA: Date.now(), stocksB: Date.now(), optionsA: Date.now(), optionsB: Date.now(),
+  };
+
+  private _watchdogHandle: ReturnType<typeof setInterval> | null = null;
+
+  // Message dedup — both connections in a pair receive identical broadcasts
+  // from the relay. This collapses the duplicate before it reaches any
+  // handler. Rolling 2s window, swept on every incoming message so the map
+  // never grows unbounded.
+  private readonly _recentMessageKeys = new Map<string, number>();
+  private static readonly DEDUP_WINDOW_MS = 2_000;
+
+  // Delay before starting the "B" connection in each pair. Long enough that
+  // Railway's cycling window is unlikely to catch both A and B close
+  // together, without meaningfully delaying full redundancy coming online.
+  private static readonly PAIR_STAGGER_MS = 45_000;
+
   constructor(apiKey: string, baseUrl = 'wss://socket.massive.com') {
     this._apiKey      = apiKey;
     this._stocksUrl  = `${baseUrl}/stocks`;
     this._optionsUrl = `${baseUrl}/options`;
   }
 
+  private _sourceOf(connId: ConnId): SourceKey {
+    return connId.startsWith('stocks') ? 'stocks' : 'options';
+  }
+
   // ── Connection lifecycle ─────────────────────────────────────────────────
 
   public connect() {
-    this._connectStocks();
-    this._connectOptions();
+    this._connect('stocksA');
+    this._connect('optionsA');
+    setTimeout(() => this._connect('stocksB'),  MassiveWebSocketBus.PAIR_STAGGER_MS);
+    setTimeout(() => this._connect('optionsB'), MassiveWebSocketBus.PAIR_STAGGER_MS);
+    this._startWatchdog();
   }
 
   public disconnect() {
-    this._stocksWs?.close();
-    this._optionsWs?.close();
-    this._stocksWs  = null;
-    this._optionsWs = null;
+    for (const connId of CONN_IDS) {
+      this._sockets[connId]?.close();
+      this._sockets[connId] = null;
+    }
+    if (this._watchdogHandle) {
+      clearInterval(this._watchdogHandle);
+      this._watchdogHandle = null;
+    }
     console.log('[MassiveWS] Disconnected.');
+  }
+
+  // ── Staleness watchdog ───────────────────────────────────────────────────
+
+  private _startWatchdog() {
+    if (this._watchdogHandle) return; // already running
+    this._watchdogHandle = setInterval(() => {
+      const threshold = isFeedScheduleActive()
+        ? STALE_THRESHOLD_MS_MARKET_HOURS
+        : STALE_THRESHOLD_MS_OFF_HOURS;
+      const now = Date.now();
+
+      // Check each connection independently — only close the one that's
+      // actually silent. If its pair partner is still delivering data, that's
+      // the redundancy working as intended, not a failure to act on.
+      for (const connId of CONN_IDS) {
+        const ws = this._sockets[connId];
+        if (!ws || ws.readyState !== WebSocket.OPEN) continue; // reconnect logic already owns this case
+
+        const silentFor = now - this._connLastMessageTime[connId];
+        if (silentFor > threshold) {
+          console.warn(
+            `[MassiveWS] ${connId} silent for ${Math.round(silentFor / 1000)}s despite open connection — forcing reconnect (its pair partner may still be covering the feed).`
+          );
+          ws.close();
+        }
+      }
+    }, WATCHDOG_INTERVAL_MS);
   }
 
   /**
@@ -86,61 +212,79 @@ export class MassiveWebSocketBus {
     );
   }
 
-  private _connectStocks() {
-    if (!this._shouldConnect(this._stocksWs)) return;
+  /**
+   * Opens one connection (one of stocksA/stocksB/optionsA/optionsB). Each
+   * connection independently auths, subscribes, and reconnects — a cycle on
+   * one member of a pair never touches the other's state.
+   */
+  private _connect(connId: ConnId) {
+    if (!this._shouldConnect(this._sockets[connId])) return;
 
-    console.log('[MassiveWS] Opening Stocks WS…');
-    const ws = new WebSocket(this._stocksUrl);
-    this._stocksWs = ws;
+    const source = this._sourceOf(connId);
+    const url    = source === 'stocks' ? this._stocksUrl : this._optionsUrl;
+    const subs   = source === 'stocks' ? this._stocksSubs : this._optionsSubs;
 
-    ws.onopen = () => {
-      console.log('[MassiveWS] Stocks open — authenticating…');
-      ws.send(JSON.stringify({ action: 'auth', params: this._apiKey }));
-    };
-
-    ws.onmessage = (event) => this._onRawMessage(event.data, 'stocks');
-
-    ws.onclose = () => {
-      console.log('[MassiveWS] Stocks WS closed — retrying in 5 s…');
-      // Keep the reference until we decide to reconnect so _shouldConnect
-      // can inspect the CLOSED state during any StrictMode re-run.
-      setTimeout(() => {
-        this._stocksWs = null;
-        this._connectStocks();
-      }, 5000);
-    };
-
-    ws.onerror = (err) => console.error('[MassiveWS] Stocks error:', err);
-  }
-
-  private _connectOptions() {
-    if (!this._shouldConnect(this._optionsWs)) return;
-
-    console.log('[MassiveWS] Opening Options WS…');
-    const ws = new WebSocket(this._optionsUrl);
-    this._optionsWs = ws;
+    console.log(`[MassiveWS:DIAG] ${new Date().toISOString()} CONNECT_START ${connId} -> ${url} visibility=${_visibility()}`);
+    const ws = new WebSocket(url);
+    this._sockets[connId] = ws;
+    const openedAt = Date.now();
 
     ws.onopen = () => {
-      console.log('[MassiveWS] Options open — authenticating…');
+      console.log(`[MassiveWS:DIAG] ${new Date().toISOString()} OPEN ${connId} visibility=${_visibility()}`);
+      this._reconnectAttempt[connId] = 0;
       ws.send(JSON.stringify({ action: 'auth', params: this._apiKey }));
+      this._resubscribeAll(ws, subs);
+      if (source === 'stocks') this._notifyStatusListeners();
     };
 
-    ws.onmessage = (event) => this._onRawMessage(event.data, 'options');
+    ws.onmessage = (event) => this._onRawMessage(event.data, connId);
 
-    ws.onclose = () => {
-      console.log('[MassiveWS] Options WS closed — retrying in 5 s…');
+    ws.onclose = (ev) => {
+      const upMs = Date.now() - openedAt;
+      console.log(`[MassiveWS:DIAG] ${new Date().toISOString()} CLOSE ${connId} code=${ev.code} reason="${ev.reason}" wasClean=${ev.wasClean} uptime=${upMs}ms visibility=${_visibility()}`);
+      this._authenticated[connId] = false;
+      if (source === 'stocks') this._notifyStatusListeners();
+      const delay = _nextReconnectDelay(this._reconnectAttempt[connId]++);
       setTimeout(() => {
-        this._optionsWs = null;
-        this._connectOptions();
-      }, 5000);
+        this._sockets[connId] = null;
+        console.log(`[MassiveWS:DIAG] ${new Date().toISOString()} RECONNECT_START ${connId} reason=closed delay=${delay}ms visibility=${_visibility()}`);
+        this._connect(connId);
+      }, delay);
     };
 
-    ws.onerror = (err) => console.error('[MassiveWS] Options error:', err);
+    ws.onerror = (err) => {
+      const upMs = Date.now() - openedAt;
+      console.error(`[MassiveWS:DIAG] ${new Date().toISOString()} ERROR ${connId} uptime=${upMs}ms`, err);
+    };
   }
 
   // ── Message processing ───────────────────────────────────────────────────
 
-  private _onRawMessage(data: string, source: 'stocks' | 'options') {
+  private _dedupeKey(msg: BaseWSMessage): string {
+    return `${msg.ev}:${msg.sym}:${msg.t ?? ''}`;
+  }
+
+  /**
+   * Returns true if this exact message was already dispatched very recently
+   * by the connection's pair partner (both connections in a pair receive
+   * identical broadcasts from the relay). Sweeps expired entries on every
+   * call so the map never grows unbounded — same discipline as the
+   * cvdStore tick cap.
+   */
+  private _isDuplicateMessage(msg: BaseWSMessage): boolean {
+    const now = Date.now();
+    for (const [key, seenAt] of this._recentMessageKeys) {
+      if (now - seenAt > MassiveWebSocketBus.DEDUP_WINDOW_MS) {
+        this._recentMessageKeys.delete(key);
+      }
+    }
+    const key = this._dedupeKey(msg);
+    if (this._recentMessageKeys.has(key)) return true;
+    this._recentMessageKeys.set(key, now);
+    return false;
+  }
+
+  private _onRawMessage(data: string, connId: ConnId) {
     let parsed: unknown;
     try {
       parsed = JSON.parse(data);
@@ -149,16 +293,35 @@ export class MassiveWebSocketBus {
       return;
     }
 
+    const source = this._sourceOf(connId);
     const messages: BaseWSMessage[] = Array.isArray(parsed) ? parsed : [parsed as BaseWSMessage];
+
+    // Real data arrived (status/auth messages don't count) — reset the
+    // per-connection clock so the watchdog knows this specific socket is
+    // still alive.
+    if (messages.some((m) => m.ev !== 'status')) {
+      this._connLastMessageTime[connId] = Date.now();
+    }
 
     // Handle auth_success / connected status messages before dispatching
     for (const msg of messages) {
       if (msg.ev === 'status') {
-        if ((msg as any).status === 'auth_success') {
-          console.log(`[MassiveWS] ${source} authenticated.`);
+        // Log every status message so we can see the exact format Massive sends
+        console.log(`[MassiveWS] status message (${connId}):`, JSON.stringify(msg));
+
+        // Massive confirms auth via status field ('auth_success') OR
+        // via message field containing 'authenticated' — check both.
+        const isAuth = (msg as any).status === 'auth_success' ||
+          (typeof (msg as any).message === 'string' &&
+           ((msg as any).message as string).toLowerCase().includes('authenticated'));
+
+        if (isAuth) {
+          console.log(`[MassiveWS] ${connId} authenticated.`);
           const subs = source === 'stocks' ? this._stocksSubs : this._optionsSubs;
-          const ws   = source === 'stocks' ? this._stocksWs   : this._optionsWs;
+          const ws   = this._sockets[connId];
           if (ws) this._resubscribeAll(ws, subs);
+          this._authenticated[connId] = true;
+          if (source === 'stocks') this._notifyStatusListeners();
           this._notifyReconnectListeners();
         }
         continue;
@@ -176,18 +339,48 @@ export class MassiveWebSocketBus {
     });
 
     for (const msg of sorted) {
-      this._dispatchMessage(msg);
+      if (msg.ev === 'status') continue;
+      // Drop the duplicate — both connections in a redundant pair receive
+      // the same broadcast from the relay. Still fine that the per-connection
+      // clock above already ran for this connection; that's about feed
+      // health, not per-message dispatch.
+      if (this._isDuplicateMessage(msg)) continue;
+      // Wrapped per-message, not per-frame: one bad message (e.g. a
+      // malformed timestamp) must never abort the rest of the messages in
+      // this batch. Before this, a single throw here escaped the loop and
+      // silently dropped every message ordered after it in the same frame.
+      try {
+        this._dispatchMessage(msg, connId);
+      } catch (e) {
+        const identifier = msg.sym ?? (msg as BaseWSMessage & { T?: string }).T ?? '';
+        console.error(`[MassiveWS] Dispatch error (${msg.ev} ${identifier}): ${formatError(e)}`);
+      }
     }
   }
 
-  private _dispatchMessage(raw: BaseWSMessage) {
+  private _dispatchMessage(raw: BaseWSMessage, connId: ConnId) {
     if (!raw.ev) return;
+
+    // If this is a data message (not a status message) and this connection
+    // isn't yet marked authenticated, mark it now. When connecting via the
+    // relay the auth_success handshake is handled relay-side and never
+    // forwarded to the browser — the first data event is the proof auth
+    // succeeded.
+    if (raw.ev !== 'status' && !this._authenticated[connId]) {
+      this._authenticated[connId] = true;
+      if (this._sourceOf(connId) === 'stocks') this._notifyStatusListeners();
+    }
 
     // Stamp with CT at the ingestion boundary — single conversion point for
     // the entire app. Every handler receives a fully-stamped message; no
     // handler ever calls toCentralTime itself.
+    //
+    // Normalise the raw timestamp's unit first — most channels send
+    // milliseconds, but LULD has been observed sending nanoseconds, which
+    // produces an out-of-range Date and crashes the Intl formatter inside
+    // toCentralTime.
     const _ct = toCentralTime(
-      typeof raw.t === 'number' ? raw.t : Date.now()
+      typeof raw.t === 'number' ? normaliseTimestampMs(raw.t) : Date.now()
     );
     const msg: WSMessageWithCT = { ...raw, _ct };
 
@@ -195,13 +388,13 @@ export class MassiveWebSocketBus {
     const evHandlers = this._handlers.get(msg.ev);
     if (evHandlers) {
       for (const h of evHandlers) {
-        try { h(msg); } catch (e) { console.error(`[MassiveWS] Handler error (${msg.ev}):`, e); }
+        try { h(msg); } catch (e) { console.error(`[MassiveWS] Handler error (${msg.ev}): ${formatError(e)}`); }
       }
     }
 
     // Dispatch to global handlers
     for (const h of this._globalHandlers) {
-      try { h(msg); } catch (e) { console.error('[MassiveWS] Global handler error:', e); }
+      try { h(msg); } catch (e) { console.error(`[MassiveWS] Global handler error: ${formatError(e)}`); }
     }
   }
 
@@ -214,7 +407,13 @@ export class MassiveWebSocketBus {
 
   private _notifyReconnectListeners() {
     for (const fn of this._reconnectListeners) {
-      try { fn(); } catch (e) { console.error('[MassiveWS] Reconnect listener error:', e); }
+      try { fn(); } catch (e) { console.error(`[MassiveWS] Reconnect listener error: ${formatError(e)}`); }
+    }
+  }
+
+  private _notifyStatusListeners() {
+    for (const fn of this._statusListeners) {
+      try { fn(); } catch (e) { console.error(`[MassiveWS] Status listener error: ${formatError(e)}`); }
     }
   }
 
@@ -223,17 +422,13 @@ export class MassiveWebSocketBus {
   public subscribeStock(channel: StockChannel, ticker: string) {
     const key = `${channel}.${ticker}`;
     this._stocksSubs.add(key);
-    if (this._stocksWs?.readyState === WebSocket.OPEN) {
-      this._stocksWs.send(JSON.stringify({ action: 'subscribe', params: key }));
-    }
+    this._sendToPair('stocks', JSON.stringify({ action: 'subscribe', params: key }));
   }
 
   public unsubscribeStock(channel: StockChannel, ticker: string) {
     const key = `${channel}.${ticker}`;
     this._stocksSubs.delete(key);
-    if (this._stocksWs?.readyState === WebSocket.OPEN) {
-      this._stocksWs.send(JSON.stringify({ action: 'unsubscribe', params: key }));
-    }
+    this._sendToPair('stocks', JSON.stringify({ action: 'unsubscribe', params: key }));
   }
 
   /**
@@ -252,29 +447,35 @@ export class MassiveWebSocketBus {
         // Remove the evicted contract from our registry and send WS frame
         const evictedKey = `Q.${result.evicted}`;
         this._optionsSubs.delete(evictedKey);
-        if (this._optionsWs?.readyState === WebSocket.OPEN) {
-          this._optionsWs.send(JSON.stringify({
-            action: 'unsubscribe',
-            params: evictedKey,
-          }));
-        }
+        this._sendToPair('options', JSON.stringify({ action: 'unsubscribe', params: evictedKey }));
         console.log(`[MassiveWS] Budget eviction — unsubscribed Q: ${result.evicted}`);
       }
     }
 
     const key = `${channel}.${ticker}`;
     this._optionsSubs.add(key);
-    if (this._optionsWs?.readyState === WebSocket.OPEN) {
-      this._optionsWs.send(JSON.stringify({ action: 'subscribe', params: key }));
-    }
+    this._sendToPair('options', JSON.stringify({ action: 'subscribe', params: key }));
   }
 
   public unsubscribeOption(channel: OptionChannel, ticker: string) {
     const key = `${channel}.${ticker}`;
     this._optionsSubs.delete(key);
     if (channel === 'Q') this.budgetManager.evict(ticker);
-    if (this._optionsWs?.readyState === WebSocket.OPEN) {
-      this._optionsWs.send(JSON.stringify({ action: 'unsubscribe', params: key }));
+    this._sendToPair('options', JSON.stringify({ action: 'unsubscribe', params: key }));
+  }
+
+  /**
+   * Sends a frame to both connections in a feed's redundant pair (e.g. both
+   * stocksA and stocksB) — each connection maintains its own subscription
+   * state on the relay, so a subscribe/unsubscribe call must reach both, not
+   * just whichever one happens to be open first.
+   */
+  private _sendToPair(source: SourceKey, frame: string) {
+    const idA: ConnId = source === 'stocks' ? 'stocksA' : 'optionsA';
+    const idB: ConnId = source === 'stocks' ? 'stocksB' : 'optionsB';
+    for (const connId of [idA, idB]) {
+      const ws = this._sockets[connId];
+      if (ws?.readyState === WebSocket.OPEN) ws.send(frame);
     }
   }
 
@@ -282,6 +483,39 @@ export class MassiveWebSocketBus {
 
   public onReconnect(fn: () => void)  { this._reconnectListeners.add(fn); }
   public offReconnect(fn: () => void) { this._reconnectListeners.delete(fn); }
+
+  // ── Status listener API ──────────────────────────────────────────────────
+
+  /**
+   * Subscribe to connection state changes.
+   * Fires on open, close, auth success.
+   * Returns unsubscribe function.
+   */
+  public onStatusChange(fn: () => void): () => void {
+    this._statusListeners.add(fn);
+    return () => this._statusListeners.delete(fn);
+  }
+
+  /**
+   * Returns the current connection status for the stocks feed, checking
+   * BOTH connections in the redundant pair:
+   *   'connected'    — at least one of stocksA/stocksB is open and authenticated
+   *   'connecting'   — at least one is open but neither is authenticated yet
+   *   'disconnected' — neither connection exists or is open
+   */
+  public getConnectionStatus(): 'connecting' | 'connected' | 'disconnected' {
+    const a = this._sockets.stocksA;
+    const b = this._sockets.stocksB;
+
+    const openAuthed = (ws: WebSocket | null, connId: ConnId) =>
+      !!ws && ws.readyState === WebSocket.OPEN && this._authenticated[connId];
+    const openAny = (ws: WebSocket | null) =>
+      !!ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING);
+
+    if (openAuthed(a, 'stocksA') || openAuthed(b, 'stocksB')) return 'connected';
+    if (openAny(a) || openAny(b)) return 'connecting';
+    return 'disconnected';
+  }
 
   // ── Event handler API ────────────────────────────────────────────────────
 
@@ -320,5 +554,5 @@ export class MassiveWebSocketBus {
  */
 export const massiveBus = new MassiveWebSocketBus(
   import.meta.env.VITE_MASSIVE_API_KEY ?? '',
-  import.meta.env.VITE_RELAY_WS_URL    ?? 'wss://socket.massive.com',
+  RELAY_WS_URL,
 );

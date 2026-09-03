@@ -6,7 +6,9 @@
  *
  * Inputs:
  *   fundamentalsStore.recentDisclosures  — 8-K, pre-categorized
- *   fundamentalsStore.insiderTransactions — already filtered to non-10b5-1 buys
+ *   fundamentalsStore.insiderTransactions — all real transactions (buys, sells,
+ *                      both 10b5-1 states); filtering to discretionary buys/sells
+ *                      happens here in computeTags(), not at the store level
  *
  * Output (CatalystTags per ticker):
  *   earningsPending  — an earnings-category 8-K filed within the last 7 days
@@ -47,12 +49,19 @@ const EARNINGS_CATEGORIES: Set<DisclosureCategory> = new Set([
   'guidance',
 ]);
 
-const MATERIAL_CATEGORIES: Set<DisclosureCategory> = new Set([
+// Exported so any other pipeline needing "is this category material" (e.g.
+// disclosureIngestion's duplicate-accession dedupe) reuses this single list
+// instead of maintaining a second copy that can drift.
+export const MATERIAL_CATEGORIES: Set<DisclosureCategory> = new Set([
   'acquisition',
   'divestiture',
   'restructuring',
   'regulatory',
   'leadership',
+  'buyback',
+  'debt',
+  'equity',
+  'activism',
 ]);
 
 // ── Time windows ──────────────────────────────────────────────────────────────
