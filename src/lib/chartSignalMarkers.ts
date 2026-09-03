@@ -29,6 +29,28 @@
  * conversion. The two fields look identical by name but are NOT
  * interchangeable in what they actually hold — treating them the same way
  * would have been the exact bug this comment exists to prevent.
+ *
+ * ── Checked, not assumed: no option contract data exists to wire in ───────
+ * Real question worth asking before shipping "entry marker" as a concept:
+ * does a signal row record the specific option contract traded (strike,
+ * expiry, right), or only the underlying stock's price? Checked live
+ * (2026-09-03) against full real signals rows (every column, including
+ * the full `factors` JSON blob: luld, cvdPct, walls, cvdClass, emaStack,
+ * flipLevel, gexRegime, tradeType, vixBucket, catalystTags) and full real
+ * signal_outcomes rows — zero contract fields anywhere. entry_price /
+ * exit_price are the underlying's price (e.g. real SPY ~765), not an
+ * option premium. Even ZeroDteCockpit's real "I'm In" flow, which DOES
+ * capture real per-contract Greeks at entry (ActiveMonitor.entryPremium/
+ * entryDelta/entryGamma/entryTheta), never persists them anywhere — they
+ * live only in that component's React state and are gone once it
+ * unmounts or the position exits. So: SignalRow/OutcomeRow above
+ * deliberately have no strike/expiry/right fields — not an oversight,
+ * a fact about what this system currently records. A chart entry marker
+ * built from this data can show WHERE and in WHAT DIRECTION a signal
+ * fired, never WHICH CONTRACT a trader would have actually held. Fixing
+ * that would mean persisting contract selection at signal-fire time
+ * server-side (relay/engine/ledger/signalLedger.ts) — a real, separate
+ * piece of work, not something to fake here from data that isn't there.
  */
 
 import type { ChartSignalMarker, SignalMarkerState } from '../components/HeliosChart';
