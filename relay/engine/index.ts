@@ -224,6 +224,15 @@ export async function startEngine(
   // starves everything else behind a boot-time traffic jam. None are
   // latency-sensitive.
   laterOnce(() => void guarded('barsDaily',     () => runBarsDailyBackfill(rest)),      2_000);
+  // Previously laterOnce-only, no periodic refresh — same gap shape as
+  // bars1m and short interest below: resumable/gap-fill by design (queries
+  // the latest stored date and starts from there), so a redeploy-only
+  // cadence silently stops advancing on any day without a deploy. Found
+  // 2026-09-02 while building the chart backfill feature that depends on
+  // this table staying current — a stale bars_daily would quietly break
+  // the 1D chart's "last complete session" guarantee the same way the
+  // missing bars1m interval below would break intraday.
+  everyInterval(() => void guarded('barsDaily', () => runBarsDailyBackfill(rest)), 24 * 60 * 60_000);
   laterOnce(() => void guarded('shortInterest', () => runShortInterestBackfill(rest)),  4_000);
   // Previously laterOnce-only, no periodic refresh at all — a real gap found
   // in the W8 audit: short volume is documented as a daily metric but only
@@ -232,6 +241,14 @@ export async function startEngine(
   // resumable watermark means most days this just no-ops quickly.
   everyInterval(() => void guarded('shortInterest', () => runShortInterestBackfill(rest)), 24 * 60 * 60_000);
   laterOnce(() => void guarded('bars1m',        () => runBars1mBackfill(rest)),         6_000);
+  // Previously laterOnce-only — found 2026-09-02 alongside barsDaily above,
+  // same mechanism, same fix. This table is the real, direct data source
+  // for the chart backfill feature (chartBars.ts): without this interval,
+  // a relay that runs for days without a redeploy stops persisting new
+  // 1-minute bars, and a chart loading from bars_1m would silently miss
+  // the most recently completed session — the exact failure mode the
+  // chart backfill work exists to fix, one layer further upstream.
+  everyInterval(() => void guarded('bars1m', () => runBars1mBackfill(rest)), 24 * 60 * 60_000);
 
   // Free float: own cadence, deliberately NOT bundled with shortInterest
   // above — float changes quarterly-ish (buybacks/issuance), forcing it
