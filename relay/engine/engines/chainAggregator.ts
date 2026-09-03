@@ -8,9 +8,14 @@
  * Design constraints:
  *   - REST-only: Q-channel quotes carry bid/ask but not OI or greeks.
  *     The options snapshot endpoint is the only correct data source for those.
- *   - On-demand: aggregator only polls while a ticker is subscribed.
- *     ChainCockpit calls subscribe() on mount / ticker change and
- *     unsubscribe() on unmount.
+ *   - subscribe()/unsubscribe() are on-demand primitives — a ticker only
+ *     polls while subscribed. The browser's ChainCockpit uses them exactly
+ *     that way (subscribe() on mount/ticker-change, unsubscribe() on
+ *     unmount). The relay does NOT: index.ts subscribes every FEED_TICKER
+ *     permanently at boot and never unsubscribes — real, continuous,
+ *     whole-watchlist polling every POLL_INTERVAL_MS, not "whatever's on
+ *     screen." Load-planning (MAX_CONCURRENT_POLLS below) is sized for
+ *     that reality, not the on-demand one.
  *   - At most one active poll loop at a time per ticker. subscribe() for an
  *     already-subscribed ticker is idempotent.
  *
@@ -33,8 +38,36 @@ import * as barsStore from '../stores/barsStore.ts';
 /** How often to re-fetch the options snapshot while subscribed (ms). */
 const POLL_INTERVAL_MS = 30_000;
 
-/** Max number of tickers allowed to have an active poll in flight at once. */
-const MAX_CONCURRENT_POLLS = 5; // tune later if needed — starting conservative
+/**
+ * Max number of tickers allowed to have an active poll in flight at once.
+ *
+ * Raised from 5 to 40 (2026-09-02) after Wegic traced a real 71% chain-fetch
+ * failure rate in the browser to this exact queueing mechanism: at
+ * concurrency=5, N tickers must wait in batches of 5, and each batch adds a
+ * full round-trip of wall time before the next can even start — under a
+ * real Massive-side slowdown this compounds into the reported 84–114s
+ * fetches. Real load-tested against Massive's actual options-snapshot
+ * endpoint (not mocked) before shipping:
+ *
+ *   concurrency=5,  23 tickers (today's FEED_TICKERS) -> 5.7s wall, 0 failures
+ *   concurrency=5,  62 tickers (2.7x growth headroom)  -> 19.0s wall, 0 failures
+ *   concurrency=25, 62 tickers                          -> 3.4s wall, 0 failures
+ *   concurrency=40, 62 tickers                          -> 3.1s wall, 0 failures (best measured)
+ *   concurrency=62, 62 tickers (fully unbounded)         -> 3.6s wall, avg fetch
+ *                                                            latency rose 2.6x
+ *                                                            (contention, no gain)
+ *
+ * 40 fully clears today's 23-ticker count with zero queueing and gives the
+ * best measured result at 2.7x growth — going higher (tested: unbounded)
+ * stopped improving wall time and started adding real per-request latency
+ * from connection contention instead. Massive's documented rate limit is
+ * 100 req/s; this codebase runs ~1 req/s in steady state, so 40 concurrent
+ * in-flight polls (each still paginating its own chain sequentially) is
+ * nowhere near that ceiling. The load-test harness used to produce the
+ * numbers above was a temporary local tool, not shipped — see this
+ * constant's introducing commit message for the full real dataset.
+ */
+const MAX_CONCURRENT_POLLS = 40;
 
 /**
  * Hard ceiling on how long a single _poll() call may run, independent of
