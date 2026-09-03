@@ -16,6 +16,18 @@
  * grid. This is not substituting a different contract for the top pick: it is
  * trying the next real, ranked one, exactly what an operator would do by
  * hand, done visibly with every attempt logged.
+ *
+ * ── preferStrike/preferExpiry (2026-09-03) ─────────────────────────────────
+ * A real, persisted preference — bestContractPicker.ts's own pick, captured
+ * at signal-fire time by signalLedger.ts — can be threaded in to try that
+ * exact contract first. Deliberately implemented as pure re-ordering of the
+ * already-filtered, already-quality-gated `accepted` list, not a new filter
+ * stage: wantExpiry/wantStrike above still hard-filter (fail outright if
+ * nothing matches) for any caller that needs an exact pin; preferExpiry/
+ * preferStrike only move a candidate to the front of the walk if it's
+ * already in the accepted pool. A preference that fails quality or doesn't
+ * exist in this chain is silently absent from the reorder — the walk
+ * proceeds through the rest exactly as it already did before this existed.
  */
 import { MassiveRestClient, type OptionsContractSnapshot } from '../lib/massive/api.ts';
 import { assessContractQuality, type QualityResult } from '../risk/contractQuality.ts';
@@ -35,6 +47,21 @@ export interface DiscoveryInput {
   wantExpiry?: string | null;
   /** Pin discovery to an exact strike. */
   wantStrike?: number | null;
+  /**
+   * A real, single contract preference — e.g. bestContractPicker.ts's real
+   * pick, persisted at signal-fire time — tried FIRST, falling through to
+   * the existing unconstrained ranked walk if it doesn't clear quality or
+   * Webull-matching. Deliberately separate from wantExpiry/wantStrike
+   * above: those HARD-FILTER the pool (fail outright if nothing matches);
+   * these only re-ORDER the already-filtered, already-quality-gated
+   * `accepted` list, so existing callers using wantExpiry/wantStrike (or
+   * neither) are provably unaffected by this addition. If the preferred
+   * strike isn't in `accepted` (failed quality, or doesn't exist), it's
+   * simply absent from the reordered list and the walk proceeds through
+   * the rest exactly as it already does today.
+   */
+  preferExpiry?: string | null;
+  preferStrike?: number | null;
   /** Only applied when wantExpiry is absent. Default 14. */
   minDaysOut?: number;
   /** Default 0.08 — matches the only concrete spread threshold in this codebase (BestContractsCockpit.tsx). */
@@ -81,6 +108,16 @@ export type DiscoveryResult =
       underlyingPrice: number | null;
       rank: number;
       attempts: DiscoveryAttempt[];
+      /**
+       * Whether the contract actually traded is the real preferStrike/
+       * preferExpiry pick, or a fallback the ranked walk found instead.
+       * `rank` alone can't tell these apart — a fallback walk also starts
+       * counting from 1. This is the real field the feedback loop needs:
+       * "did the persisted recommendation get traded, or did execution-
+       * time reality require falling back" is a different, more useful
+       * question than the raw rank position alone answers.
+       */
+      matchedPreference: boolean;
     }
   | {
       ok: false;
@@ -114,6 +151,7 @@ export async function discoverContract(
   const {
     symbol, right, equity, riskPct, maxPremiumLossPct, caps,
     wantExpiry = null, wantStrike = null,
+    preferExpiry = null, preferStrike = null,
     minDaysOut = 14, maxSpreadPctOfMid = 0.08,
     maxContracts = 20000, attemptLimit = 20,
   } = input;
@@ -166,6 +204,22 @@ export async function discoverContract(
     return Math.abs(a.contract.details.strike_price - underlyingPrice) - Math.abs(b.contract.details.strike_price - underlyingPrice);
   });
 
+  // Move a real, persisted preference to the front of the already-filtered,
+  // already-quality-gated list — pure reordering, no new filtering. If the
+  // preferred strike/expiry isn't in `accepted` at all (failed quality
+  // above, or doesn't exist in this chain), findIndex returns -1 and the
+  // list is left exactly as the volume/moneyness sort produced it.
+  if (preferStrike != null || preferExpiry != null) {
+    const preferredIdx = accepted.findIndex((s) =>
+      (preferStrike == null || s.contract.details.strike_price === preferStrike) &&
+      (preferExpiry == null || s.contract.details.expiration_date === preferExpiry)
+    );
+    if (preferredIdx > 0) {
+      const [preferred] = accepted.splice(preferredIdx, 1);
+      accepted.unshift(preferred);
+    }
+  }
+
   const attempts: DiscoveryAttempt[] = [];
   for (let i = 0; i < Math.min(attemptLimit, accepted.length); i++) {
     const s = accepted[i];
@@ -188,6 +242,10 @@ export async function discoverContract(
       continue;
     }
     attempts.push({ ticker: d.ticker, result: `MATCHED — ${match.symbol}` });
+    const matchedPreference =
+      (preferStrike == null || d.strike_price === preferStrike) &&
+      (preferExpiry == null || d.expiration_date === preferExpiry) &&
+      (preferStrike != null || preferExpiry != null);
     return {
       ok: true,
       candidate: candidateFrom(s.contract, s.quality),
@@ -202,6 +260,7 @@ export async function discoverContract(
       underlyingPrice,
       rank: i + 1,
       attempts,
+      matchedPreference,
     };
   }
 

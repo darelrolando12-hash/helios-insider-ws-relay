@@ -57,6 +57,19 @@ export interface SignalInput {
   /** confluenceEngine band at signal time — confirmation.ts's entry baseline. */
   entryBand: string;
   settlementType: SettlementType;
+  /**
+   * A real, persisted contract preference — bestContractPicker.ts's own
+   * pick, captured by signalLedger.ts at signal-fire time
+   * (signals.factors.bestContractPick). Passed straight through to
+   * discoverContract's preferStrike/preferExpiry — see that module for why
+   * this is a soft preference (tried first, real fallback if it fails
+   * quality/Webull-matching), not a hard requirement. `null`/absent means
+   * no persisted pick exists for this signal (e.g. chain wasn't ready at
+   * fire time) — discoverContract falls back to its existing unconstrained
+   * ranked walk exactly as it already did before this field existed.
+   */
+  preferStrike?: number | null;
+  preferExpiry?: string | null;
 }
 
 export interface ExecutionConfig {
@@ -177,11 +190,16 @@ export async function executeEntry(
       right: signal.direction === 'call' ? 'CALL' : 'PUT',
       equity, riskPct: config.riskPct, maxPremiumLossPct: config.maxPremiumLossPct, caps: config.caps,
       minDaysOut: config.minDaysOut,
+      preferStrike: signal.preferStrike ?? null,
+      preferExpiry: signal.preferExpiry ?? null,
     },
     { massive, webull },
   );
   if (!discovery.ok) return { ok: false, reason: `discovery: ${discovery.reason}`, log };
-  log.push(`discovered (rank #${discovery.rank}): ${discovery.candidate.massiveTicker} -> Webull ${discovery.webull.symbol}, mid=$${discovery.candidate.mid.toFixed(2)}, vol=${discovery.candidate.volume ?? 'n/a'}`);
+  log.push(
+    `discovered (rank #${discovery.rank}${discovery.matchedPreference ? ', matched persisted pick' : (signal.preferStrike != null || signal.preferExpiry != null) ? ', persisted pick unavailable — fell back to ranked walk' : ''}): ` +
+    `${discovery.candidate.massiveTicker} -> Webull ${discovery.webull.symbol}, mid=$${discovery.candidate.mid.toFixed(2)}, vol=${discovery.candidate.volume ?? 'n/a'}`
+  );
 
   const sized = sizePosition({
     equity, riskPct: config.riskPct, premium: discovery.candidate.mid, maxPremiumLossPct: config.maxPremiumLossPct,

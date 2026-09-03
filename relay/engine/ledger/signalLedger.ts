@@ -28,10 +28,13 @@ import * as marketStore                from '../stores/marketStore.ts';
 import * as luldStore                  from '../stores/luldStore.ts';
 import * as fundamentalsStore          from '../stores/fundamentalsStore.ts';
 import * as catalystGate               from '../engines/catalystGate.ts';
-import { getDirectionState, computeTradeType } from '../state/directionState.ts';
+import { getDirectionState, computeTradeType, TICKER_BETA_TABLE } from '../state/directionState.ts';
 import type { TradeType }              from '../state/directionState.ts';
-import { vixBucket }                   from '../ledger/brainStore.ts';
+import { vixBucket, getBaseRate, timeOfDayBucket } from '../ledger/brainStore.ts';
 import type { VixBucket }              from '../ledger/brainStore.ts';
+import { pickBestContract }            from './bestContractPicker.ts';
+import type { BestContractPick }       from './bestContractPicker.ts';
+import { toCentralTime }               from '../lib/time.ts';
 import type { Signal, SignalType, SourceEngine } from '../stores/types.ts';
 
 // ── Exported types ─────────────────────────────────────────────────────────────
@@ -96,6 +99,19 @@ export interface SignalFactors {
    * not reachable yet because prior-signal tracking isn't wired anywhere.
    */
   tradeType:    TradeType | null;
+  /**
+   * The real, single contract Best Contracts' own logic would recommend for
+   * this ticker + direction at signal-fire time — ATM-with-narrow-fallback
+   * strike, real Greeks, the 8-criterion quality check, and the composite
+   * rankScore. See bestContractPicker.ts's header for why this is ONE
+   * candidate, not a ranked list — Best Contracts' "top 5" ranks across
+   * DIFFERENT tickers, not multiple strikes within one. `null` means the
+   * chain or bars weren't ready at fire time — a real, genuine absence,
+   * not a fabricated pick. Filled in by _onSignal after direction is known
+   * (pickBestContract needs it), same pattern as tradeType/sourceEngine
+   * below.
+   */
+  bestContractPick: BestContractPick | null;
 }
 
 interface CatalystTagsBlob {
@@ -173,6 +189,14 @@ async function _onSignal(signal: Signal): Promise<void> {
   // produced it would silently corrupt the per-generator comparison this field
   // exists to make possible.
   factors.sourceEngine = signal.sourceEngine ?? null;
+
+  // Best Contracts' real, single recommended contract for this ticker +
+  // direction. Needs `direction`, which is only known after _inferDirection
+  // runs above — same reason tradeType is filled in here rather than inside
+  // _captureFactors. Re-reads the same stores _captureFactors already read
+  // (cheap, synchronous, in-memory) rather than threading raw store
+  // snapshots through an extra return path for one extra consumer.
+  factors.bestContractPick = _pickBestContractForSignal(signal, direction);
 
   const row = {
     id:          signal.id,
@@ -299,7 +323,62 @@ function _captureFactors(ticker: string): SignalFactors {
     // an absent key and an explicit null are different things to a consumer
     // querying factors->>'sourceEngine'.
     sourceEngine: null,
+    // bestContractPick is filled in by _onSignal after direction is known —
+    // see _pickBestContractForSignal below.
+    bestContractPick: null,
   };
+}
+
+// ── Best Contracts pick ──────────────────────────────────────────────────────
+
+/**
+ * Real store reads for pickBestContract's inputs. Separate from
+ * _captureFactors because it needs `direction`, which _captureFactors runs
+ * before _inferDirection has computed. Re-reads cvdStore/marketStore/
+ * barsStore/fundamentalsStore — the same in-memory data _captureFactors
+ * already read a moment earlier in the same synchronous tick; a second
+ * synchronous getResult() call is not real I/O, so this costs nothing
+ * meaningful in exchange for not threading raw store snapshots through an
+ * extra return path for one extra consumer.
+ */
+function _pickBestContractForSignal(signal: Signal, direction: SignalDirection): BestContractPick | null {
+  const ctx  = marketStore.getResult(signal.ticker);
+  const cvd  = cvdStore.getResult(signal.ticker);
+  const bars = barsStore.getResult(signal.ticker);
+  const fund = fundamentalsStore.getResult(signal.ticker);
+
+  const leaderSymbol = TICKER_BETA_TABLE[signal.ticker]?.leader ?? 'SPY';
+  const leaderCvd     = cvdStore.getResult(leaderSymbol);
+
+  const nowCT = toCentralTime(Date.now());
+  const vixResult = barsStore.getResult('I:VIX');
+  const vixClose = vixResult.status === 'ready' && vixResult.data.length > 0
+    ? vixResult.data[vixResult.data.length - 1].close
+    : null;
+  const sessionBias = getDirectionState(signal.ticker)?.sessionBias ?? 'neutral';
+  const fingerprint = {
+    ticker:     signal.ticker,
+    direction,
+    gexRegime:  ctx.status === 'ready' ? ctx.data.gexRegime : 'neutral',
+    vixBucket:  vixClose !== null ? vixBucket(vixClose) : ('<15' as const),
+    timeOfDay:  timeOfDayBucket(nowCT.ctMs),
+    tradeType:  computeTradeType(direction, sessionBias, null, null),
+  };
+  const brainResult = getBaseRate(fingerprint);
+
+  return pickBestContract({
+    ticker:     signal.ticker,
+    direction,
+    signalType: signal.type,
+    confidence: signal.confidence,
+    ctx:        ctx.status === 'ready' ? ctx.data : null,
+    cvd:        cvd.status === 'ready' ? cvd.data : null,
+    leaderCvd:  leaderCvd.status === 'ready' ? leaderCvd.data : null,
+    bars:       bars.status === 'ready' ? bars.data : null,
+    fund:       fund.status === 'ready' ? fund.data : null,
+    baseRate:   brainResult.status === 'ready' ? brainResult.data : null,
+    nowMs:      Date.now(),
+  });
 }
 
 // ── Direction inference ────────────────────────────────────────────────────────
