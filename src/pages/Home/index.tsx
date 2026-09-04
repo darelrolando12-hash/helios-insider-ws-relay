@@ -717,9 +717,17 @@ function SettingsOverlay({ watchlist, onAdd, onRemove, onClose }: SettingsOverla
 // Wraps HeliosChart with a ticker selector from the fixed FEED_TICKERS universe.
 // Import FEED_TICKERS + CONTEXT_ONLY_TICKERS from directionState
 import { FEED_TICKERS } from '@/state/directionState';
+import type { ChartInterval } from '@/lib/aggregateBars';
 
 const NON_CHARTABLE = new Set(['SPX', 'NDX', 'I:VIX', 'HYG', 'TLT']);
 const CHART_TICKERS = FEED_TICKERS.filter(t => !NON_CHARTABLE.has(t));
+
+const INTERVAL_OPTIONS: { value: ChartInterval; label: string }[] = [
+  { value: '1m',  label: '1m'  },
+  { value: '5m',  label: '5m'  },
+  { value: '15m', label: '15m' },
+  { value: '1h',  label: '1H'  },
+];
 
 /** Real trading-day lookback for signal markers — matches chartBars.ts's own
  * live-verified default (computeChartBackfillWindow), so signal history
@@ -741,6 +749,10 @@ function ChartScreen({ initialTickerRef, watchlistTickers = [] }: ChartScreenPro
   ]));
 
   const [ticker, setTicker] = useState<string>(resolvedInitial);
+  // Named setChartInterval, not setInterval — the obvious name shadows the
+  // real global window.setInterval within this component's scope, a real
+  // footgun for any future code here that needs a real polling timer.
+  const [interval, setChartInterval] = useState<ChartInterval>('1m');
 
   // ── Real signal markers — entries + exits over the same real window
   // bar history uses (chartBars.ts's computeChartBackfillWindow). Result<T>
@@ -797,6 +809,35 @@ function ChartScreen({ initialTickerRef, watchlistTickers = [] }: ChartScreenPro
           );
         })}
       </div>
+      {/* Interval toggle row — candles/EMA re-aggregate real, backfilled
+          data at 15m/1h (see HeliosChart's own real backfill wiring);
+          VWAP/GEX are deliberately interval-invariant and unaffected. */}
+      <div style={{
+        display: 'flex', gap: '4px', padding: '6px 12px',
+        borderBottom: '1px solid var(--border-dim)',
+      }}>
+        {INTERVAL_OPTIONS.map(opt => {
+          const active = opt.value === interval;
+          return (
+            <button
+              key={opt.value}
+              onClick={() => setChartInterval(opt.value)}
+              style={{
+                padding: '3px 10px',
+                background: active ? 'rgba(255,255,255,0.10)' : 'transparent',
+                border: `1px solid ${active ? 'rgba(255,255,255,0.25)' : 'rgba(255,255,255,0.08)'}`,
+                borderRadius: '3px', cursor: 'pointer',
+                fontSize: '10px',
+                fontWeight: active ? 700 : 500,
+                fontFamily: 'JetBrains Mono, monospace',
+                color: active ? 'var(--text-primary)' : 'rgba(255,255,255,0.35)',
+              }}
+            >
+              {opt.label}
+            </button>
+          );
+        })}
+      </div>
       {/* Signal history fetch failure — distinct from "genuinely no signals
           fired", never conflated. Candles/VWAP/EMA/GEX still render fine
           below; this failure is scoped to markers only. */}
@@ -817,7 +858,7 @@ function ChartScreen({ initialTickerRef, watchlistTickers = [] }: ChartScreenPro
       )}
       {/* Chart */}
       <div style={{ flex: 1, overflow: 'hidden' }}>
-        <HeliosChart ticker={ticker} markers={markers} />
+        <HeliosChart ticker={ticker} markers={markers} interval={interval} />
       </div>
     </section>
   );

@@ -84,9 +84,25 @@ import * as barsStore      from '../stores/barsStore';
 import * as cvdStore       from '../stores/cvdStore';
 import * as marketStore    from '../stores/marketStore';
 import * as directionState from '../state/directionState';
-import { toCentralTime }   from '../lib/time';
-import type { Bar }        from '../stores/types';
+import { toCentralTime, toCTMidnight } from '../lib/time';
+import { aggregateBars, INTERVAL_MINUTES, type ChartInterval } from '../lib/aggregateBars';
+import { fetchBackfilledBars } from '../lib/chartBarsBackfill';
+import { computeChartBackfillWindow } from '../lib/chartWindow';
+import { clusterMarkersForDisplay } from '../lib/markerClustering';
+import type { Bar, Result } from '../stores/types';
 import type { MarketContext } from '../stores/marketStore';
+
+// Real backfill lookback, per selected interval — 1m/5m never need it (the
+// live barsStore buffer alone comfortably seeds even an EMA55 at those
+// resolutions); 15m uses the real, already-validated 7-trading-day default;
+// 1h needs the documented upper bound (10 days) specifically to seed a real
+// 55-period EMA (7 days -> ~45 real 1h bars, short of 55; 10 days -> ~65,
+// real margin). See this session's own multi-timeframe design work for the
+// full real derivation.
+const BACKFILL_LOOKBACK_TRADING_DAYS: Partial<Record<ChartInterval, number>> = {
+  '15m': 7,
+  '1h': 10,
+};
 
 // ── Colour tokens ──────────────────────────────────────────────────────────────
 
@@ -163,6 +179,13 @@ export interface ChartSignalMarker {
   price:      number;
   pnlPct?:    number;    // for EXIT markers
   parentId?:  string;    // for CONTINUATION, RE_ENTRY, FLIP
+  /**
+   * Set by markerClustering.ts's clusterMarkersForDisplay when this marker
+   * represents N real markers collapsed into one at a coarser interval —
+   * never set by any real producer (chartSignalMarkers.ts, ZeroDteCockpit).
+   * Absent/undefined means "one real marker, not a cluster."
+   */
+  clusterCount?: number;
 }
 
 export interface HeliosChartProps {
@@ -171,6 +194,14 @@ export interface HeliosChartProps {
   onMarkerClick?: (markerId: string) => void;
   height?:        number;
   className?:     string;
+  /**
+   * Candle/EMA/marker-clustering interval. Defaults to '1m' — the exact,
+   * unchanged behavior every existing caller (ZeroDteCockpit's embedded
+   * mini-chart included) already gets without passing this prop at all.
+   * VWAP is deliberately NOT affected by this — see _computeVwapSeries's
+   * real header comment for why it stays interval-invariant.
+   */
+  interval?: ChartInterval;
 }
 
 // ── Panel height ratios ────────────────────────────────────────────────────────
@@ -234,6 +265,7 @@ export const HeliosChart = React.memo(function HeliosChart({
   onMarkerClick,
   height      = 640,
   className   = '',
+  interval    = '1m',
 }: HeliosChartProps) {
   const containerRef = useRef<HTMLDivElement>(null);
 
@@ -409,6 +441,38 @@ export const HeliosChart = React.memo(function HeliosChart({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [ticker, height]);
 
+  // ── Real backfill for coarser intervals ─────────────────────────────────────
+  //
+  // 1m/5m never trigger this — the live barsStore buffer alone comfortably
+  // seeds them (see BACKFILL_LOOKBACK_TRADING_DAYS's real header comment).
+  // 15m/1h fetch real persisted history from bars_1m, sized per interval.
+  // Result<Bar[]> throughout — a fetch failure is distinguishable from a
+  // genuine empty range, same discipline as chartSignals.ts.
+
+  const [backfillResult, setBackfillResult] = useState<Result<Bar[]>>({ status: 'ready', data: [], asOf: 0 });
+
+  useEffect(() => {
+    const lookbackDays = BACKFILL_LOOKBACK_TRADING_DAYS[interval];
+    if (lookbackDays === undefined) {
+      // 1m/5m — no backfill needed, real live buffer suffices.
+      setBackfillResult({ status: 'ready', data: [], asOf: Date.now() });
+      return;
+    }
+
+    let cancelled = false;
+    setBackfillResult({ status: 'loading' });
+
+    const { fromMs, toMs } = computeChartBackfillWindow(Date.now(), lookbackDays);
+    fetchBackfilledBars(ticker, fromMs, toMs).then((result) => {
+      // Guard against a slow fetch for a previously-selected ticker/interval
+      // landing after the user has already switched — same pattern as
+      // ChartScreen's marker fetch (Home/index.tsx).
+      if (!cancelled) setBackfillResult(result);
+    });
+
+    return () => { cancelled = true; };
+  }, [ticker, interval]);
+
   // ── Store data → chart ────────────────────────────────────────────────────────
 
   const updateChartData = useCallback(() => {
@@ -417,23 +481,37 @@ export const HeliosChart = React.memo(function HeliosChart({
     const marketResult = marketStore.getResult(ticker);
 
     if (barsResult.status !== 'ready') return;
-    const bars = barsResult.data;
-    if (bars.length === 0) return;
+    const liveBars = barsResult.data;
+    if (liveBars.length === 0) return;
 
-    _updatePriceData(bars, candleSeriesRef.current, ema8Ref.current, ema21Ref.current, ema55Ref.current, vwapRef.current);
+    // Real, finest-grain 1-minute series: backfilled history (when the
+    // selected interval needs it) merged with the live buffer's tail.
+    // VWAP is always computed from THIS, never from displayBars below —
+    // see _computeVwapSeries's own header for why.
+    const backfilled = backfillResult.status === 'ready' ? backfillResult.data : [];
+    const rawBars1m  = backfilled.length > 0 ? _mergeBarHistory(backfilled, liveBars) : liveBars;
+
+    // Real candle/EMA series: aggregated to the selected interval. '1m' is
+    // a real, tested identity passthrough inside aggregateBars.
+    const displayBars = aggregateBars(rawBars1m, interval);
+    if (displayBars.length === 0) return;
+
+    _updatePriceData(displayBars, rawBars1m, candleSeriesRef.current, ema8Ref.current, ema21Ref.current, ema55Ref.current, vwapRef.current);
 
     // FIX 4: CVD line built from per-bar snapshots using current cvdStore state.
     // cvdStore holds callPct/putPct (not a ticks array). We project the current
     // directional skew value across all bar timestamps to build the chart line,
     // and compute aggressor ROC from the same synthetic per-bar series.
+    // Uses displayBars — the CVD/aggressor panels stay time-aligned with the
+    // candle panel above them, same as before this change.
     if (cvdResult.status === 'ready') {
-      _updateCvdFromBars(bars, cvdResult.data, cvdLineRef.current, aggrHistRef.current);
+      _updateCvdFromBars(displayBars, cvdResult.data, cvdLineRef.current, aggrHistRef.current);
     }
 
     if (marketResult.status === 'ready') {
       _applyGexLevelsInternal(candleSeriesRef.current, marketResult.data);
     }
-  }, [ticker]);
+  }, [ticker, interval, backfillResult]);
 
   useEffect(() => {
     updateChartData();
@@ -449,11 +527,17 @@ export const HeliosChart = React.memo(function HeliosChart({
   }, [ticker, updateChartData]);
 
   // ── Signal markers ────────────────────────────────────────────────────────────
+  //
+  // Clustered at the currently-displayed interval's own bucket width —
+  // real no-op at 1m (bucket width == a marker's own native resolution),
+  // real collapsing at 5m/15m/1h. See markerClustering.ts.
 
   useEffect(() => {
     if (!markersPluginRef.current) return;
-    markersPluginRef.current.setMarkers(_buildLtwMarkers(markers));
-  }, [markers]);
+    const bucketMs = INTERVAL_MINUTES[interval] * 60_000;
+    const clustered = clusterMarkersForDisplay(markers, bucketMs);
+    markersPluginRef.current.setMarkers(_buildLtwMarkers(clustered));
+  }, [markers, interval]);
 
   // ── Session bias tint ─────────────────────────────────────────────────────────
 
@@ -523,8 +607,26 @@ export const HeliosChart = React.memo(function HeliosChart({
 
 // ── Price data update ──────────────────────────────────────────────────────────
 
+/**
+ * `displayBars` — the currently-selected interval's aggregated candles
+ * (via aggregateBars). Feeds the candlestick series and all three EMAs:
+ * the full, real, unmodified 8/21/55 stack is used at every interval — the
+ * real backfill sizing in HeliosChart's own component body (7 real trading
+ * days for 15m, 10 for 1h) guarantees enough real bars to seed EMA55 at
+ * every one of them. This is deliberately NOT the two-period shrink
+ * confluenceEngine's live scoring uses — that shrink exists because the
+ * scoring engine's own bar source is a permanent, unbackfilled, in-memory
+ * 500-bar cap; the chart's ceiling is solvable (this real backfill IS the
+ * solve), so it gets the real, full stack instead.
+ *
+ * `rawBars1m` — the real, un-aggregated 1-minute series (backfilled
+ * history merged with the live buffer). Feeds ONLY VWAP, deliberately
+ * never displayBars — see _computeVwapSeries's own header for why VWAP
+ * must never be recomputed at the aggregated interval.
+ */
 function _updatePriceData(
-  bars:        Bar[],
+  displayBars: Bar[],
+  rawBars1m:   Bar[],
   candles:     ISeriesApi<'Candlestick'> | null,
   ema8Series:  ISeriesApi<'Line'> | null,
   ema21Series: ISeriesApi<'Line'> | null,
@@ -533,7 +635,7 @@ function _updatePriceData(
 ) {
   if (!candles) return;
 
-  const candleData: CandlestickData<Time>[] = bars.map(b => ({
+  const candleData: CandlestickData<Time>[] = displayBars.map(b => ({
     time:  Math.floor(b.tCT / 1000) as UTCTimestamp,
     open:  b.open,
     high:  b.high,
@@ -542,12 +644,28 @@ function _updatePriceData(
   }));
   candles.setData(candleData);
 
-  const closes = bars.map(b => b.close);
-  if (ema8Series)  _setEmaData(ema8Series,  bars, closes, 8);
-  if (ema21Series) _setEmaData(ema21Series, bars, closes, 21);
-  if (ema55Series) _setEmaData(ema55Series, bars, closes, 55);
+  const closes = displayBars.map(b => b.close);
+  if (ema8Series)  _setEmaData(ema8Series,  displayBars, closes, 8);
+  if (ema21Series) _setEmaData(ema21Series, displayBars, closes, 21);
+  if (ema55Series) _setEmaData(ema55Series, displayBars, closes, 55);
 
-  if (vwapSeries) vwapSeries.setData(_computeVwapSeries(bars));
+  if (vwapSeries) vwapSeries.setData(_computeVwapSeries(rawBars1m));
+}
+
+/**
+ * Merge real backfilled history with the live barsStore buffer's tail into
+ * one real, time-ascending 1-minute series. Dedupes by tUtc, preferring the
+ * live value on overlap (freshest for whatever tail both sources share) —
+ * unlike chartBars.ts's mergeLiveBar (which appends ONE new live bar to an
+ * already-merged history), this combines two whole READ-ONLY arrays from
+ * two independent sources HeliosChart doesn't own the storage of, so it's
+ * a real, distinct merge rather than a reuse of that exact function.
+ */
+export function _mergeBarHistory(historical: Bar[], live: Bar[]): Bar[] {
+  const byTUtc = new Map<number, Bar>();
+  for (const b of historical) byTUtc.set(b.tUtc, b);
+  for (const b of live) byTUtc.set(b.tUtc, b); // live wins on overlap
+  return Array.from(byTUtc.values()).sort((a, b) => a.tUtc - b.tUtc);
 }
 
 function _setEmaData(
@@ -572,10 +690,36 @@ function _setEmaData(
   series.setData(data);
 }
 
-function _computeVwapSeries(bars: Bar[]): LineData<Time>[] {
+/**
+ * VWAP is a real, session-level indicator — cumulative volume-weighted
+ * price since the most recent session's open, resetting to zero at every
+ * new session boundary. This function must always receive the real,
+ * finest-grain 1-minute series (never displayBars, the aggregated
+ * candles) — see _updatePriceData's own header for why.
+ *
+ * Real bug found and fixed here (2026-09-03): this function previously
+ * accumulated across the ENTIRE bars array with no session-reset at all.
+ * That looked correct only by accident — barsStore's live buffer rarely
+ * held more than ~1.3 sessions, so the drift was invisible. The moment
+ * multi-day backfilled data flows through here (which the interval toggle
+ * requires), an unreset accumulator would silently compute a nonsensical
+ * multi-day-cumulative line and mislabel it VWAP — a real, latent bug that
+ * had simply never been triggered yet. Fixed via toCTMidnight (lib/time.ts)
+ * detecting a new real CT calendar day within the array and resetting the
+ * accumulator there, regardless of what candle interval is displayed.
+ */
+export function _computeVwapSeries(bars: Bar[]): LineData<Time>[] {
   let cumPV  = 0;
   let cumVol = 0;
+  let sessionStart: number | null = null;
+
   return bars.map(b => {
+    const barSession = toCTMidnight(b.tUtc);
+    if (sessionStart === null || barSession !== sessionStart) {
+      sessionStart = barSession;
+      cumPV  = 0;
+      cumVol = 0;
+    }
     cumPV  += b.close * b.volume;
     cumVol += b.volume;
     return {
@@ -784,6 +928,16 @@ export function applyGexLevels(
 
 // ── Signal markers ─────────────────────────────────────────────────────────────
 
+/**
+ * Appends a real cluster-count suffix to a marker's text when
+ * markerClustering.ts collapsed multiple real markers into this one
+ * (clusterCount > 1). No-op for any real, uncollapsed marker.
+ */
+function _withClusterSuffix(text: string, m: ChartSignalMarker): string {
+  if (!m.clusterCount || m.clusterCount <= 1) return text;
+  return `${text}×${m.clusterCount}`;
+}
+
 function _buildLtwMarkers(markers: ChartSignalMarker[]): SeriesMarker<Time>[] {
   return markers.map(m => {
     const time   = Math.floor(m.tCT / 1000) as UTCTimestamp;
@@ -791,33 +945,36 @@ function _buildLtwMarkers(markers: ChartSignalMarker[]): SeriesMarker<Time>[] {
 
     switch (m.state) {
       case 'FORMING':
-        return { id: m.id, time, position: isCall ? 'belowBar' : 'aboveBar', color: isCall ? C.callSignal : C.putSignal, shape: 'circle', text: '○', size: 1 };
+        return { id: m.id, time, position: isCall ? 'belowBar' : 'aboveBar', color: isCall ? C.callSignal : C.putSignal, shape: 'circle', text: _withClusterSuffix('○', m), size: 1 };
 
       case 'TRIGGERING':
-        return { id: m.id, time, position: isCall ? 'belowBar' : 'aboveBar', color: isCall ? C.callSignal : C.putSignal, shape: 'circle', text: '●', size: 2 };
+        return { id: m.id, time, position: isCall ? 'belowBar' : 'aboveBar', color: isCall ? C.callSignal : C.putSignal, shape: 'circle', text: _withClusterSuffix('●', m), size: 2 };
 
       case 'ACTIVE':
-        return { id: m.id, time, position: isCall ? 'belowBar' : 'aboveBar', color: isCall ? C.callSignal : C.putSignal, shape: 'circle', text: '⊙', size: 2 };
+        return { id: m.id, time, position: isCall ? 'belowBar' : 'aboveBar', color: isCall ? C.callSignal : C.putSignal, shape: 'circle', text: _withClusterSuffix('⊙', m), size: 2 };
 
       case 'CONSOLIDATING':
-        return { id: m.id, time, position: isCall ? 'belowBar' : 'aboveBar', color: isCall ? C.callSignal : C.putSignal, shape: 'circle', text: '◌', size: 1 };
+        return { id: m.id, time, position: isCall ? 'belowBar' : 'aboveBar', color: isCall ? C.callSignal : C.putSignal, shape: 'circle', text: _withClusterSuffix('◌', m), size: 1 };
 
       case 'CONTINUATION':
-        return { id: m.id, time, position: isCall ? 'belowBar' : 'aboveBar', color: isCall ? C.callSignal : C.putSignal, shape: 'circle', text: '⊕', size: 1 };
+        return { id: m.id, time, position: isCall ? 'belowBar' : 'aboveBar', color: isCall ? C.callSignal : C.putSignal, shape: 'circle', text: _withClusterSuffix('⊕', m), size: 1 };
 
       case 'RE_ENTRY':
-        return { id: m.id, time, position: isCall ? 'belowBar' : 'aboveBar', color: isCall ? C.callSignal : C.putSignal, shape: 'square', text: '◇', size: 1 };
+        return { id: m.id, time, position: isCall ? 'belowBar' : 'aboveBar', color: isCall ? C.callSignal : C.putSignal, shape: 'square', text: _withClusterSuffix('◇', m), size: 1 };
 
       case 'FLIP':
-        return { id: m.id, time, position: isCall ? 'belowBar' : 'aboveBar', color: isCall ? C.callSignal : C.putSignal, shape: isCall ? 'arrowUp' : 'arrowDown', text: '', size: 2 };
+        return { id: m.id, time, position: isCall ? 'belowBar' : 'aboveBar', color: isCall ? C.callSignal : C.putSignal, shape: isCall ? 'arrowUp' : 'arrowDown', text: _withClusterSuffix('', m), size: 2 };
 
       case 'EXIT': {
+        // Never clustered — markerClustering.ts excludes any bucket
+        // containing an EXIT from collapse, so clusterCount is never set
+        // here. No suffix logic needed.
         const isProfit = (m.pnlPct ?? 0) >= 0;
         return { id: m.id, time, position: 'inBar' as const, color: isProfit ? C.callSignal : C.putSignal, shape: 'square' as const, text: `${isProfit ? '+' : ''}${(m.pnlPct ?? 0).toFixed(1)}%`, size: 1 };
       }
 
       case 'DUMP_RIP':
-        return { id: m.id, time, position: 'aboveBar' as const, color: C.dumpRip, shape: isCall ? 'arrowUp' : 'arrowDown', text: '⚡', size: 2 };
+        return { id: m.id, time, position: 'aboveBar' as const, color: C.dumpRip, shape: isCall ? 'arrowUp' : 'arrowDown', text: _withClusterSuffix('⚡', m), size: 2 };
 
       default:
         return { id: m.id, time, position: 'inBar' as const, color: C.textMuted, shape: 'circle' as const, text: '', size: 1 };
