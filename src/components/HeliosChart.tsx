@@ -84,7 +84,7 @@ import * as barsStore      from '../stores/barsStore';
 import * as cvdStore       from '../stores/cvdStore';
 import * as marketStore    from '../stores/marketStore';
 import * as directionState from '../state/directionState';
-import { toCentralTime, toCTMidnight } from '../lib/time';
+import { toCTMidnight } from '../lib/time';
 import { aggregateBars, INTERVAL_MINUTES, type ChartInterval } from '../lib/aggregateBars';
 import { fetchBackfilledBars } from '../lib/chartBarsBackfill';
 import { computeChartBackfillWindow } from '../lib/chartWindow';
@@ -248,8 +248,18 @@ function _makeChartOptions(
         // Always show HH:mm regardless of how many calendar days the data spans.
         // Without this, Lightweight Charts defaults to repeating date strings for
         // intraday data that crosses midnight (e.g. after backfill includes yesterday).
-        const ct = toCentralTime(timeAsSeconds * 1000);
-        return `${String(ct.hour).padStart(2, '0')}:${String(ct.minute).padStart(2, '0')}`;
+        //
+        // `timeAsSeconds` is already a CT pseudo-UTC epoch (every series feeds
+        // the chart Math.floor(b.tCT / 1000) — see _buildLtwMarkers and the
+        // candle/EMA/VWAP series builders below). tCT is a real UTC epoch
+        // already SHIFTED by the CT offset at construction time (toCentralTime
+        // in massiveAggToBar / chartBarsBackfill / chartSignalMarkers), so it
+        // must be read back with UTC methods only. Passing it through
+        // toCentralTime() again here applied the CT offset a SECOND time —
+        // real bug, found 2026-09-04: an 08:30 CT bar rendered as if it were
+        // several hours off. Read the pseudo-epoch directly, never re-convert.
+        const d = new Date(timeAsSeconds * 1000);
+        return `${String(d.getUTCHours()).padStart(2, '0')}:${String(d.getUTCMinutes()).padStart(2, '0')}`;
       },
     },
     handleScroll:  true,
@@ -984,10 +994,15 @@ function _buildLtwMarkers(markers: ChartSignalMarker[]): SeriesMarker<Time>[] {
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
 
-// Tick mark formatter using CT
+// Tick mark formatter for the CVD/aggressor sub-panels (separate chart
+// instances — see this file's header comment on panel structure).
+// `timeAsSeconds` is a CT pseudo-UTC epoch (same convention as the price
+// panel's own tickMarkFormatter above) — read with UTC methods only, never
+// re-converted through toCentralTime(). See that formatter's comment for
+// the real double-conversion bug this shape previously had.
 export function formatChartTime(timeAsSeconds: UTCTimestamp): string {
-  const ct = toCentralTime(timeAsSeconds * 1000);
-  return `${String(ct.hour).padStart(2, '0')}:${String(ct.minute).padStart(2, '0')}`;
+  const d = new Date(timeAsSeconds * 1000);
+  return `${String(d.getUTCHours()).padStart(2, '0')}:${String(d.getUTCMinutes()).padStart(2, '0')}`;
 }
 
 function _playDirectionLabel(d: directionState.PlayDirection): string {

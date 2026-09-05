@@ -29,6 +29,35 @@ const STALE_THRESHOLD_MS = 2 * 60 * 1000; // 2 minutes
 const MAX_BARS_PER_TICKER = 500;
 
 /**
+ * Max number of tickers allowed to have a reconnect gap-fill REST call in
+ * flight at once.
+ *
+ * Real root cause found 2026-09-04: _registerReconnectHandler's onReconnect
+ * loop below called _backfill(ticker, 'reconnect') for every stale ticker
+ * without awaiting each call — with 4 upstream WS connections dropping
+ * together (observed repeatedly, ~every 3 min, in a real 30-min session),
+ * every one of ~23 FEED_TICKERS crosses the 2-min STALE_THRESHOLD_MS and
+ * fires its own fetchBarRange() in the same synchronous tick. That burst
+ * lands on relay.helios-insiders.com/rest/* at the exact moment
+ * chainAggregator's own concurrent chain-snapshot polls are already
+ * in flight, on one single-threaded, single-Railway-replica relay process
+ * with no server-side concurrency governor on its own outbound fetch() —
+ * the real mechanism behind SOFI's 24x fetch-time spread (1.5s idle vs
+ * 36.1s mid-burst) and the mass "_poll hard-timeout" clusters that
+ * consistently appeared within seconds of a WS reconnect.
+ *
+ * Mirrors chainAggregator.ts's own _acquireSlot/_releaseSlot semaphore
+ * pattern exactly, kept local rather than extracted to a shared utility —
+ * two independent, unrelated call sites don't yet justify a shared
+ * abstraction. Capped at 5, matching that module's original conservative
+ * default: this handler's job is to stop a reconnect from ever adding a
+ * burst larger than what the rest of the system already tolerates, not to
+ * make gap-fill maximally fast at the cost of re-creating the exact
+ * thundering-herd this fix exists to remove.
+ */
+const MAX_CONCURRENT_RECONNECT_BACKFILLS = 5;
+
+/**
  * Tolerance window for signal-outcome bar lookup.
  * Engineering Lesson #7: exact timestamp match silently misses; use ±5 min.
  */
@@ -48,6 +77,31 @@ interface TickerState {
 
 const _state   = new Map<string, TickerState>();
 const _listeners = new Set<() => void>();
+
+// ── Reconnect-backfill concurrency semaphore ────────────────────────────────
+// See MAX_CONCURRENT_RECONNECT_BACKFILLS's comment for why this exists.
+
+let _activeReconnectBackfills = 0;
+const _reconnectBackfillQueue: Array<() => void> = [];
+
+async function _acquireReconnectBackfillSlot(): Promise<void> {
+  if (_activeReconnectBackfills < MAX_CONCURRENT_RECONNECT_BACKFILLS) {
+    _activeReconnectBackfills++;
+    return;
+  }
+  return new Promise((resolve) => {
+    _reconnectBackfillQueue.push(() => {
+      _activeReconnectBackfills++;
+      resolve();
+    });
+  });
+}
+
+function _releaseReconnectBackfillSlot(): void {
+  _activeReconnectBackfills--;
+  const next = _reconnectBackfillQueue.shift();
+  if (next) next();
+}
 
 // ── REST client reference ─────────────────────────────────────────────────────
 
@@ -294,23 +348,44 @@ async function _backfill(ticker: string, reason: 'cold-start' | 'reconnect') {
 }
 
 /**
+ * Runs `_backfill` for one ticker only after acquiring a reconnect-backfill
+ * slot — the real fix for the thundering-herd burst described on
+ * MAX_CONCURRENT_RECONNECT_BACKFILLS. Callers fire-and-forget this per
+ * ticker; the semaphore (not the caller) decides how many run at once.
+ */
+async function _gatedReconnectBackfill(ticker: string, reason: 'cold-start' | 'reconnect') {
+  await _acquireReconnectBackfillSlot();
+  try {
+    await _backfill(ticker, reason);
+  } finally {
+    _releaseReconnectBackfillSlot();
+  }
+}
+
+/**
  * On reconnect, check all subscribed tickers. Any ticker whose last bar is
  * older than STALE_THRESHOLD_MS gets a gap-fill backfill.
  * Engineering Lesson #9.
+ *
+ * Every stale ticker is queued through _gatedReconnectBackfill rather than
+ * called directly — with 4 upstream connections reconnecting together,
+ * this loop can mark most/all subscribed tickers stale in the same tick.
+ * Un-gated, that fires every one of their REST calls simultaneously; see
+ * MAX_CONCURRENT_RECONNECT_BACKFILLS for the real incident this caused.
  */
 function _registerReconnectHandler() {
   massiveBus.onReconnect(() => {
     const nowMs = Date.now();
     for (const [ticker, state] of _state) {
       if (state.bars.length === 0) {
-        _backfill(ticker, 'cold-start');
+        void _gatedReconnectBackfill(ticker, 'cold-start');
         continue;
       }
       const last  = state.bars[state.bars.length - 1];
       const ageMs = nowMs - last.tUtc;
       if (ageMs > STALE_THRESHOLD_MS) {
         console.log(`[barsStore] ${ticker} stale after reconnect (${Math.round(ageMs / 1000)}s) — gap-filling.`);
-        _backfill(ticker, 'reconnect');
+        void _gatedReconnectBackfill(ticker, 'reconnect');
       }
     }
   });

@@ -373,7 +373,78 @@ server.on('request', (req, res) => {
 // error response instead of leaving the request dangling.
 const REST_PROXY_TIMEOUT_MS = 20_000;
 
+/**
+ * Max number of proxied Massive requests this relay process will have
+ * in flight at once, across every browser client and every module that
+ * calls it (chainAggregator's chain-snapshot polls, barsStore's cold-start
+ * AND reconnect gap-fill backfills, insiderIngestion/disclosureIngestion/
+ * ratiosIngestion/shortInterestIngestion/bars1mIngestion).
+ *
+ * Real root cause found 2026-09-04: this handler had NO concurrency
+ * governor of its own. Each of those browser-side modules caps its OWN
+ * concurrency independently (or, for the ingestion modules, runs one
+ * ticker at a time) — but none of them coordinate with each other, and
+ * this single-threaded relay process on Railway's single-replica
+ * constraint is the one resource all of them share. A WS reconnect
+ * (relay/index.js's own upstream 'close' handler, or a browser-side
+ * heartbeat miss) fires barsStore's gap-fill for every stale ticker at
+ * once; if that lands in the same window as chainAggregator's own
+ * concurrent chain-snapshot polls, the combined burst has no ceiling here
+ * — this is the real mechanism confirmed behind SOFI's 24x fetch-time
+ * spread and the mass "_poll hard-timeout" clusters that tracked WS
+ * reconnects second-for-second in a real 30-min session.
+ *
+ * 25 is a deliberate middle ground, not a guess: relay/engine's own
+ * chainAggregator.ts documents a real load test against this same Massive
+ * endpoint showing 0 failures and 3.4s wall time at concurrency=25 for 62
+ * tickers — comfortably under Massive's documented 100 req/s limit, and
+ * with real headroom above every known browser-side module's own cap
+ * (barsStore's reconnect gap-fill is capped at 5; see barsStore.ts) so
+ * none of them are throttled by this governor under normal operation.
+ * Its job is to be the final backstop against a pathological combined
+ * burst, not to be the everyday bottleneck.
+ */
+const MAX_CONCURRENT_REST_PROXY = 25;
+
+let _activeRestProxyRequests = 0;
+const _restProxyQueue = [];
+
+function _acquireRestProxySlot() {
+  if (_activeRestProxyRequests < MAX_CONCURRENT_REST_PROXY) {
+    _activeRestProxyRequests++;
+    return Promise.resolve();
+  }
+  return new Promise((resolve) => {
+    _restProxyQueue.push(() => {
+      _activeRestProxyRequests++;
+      resolve();
+    });
+  });
+}
+
+function _releaseRestProxySlot() {
+  _activeRestProxyRequests--;
+  const next = _restProxyQueue.shift();
+  if (next) next();
+}
+
 async function handleRestProxy(req, res) {
+  // A request can now wait in _restProxyQueue before its own 20s abort timer
+  // even starts (deliberate — queue time bounding the timer would make the
+  // cap meaningless under real contention). If the browser's own 25s fetch
+  // timeout fires while still queued, the client is gone by the time a slot
+  // opens; track that so we skip the wasted upstream call and never attempt
+  // to write to an already-closed response.
+  let clientGone = false;
+  res.once('close', () => { clientGone = true; });
+
+  await _acquireRestProxySlot();
+
+  if (clientGone) {
+    _releaseRestProxySlot();
+    return;
+  }
+
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), REST_PROXY_TIMEOUT_MS);
 
@@ -389,6 +460,8 @@ async function handleRestProxy(req, res) {
     const upstreamRes = await fetch(target.toString(), { method: 'GET', signal: controller.signal });
     const bodyText = await upstreamRes.text();
 
+    if (clientGone) return; // browser gave up mid-fetch — nothing to write to
+
     res.writeHead(upstreamRes.status, {
       'Content-Type': upstreamRes.headers.get('content-type') || 'application/json',
       'Access-Control-Allow-Origin': '*',
@@ -399,6 +472,7 @@ async function handleRestProxy(req, res) {
   } catch (err) {
     const timedOut = err.name === 'AbortError';
     console.error('[relay] REST proxy error:', timedOut ? `timed out after ${REST_PROXY_TIMEOUT_MS / 1000}s` : err.message);
+    if (clientGone) return; // browser already gone — writing here would throw
     res.writeHead(timedOut ? 504 : 502, {
       'Content-Type': 'application/json',
       'Access-Control-Allow-Origin': '*',
@@ -408,6 +482,7 @@ async function handleRestProxy(req, res) {
     res.end(JSON.stringify({ error: 'relay proxy failed', message: timedOut ? 'upstream request timed out' : err.message }));
   } finally {
     clearTimeout(timeout);
+    _releaseRestProxySlot();
   }
 }
 
