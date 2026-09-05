@@ -86,20 +86,43 @@ import * as marketStore    from '../stores/marketStore';
 import * as directionState from '../state/directionState';
 import { toCTMidnight } from '../lib/time';
 import { aggregateBars, INTERVAL_MINUTES, type ChartInterval } from '../lib/aggregateBars';
-import { fetchBackfilledBars } from '../lib/chartBarsBackfill';
+import { fetchChartBackfill, type ChartBackfill } from '../lib/chartBarsBackfill';
 import { computeChartBackfillWindow } from '../lib/chartWindow';
 import { clusterMarkersForDisplay } from '../lib/markerClustering';
 import type { Bar, Result } from '../stores/types';
 import type { MarketContext } from '../stores/marketStore';
 
-// Real backfill lookback, per selected interval — 1m/5m never need it (the
-// live barsStore buffer alone comfortably seeds even an EMA55 at those
-// resolutions); 15m uses the real, already-validated 7-trading-day default;
-// 1h needs the documented upper bound (10 days) specifically to seed a real
-// 55-period EMA (7 days -> ~45 real 1h bars, short of 55; 10 days -> ~65,
-// real margin). See this session's own multi-timeframe design work for the
-// full real derivation.
+/**
+ * Real backfill lookback per interval, in TRADING days.
+ *
+ * 1m stays live-buffer-only — barsStore's 500-bar cap is ~8 real hours,
+ * which already exceeds what a 1-minute chart usefully shows.
+ *
+ * ── Corrected against real data (2026-09-05) ──────────────────────────────
+ * The previous derivation here assumed a 6.5-hour regular session and
+ * concluded "7 days -> ~45 real 1h bars, short of 55". That was wrong:
+ * Massive's aggregates cover EXTENDED hours. Live-verified SPY, 2026-09-03
+ * to 2026-09-04 (2 trading days), first bar 08:00Z = 03:00 CT, last 23:59Z
+ * = 18:59 CT — about 16 real trading hours a day, not 6.5:
+ *
+ *   5m  -> 384 bars / 2 days = ~192 per trading day
+ *   15m -> 128 bars / 2 days =  ~64 per trading day
+ *   1h  ->  32 bars / 2 days =  ~16 per trading day
+ *
+ * So EMA55 (55 bars) is seeded with real margin everywhere:
+ *   5m  @ 7 days  -> ~1344 bars   (24x)
+ *   15m @ 7 days  ->  ~448 bars   (8x)
+ *   1h  @ 10 days ->  ~160 bars   (3x)
+ *
+ * 5m gets the same 7 days as 15m deliberately — matching 15m's real
+ * multi-day depth rather than shrinking to a number that merely clears the
+ * EMA55 floor, which one trading day alone would already do. 1h keeps 10
+ * days: more than the corrected math strictly requires, but it is the
+ * already-shipped, already-verified value and 3x margin on a 55-period EMA
+ * is not worth churning.
+ */
 const BACKFILL_LOOKBACK_TRADING_DAYS: Partial<Record<ChartInterval, number>> = {
+  '5m':  7,
   '15m': 7,
   '1h': 10,
 };
@@ -204,6 +227,33 @@ export interface HeliosChartProps {
   interval?: ChartInterval;
 }
 
+/**
+ * The overlay series exactly as drawn, handed back by _updatePriceData so
+ * the live legend reports the same numbers the lines show.
+ */
+interface OverlayData {
+  ema8:  LineData<Time>[];
+  ema21: LineData<Time>[];
+  ema55: LineData<Time>[];
+  vwap:  LineData<Time>[];
+}
+
+/** One rendered row of the live legend — the hovered or newest candle. */
+interface LegendSnapshot {
+  timeLabel: string;
+  open:  number;
+  high:  number;
+  low:   number;
+  close: number;
+  isUp:  boolean;
+  ema8:  number | null;
+  ema21: number | null;
+  ema55: number | null;
+  vwap:  number | null;
+  /** True when pinned to a hovered candle rather than tracking the newest. */
+  hovered: boolean;
+}
+
 // ── Panel height ratios ────────────────────────────────────────────────────────
 
 const PRICE_PANEL_RATIO = 0.60;
@@ -304,6 +354,68 @@ export const HeliosChart = React.memo(function HeliosChart({
   const onMarkerClickRef = useRef(onMarkerClick);
   useEffect(() => { onMarkerClickRef.current = onMarkerClick; }, [onMarkerClick]);
 
+  // ── Live legend state ───────────────────────────────────────────────────────
+  // Refs, not state, for the source data: the crosshair handler is registered
+  // once at chart-init and must always read the CURRENT bars/overlays without
+  // being torn down and re-subscribed on every data tick.
+
+  const [legend, setLegend] = useState<LegendSnapshot | null>(null);
+  const displayBarsRef = useRef<Bar[]>([]);
+  const overlayRef     = useRef<OverlayData>({ ema8: [], ema21: [], ema55: [], vwap: [] });
+  const hoverTimeRef   = useRef<number | null>(null);
+
+  const _refreshLegend = useCallback(() => {
+    const bars = displayBarsRef.current;
+    if (bars.length === 0) { setLegend(null); return; }
+
+    const hoverT = hoverTimeRef.current;
+    const bar = hoverT === null
+      ? bars[bars.length - 1]
+      : bars.find(b => Math.floor(b.tCT / 1000) === hoverT) ?? bars[bars.length - 1];
+
+    const at = Math.floor(bar.tCT / 1000);
+
+    // EMAs are computed ON displayBars, so their points land exactly on bar
+    // times. Exact match only, never nearest: an EMA genuinely has no value
+    // before its own seeding period (EMA55's first 54 bars), and borrowing a
+    // neighbouring bar's number there would be a quiet lie.
+    const emaAt = (series: LineData<Time>[]): number | null =>
+      series.find(p => p.time === at)?.value ?? null;
+
+    // VWAP is deliberately computed at a fixed 1-minute resolution (that is
+    // what makes it interval-invariant), so on a 15m/1h candle its points do
+    // NOT align with bar times. Take the last value inside the candle — VWAP
+    // as of the end of the bar being shown. An exact-match lookup here would
+    // report VWAP from the bar's opening minute, up to 59 minutes stale on a
+    // 1h chart.
+    const bucketSec = (INTERVAL_MINUTES[interval] * 60_000) / 1000;
+    let vwapVal: number | null = null;
+    for (const p of overlayRef.current.vwap) {
+      const t = p.time as number;
+      if (t >= at && t < at + bucketSec) vwapVal = p.value;
+      else if (t >= at + bucketSec) break;
+    }
+
+    setLegend({
+      timeLabel: formatChartTime(at as UTCTimestamp),
+      open:  bar.open,
+      high:  bar.high,
+      low:   bar.low,
+      close: bar.close,
+      isUp:  bar.close >= bar.open,
+      ema8:  emaAt(overlayRef.current.ema8),
+      ema21: emaAt(overlayRef.current.ema21),
+      ema55: emaAt(overlayRef.current.ema55),
+      vwap:  vwapVal,
+      hovered: hoverT !== null,
+    });
+  }, [interval]);
+
+  // Stable indirection so the once-registered crosshair handler always calls
+  // the current _refreshLegend without needing to re-subscribe.
+  const _refreshLegendRef = useRef(_refreshLegend);
+  useEffect(() => { _refreshLegendRef.current = _refreshLegend; }, [_refreshLegend]);
+
   // ── Chart initialisation ────────────────────────────────────────────────────
 
   useEffect(() => {
@@ -363,6 +475,20 @@ export const HeliosChart = React.memo(function HeliosChart({
       lastValueVisible:       true,
       crosshairMarkerVisible: false,
       title:                  'VWAP',
+    });
+
+    // ── Live legend wiring ───────────────────────────────────────────────────
+    // Hovering pins the legend to the crosshair's candle; moving off the
+    // chart (param.time undefined) releases it back to the newest bar, so
+    // the legend is never blank and never stale. The handler only records
+    // WHICH bar to show — the values themselves come from the same computed
+    // series the lines were drawn from (see _refreshLegend).
+    priceChart.subscribeCrosshairMove((param) => {
+      const t = typeof param.time === 'number' ? param.time : null;
+      if (t !== hoverTimeRef.current) {
+        hoverTimeRef.current = t;
+        _refreshLegendRef.current();
+      }
     });
 
     // ── CVD panel ────────────────────────────────────────────────────────────
@@ -451,21 +577,24 @@ export const HeliosChart = React.memo(function HeliosChart({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [ticker, height]);
 
-  // ── Real backfill for coarser intervals ─────────────────────────────────────
+  // ── Real backfill from Massive's native aggregates ──────────────────────────
   //
-  // 1m/5m never trigger this — the live barsStore buffer alone comfortably
-  // seeds them (see BACKFILL_LOOKBACK_TRADING_DAYS's real header comment).
-  // 15m/1h fetch real persisted history from bars_1m, sized per interval.
-  // Result<Bar[]> throughout — a fetch failure is distinguishable from a
-  // genuine empty range, same discipline as chartSignals.ts.
+  // 1m stays live-buffer-only. 5m/15m/1h fetch real, natively pre-aggregated
+  // bars at the selected interval (plus a fixed 1-minute series for VWAP) —
+  // see chartBarsBackfill.ts for the two-source split and the real seam
+  // handling. Result<T> throughout: a fetch failure stays distinguishable
+  // from a genuine empty range, same discipline as chartSignals.ts.
 
-  const [backfillResult, setBackfillResult] = useState<Result<Bar[]>>({ status: 'ready', data: [], asOf: 0 });
+  const EMPTY_BACKFILL: ChartBackfill = useMemo(() => ({ displayBars: [], minuteBars: [] }), []);
+  const [backfillResult, setBackfillResult] = useState<Result<ChartBackfill>>(
+    { status: 'ready', data: { displayBars: [], minuteBars: [] }, asOf: 0 },
+  );
 
   useEffect(() => {
     const lookbackDays = BACKFILL_LOOKBACK_TRADING_DAYS[interval];
     if (lookbackDays === undefined) {
-      // 1m/5m — no backfill needed, real live buffer suffices.
-      setBackfillResult({ status: 'ready', data: [], asOf: Date.now() });
+      // 1m — no backfill needed, real live buffer suffices.
+      setBackfillResult({ status: 'ready', data: EMPTY_BACKFILL, asOf: Date.now() });
       return;
     }
 
@@ -473,7 +602,7 @@ export const HeliosChart = React.memo(function HeliosChart({
     setBackfillResult({ status: 'loading' });
 
     const { fromMs, toMs } = computeChartBackfillWindow(Date.now(), lookbackDays);
-    fetchBackfilledBars(ticker, fromMs, toMs).then((result) => {
+    fetchChartBackfill(ticker, interval, fromMs, toMs).then((result) => {
       // Guard against a slow fetch for a previously-selected ticker/interval
       // landing after the user has already switched — same pattern as
       // ChartScreen's marker fetch (Home/index.tsx).
@@ -481,7 +610,7 @@ export const HeliosChart = React.memo(function HeliosChart({
     });
 
     return () => { cancelled = true; };
-  }, [ticker, interval]);
+  }, [ticker, interval, EMPTY_BACKFILL]);
 
   // ── Store data → chart ────────────────────────────────────────────────────────
 
@@ -494,19 +623,36 @@ export const HeliosChart = React.memo(function HeliosChart({
     const liveBars = barsResult.data;
     if (liveBars.length === 0) return;
 
-    // Real, finest-grain 1-minute series: backfilled history (when the
-    // selected interval needs it) merged with the live buffer's tail.
-    // VWAP is always computed from THIS, never from displayBars below —
-    // see _computeVwapSeries's own header for why.
-    const backfilled = backfillResult.status === 'ready' ? backfillResult.data : [];
-    const rawBars1m  = backfilled.length > 0 ? _mergeBarHistory(backfilled, liveBars) : liveBars;
+    const backfilled = backfillResult.status === 'ready'
+      ? backfillResult.data
+      : EMPTY_BACKFILL;
 
-    // Real candle/EMA series: aggregated to the selected interval. '1m' is
-    // a real, tested identity passthrough inside aggregateBars.
-    const displayBars = aggregateBars(rawBars1m, interval);
+    // Real, finest-grain 1-minute series: backfilled 1-minute history merged
+    // with the live buffer's tail. VWAP is always computed from THIS, never
+    // from displayBars below — a fixed 1-minute source is precisely what
+    // makes VWAP identical at every interval (see chartBarsBackfill.ts's
+    // header and _computeVwapSeries's own).
+    const rawBars1m = backfilled.minuteBars.length > 0
+      ? _mergeBarHistory(backfilled.minuteBars, liveBars)
+      : liveBars;
+
+    // Real candle/EMA series. The historical portion is Massive's own native
+    // aggregation at this interval; only the live edge — the currently-
+    // forming candle and any bucket that completed since the fetch — is
+    // rolled up client-side from the live 1-minute stream. '1m' is a real,
+    // tested identity passthrough inside aggregateBars.
+    const liveEdge = aggregateBars(liveBars, interval);
+    const displayBars = backfilled.displayBars.length > 0
+      ? _mergeDisplayBars(backfilled.displayBars, liveEdge)
+      : liveEdge;
     if (displayBars.length === 0) return;
 
-    _updatePriceData(displayBars, rawBars1m, candleSeriesRef.current, ema8Ref.current, ema21Ref.current, ema55Ref.current, vwapRef.current);
+    const overlays = _updatePriceData(displayBars, rawBars1m, candleSeriesRef.current, ema8Ref.current, ema21Ref.current, ema55Ref.current, vwapRef.current);
+
+    // Feed the live legend from the exact series just drawn.
+    displayBarsRef.current = displayBars;
+    overlayRef.current     = overlays;
+    _refreshLegend();
 
     // FIX 4: CVD line built from per-bar snapshots using current cvdStore state.
     // cvdStore holds callPct/putPct (not a ticks array). We project the current
@@ -521,7 +667,7 @@ export const HeliosChart = React.memo(function HeliosChart({
     if (marketResult.status === 'ready') {
       _applyGexLevelsInternal(candleSeriesRef.current, marketResult.data);
     }
-  }, [ticker, interval, backfillResult]);
+  }, [ticker, interval, backfillResult, EMPTY_BACKFILL, _refreshLegend]);
 
   useEffect(() => {
     updateChartData();
@@ -593,6 +739,55 @@ export const HeliosChart = React.memo(function HeliosChart({
         </div>
       )}
 
+      {/* Live legend — the hovered candle, or the newest one when not
+          hovering. Sits below the direction badges when those are present.
+          pointer-events-none so it never intercepts chart interaction. */}
+      {legend && (
+        <div
+          className="absolute left-3 z-20 pointer-events-none select-none"
+          style={{ top: direction ? 36 : 8 }}
+        >
+          <div
+            style={{
+              background:    'rgba(13, 15, 20, 0.78)',
+              border:        `1px solid ${C.border}`,
+              borderRadius:  '4px',
+              padding:       '5px 9px',
+              fontFamily:    "'JetBrains Mono', 'Fira Code', monospace",
+              fontSize:      '10.5px',
+              lineHeight:    1.6,
+              whiteSpace:    'nowrap',
+            }}
+          >
+            <div style={{ display: 'flex', gap: '10px', alignItems: 'baseline' }}>
+              <span style={{ color: C.text, fontWeight: 700, letterSpacing: '0.04em' }}>{ticker}</span>
+              <span style={{ color: C.textMuted }}>{interval}</span>
+              <span style={{ color: legend.hovered ? C.text : C.textMuted }}>{legend.timeLabel}</span>
+            </div>
+
+            <div style={{ display: 'flex', gap: '10px' }}>
+              {([['O', legend.open], ['H', legend.high], ['L', legend.low], ['C', legend.close]] as const).map(
+                ([label, value]) => (
+                  <LegendItem
+                    key={label}
+                    label={label}
+                    value={value}
+                    color={legend.isUp ? C.bullBody : C.bearBody}
+                  />
+                ),
+              )}
+            </div>
+
+            <div style={{ display: 'flex', gap: '10px' }}>
+              <LegendItem label="EMA8"  value={legend.ema8}  color={C.ema8}  />
+              <LegendItem label="EMA21" value={legend.ema21} color={C.ema21} />
+              <LegendItem label="EMA55" value={legend.ema55} color={C.ema55} />
+              <LegendItem label="VWAP"  value={legend.vwap}  color={C.vwap}  />
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Chart panels mounted here by useEffect */}
       <div ref={containerRef} className="w-full" />
 
@@ -642,8 +837,9 @@ function _updatePriceData(
   ema21Series: ISeriesApi<'Line'> | null,
   ema55Series: ISeriesApi<'Line'> | null,
   vwapSeries:  ISeriesApi<'Line'> | null,
-) {
-  if (!candles) return;
+): OverlayData {
+  const empty: OverlayData = { ema8: [], ema21: [], ema55: [], vwap: [] };
+  if (!candles) return empty;
 
   const candleData: CandlestickData<Time>[] = displayBars.map(b => ({
     time:  Math.floor(b.tCT / 1000) as UTCTimestamp,
@@ -655,11 +851,19 @@ function _updatePriceData(
   candles.setData(candleData);
 
   const closes = displayBars.map(b => b.close);
-  if (ema8Series)  _setEmaData(ema8Series,  displayBars, closes, 8);
-  if (ema21Series) _setEmaData(ema21Series, displayBars, closes, 21);
-  if (ema55Series) _setEmaData(ema55Series, displayBars, closes, 55);
+  const ema8   = _computeEmaSeries(displayBars, closes, 8);
+  const ema21  = _computeEmaSeries(displayBars, closes, 21);
+  const ema55  = _computeEmaSeries(displayBars, closes, 55);
+  const vwap   = _computeVwapSeries(rawBars1m);
 
-  if (vwapSeries) vwapSeries.setData(_computeVwapSeries(rawBars1m));
+  if (ema8Series)  ema8Series.setData(ema8);
+  if (ema21Series) ema21Series.setData(ema21);
+  if (ema55Series) ema55Series.setData(ema55);
+  if (vwapSeries)  vwapSeries.setData(vwap);
+
+  // Handed back so the live legend reads the exact values the lines were
+  // drawn from, rather than recomputing them and risking a disagreement.
+  return { ema8, ema21, ema55, vwap };
 }
 
 /**
@@ -678,12 +882,43 @@ export function _mergeBarHistory(historical: Bar[], live: Bar[]): Bar[] {
   return Array.from(byTUtc.values()).sort((a, b) => a.tUtc - b.tUtc);
 }
 
-function _setEmaData(
-  series: ISeriesApi<'Line'>,
-  bars:   Bar[],
-  closes: number[],
-  period: number,
-) {
+/**
+ * Join Massive's native historical aggregates to the client-rolled live edge.
+ *
+ * Two real differences from _mergeBarHistory above, both load-bearing:
+ *
+ * 1. Keyed on tCT, not tUtc. For an AGGREGATED bar, tUtc is the first
+ *    source bar's own timestamp (see _mergeGroup in aggregateBars.ts), so a
+ *    1h bucket rolled from a live buffer that happens to start at 14:03
+ *    carries tUtc 14:03 — while Massive's native bar for the same bucket
+ *    carries 14:00. Keyed on tUtc the two would not dedupe and the chart
+ *    would draw the same hour twice. tCT IS the exact bucket start in both
+ *    sources (verified live: Massive's bucket starts are exact multiples of
+ *    the interval in the CT frame as well as UTC), so it is the real bucket
+ *    identity.
+ *
+ * 2. HISTORICAL wins on overlap — the opposite of _mergeBarHistory's rule,
+ *    deliberately. The oldest bucket the live buffer can produce is usually
+ *    PARTIAL (the 500-bar buffer starts mid-bucket), so letting live win
+ *    would quietly replace a complete native bar with a truncated
+ *    reconstruction of the same period. Nothing fresh is lost by preferring
+ *    historical: the bucket that was still forming at fetch time was already
+ *    removed by dropFormingBucket, and any bucket that completed after the
+ *    fetch exists only in the live edge, so it is carried through untouched.
+ */
+export function _mergeDisplayBars(historical: Bar[], live: Bar[]): Bar[] {
+  const byBucket = new Map<number, Bar>();
+  for (const b of live) byBucket.set(b.tCT, b);
+  for (const b of historical) byBucket.set(b.tCT, b); // historical wins on overlap
+  return Array.from(byBucket.values()).sort((a, b) => a.tCT - b.tCT);
+}
+
+/**
+ * Real EMA series over `bars`. Pure and exported — the live legend needs the
+ * same computed values the line is drawn from, and recomputing them a second
+ * time in the legend would be a real chance for the two to disagree.
+ */
+export function _computeEmaSeries(bars: Bar[], closes: number[], period: number): LineData<Time>[] {
   const k    = 2 / (period + 1);
   let   ema  = 0;
   const data: LineData<Time>[] = [];
@@ -697,7 +932,7 @@ function _setEmaData(
     }
     data.push({ time: Math.floor(bars[i].tCT / 1000) as UTCTimestamp, value: ema });
   }
-  series.setData(data);
+  return data;
 }
 
 /**
@@ -1003,6 +1238,23 @@ function _buildLtwMarkers(markers: ChartSignalMarker[]): SeriesMarker<Time>[] {
 export function formatChartTime(timeAsSeconds: UTCTimestamp): string {
   const d = new Date(timeAsSeconds * 1000);
   return `${String(d.getUTCHours()).padStart(2, '0')}:${String(d.getUTCMinutes()).padStart(2, '0')}`;
+}
+
+/**
+ * One label/value pair in the live legend. A null value renders as an em
+ * dash, never as 0 or a blank — "this overlay has no value on this bar"
+ * (EMA55 before its seeding period, VWAP on a bar with no 1-minute data) is
+ * real information and must not read as a real number.
+ */
+function LegendItem({ label, value, color }: { label: string; value: number | null; color: string }) {
+  return (
+    <span>
+      <span style={{ color: C.textMuted }}>{label} </span>
+      <span style={{ color, fontWeight: 600 }}>
+        {value === null ? '—' : value.toFixed(2)}
+      </span>
+    </span>
+  );
 }
 
 function _playDirectionLabel(d: directionState.PlayDirection): string {

@@ -31,6 +31,37 @@ interface MassiveAggResult {
   t:  number;   // bar start time (UTC ms)
 }
 
+/**
+ * The `timespan` path segment of /v2/aggs/ticker/{t}/range/{multiplier}/{timespan}/...
+ *
+ * Note this is a PATH segment, not a query parameter — a real deviation from
+ * how generic Polygon-style documentation often presents it, verified against
+ * real responses rather than docs (2026-09-05).
+ *
+ * Real live verification of every granularity this codebase uses, against the
+ * real endpoint through the relay proxy (SPY, 2026-09-03 → 2026-09-04):
+ *
+ *   1/minute  -> 1698 bars, modal t-delta      60,000ms, 1698/1698 bucket-aligned
+ *   5/minute  ->  384 bars, modal t-delta     300,000ms,  384/384  bucket-aligned
+ *   15/minute ->  128 bars, modal t-delta     900,000ms,  128/128  bucket-aligned
+ *   1/hour    ->   32 bars, modal t-delta   3,600,000ms,   32/32   bucket-aligned
+ *
+ * Field shape is IDENTICAL at every granularity — {c,h,l,n,o,t,v,vw} — so
+ * massiveAggToBar below needs no per-granularity branching.
+ *
+ * ── A real trap, documented so it isn't rediscovered ──────────────────────
+ * `limit` bounds the number of BASE aggregates SCANNED, not the number of
+ * result bars returned. A first pass at verifying these granularities used
+ * limit=3 and got `{"status":"OK","resultsCount":0}` with no `results` key at
+ * all for 5m/15m/1h — the exact silent-zero shape this codebase keeps getting
+ * bitten by, and it looked like "this plan doesn't support multiplier>1."
+ * It isn't: 3 base minute-bars cannot fill even one 5-minute bucket, let
+ * alone an hour, so zero complete buckets came back. The same call with the
+ * real limit (50000) returns the full series above. Any future probe of this
+ * endpoint must size `limit` in BASE units, never in expected output bars.
+ */
+export type AggTimespan = 'minute' | 'hour' | 'day' | 'week' | 'month';
+
 interface MassiveAggResponse {
   status:     string;
   resultsCount: number;
@@ -364,6 +395,29 @@ export class MassiveRestClient {
     minutes  = 1,
   ): Promise<Bar[]> {
     return this._fetchBarRange(ticker, minutes, fromUtcMs, toUtcMs);
+  }
+
+  /**
+   * Fetch NATIVE pre-aggregated bars at an arbitrary multiplier/timespan —
+   * Massive does the rollup server-side, so the client never re-derives
+   * thousands of historical candles from raw 1-minute rows.
+   *
+   * Every (multiplier, timespan) pair this codebase uses is live-verified —
+   * see AggTimespan's own comment for the real per-granularity results and
+   * for the real `limit`-is-in-base-units trap.
+   *
+   * The returned bars carry the same real Bar shape as every other source
+   * (massiveAggToBar), including the DST-correct tCT pseudo-epoch, so they
+   * drop straight into the chart's existing series builders.
+   */
+  public async fetchAggregateBars(
+    ticker:     string,
+    multiplier: number,
+    timespan:   AggTimespan,
+    fromUtcMs:  number,
+    toUtcMs:    number,
+  ): Promise<Bar[]> {
+    return this._fetchBarRange(ticker, multiplier, fromUtcMs, toUtcMs, timespan);
   }
 
   // ── Trades (reconnect gap-fill only) ──────────────────────────────────────
@@ -744,13 +798,14 @@ export class MassiveRestClient {
     minutes:   number,
     fromUtcMs: number,
     toUtcMs:   number,
+    timespan:  AggTimespan = 'minute',
   ): Promise<Bar[]> {
     // Dates must be YYYY-MM-DD strings for the aggs endpoint
     const from = utcMsToDate(fromUtcMs);
     const to   = utcMsToDate(toUtcMs);
 
     const url = this._url(
-      `/v2/aggs/ticker/${encodeURIComponent(ticker)}/range/${minutes}/minute/${from}/${to}`,
+      `/v2/aggs/ticker/${encodeURIComponent(ticker)}/range/${minutes}/${timespan}/${from}/${to}`,
       { adjusted: 'true', sort: 'asc', limit: '50000' },
     );
 
