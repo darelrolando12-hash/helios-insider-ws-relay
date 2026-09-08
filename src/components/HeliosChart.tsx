@@ -67,6 +67,7 @@ import {
   createSeriesMarkers,
   CrosshairMode,
   LineStyle,
+  TickMarkType,
   CandlestickSeries,
   LineSeries,
   HistogramSeries,
@@ -126,6 +127,32 @@ const BACKFILL_LOOKBACK_TRADING_DAYS: Partial<Record<ChartInterval, number>> = {
   '15m': 7,
   '1h': 10,
 };
+
+/**
+ * Real bug found and fixed live (2026-09-08): switching ticker or interval
+ * calls candles.setData() with a completely different-sized array (e.g.
+ * 1m's live buffer can hold hundreds of dense bars; a fresh 1h fetch might
+ * hand back 174 sparser ones) on the SAME, already-mounted chart/series —
+ * HeliosChart never calls setData() for the first time on a fresh series,
+ * so Lightweight Charts never auto-fits. It instead keeps whatever visible
+ * LOGICAL range was left over from the previous dataset. Reproduced
+ * exactly live: NVDA 1h showed real, complete, correctly-backfilled data
+ * (verified via a diagnostic dump: 174 bars, 2026-08-24 through
+ * 2026-09-08) — but the chart rendered only the single rightmost candle,
+ * because the leftover visible range from the prior view didn't overlap
+ * the new, much-shorter series at all.
+ *
+ * INVESTIGATING (2026-09-08): a first fix attempt computed a manual
+ * setVisibleLogicalRange({from: total-100, to: total-1}) — this reads back
+ * as applied via getVisibleLogicalRange(), but getVisibleRange() (the
+ * TIME-based range for those same logical indices) reports real dates from
+ * 2026-08-24, not the expected recent window — i.e. logical index 173 of a
+ * freshly-set 174-bar array is NOT resolving to that array's own last
+ * element. Trying fitContent() instead to isolate whether this is a real
+ * misunderstanding of Lightweight Charts' logical-index semantics across
+ * successive setData() calls, before trying to hand-compute a "last N
+ * bars" window again.
+ */
 
 // ── Colour tokens ──────────────────────────────────────────────────────────────
 
@@ -294,11 +321,7 @@ function _makeChartOptions(
       borderColor:        C.border,
       timeVisible:        opts.showTimeAxis,
       secondsVisible:     false,
-      tickMarkFormatter: (timeAsSeconds: number) => {
-        // Always show HH:mm regardless of how many calendar days the data spans.
-        // Without this, Lightweight Charts defaults to repeating date strings for
-        // intraday data that crosses midnight (e.g. after backfill includes yesterday).
-        //
+      tickMarkFormatter: (timeAsSeconds: number, tickMarkType: TickMarkType) => {
         // `timeAsSeconds` is already a CT pseudo-UTC epoch (every series feeds
         // the chart Math.floor(b.tCT / 1000) — see _buildLtwMarkers and the
         // candle/EMA/VWAP series builders below). tCT is a real UTC epoch
@@ -309,7 +332,32 @@ function _makeChartOptions(
         // real bug, found 2026-09-04: an 08:30 CT bar rendered as if it were
         // several hours off. Read the pseudo-epoch directly, never re-convert.
         const d = new Date(timeAsSeconds * 1000);
-        return `${String(d.getUTCHours()).padStart(2, '0')}:${String(d.getUTCMinutes()).padStart(2, '0')}`;
+        const hhmm = `${String(d.getUTCHours()).padStart(2, '0')}:${String(d.getUTCMinutes()).padStart(2, '0')}`;
+
+        // Real gap found and fixed live (2026-09-08): with 5m/15m/1h now
+        // backfilling up to 10 real trading days, panning back genuinely
+        // crosses real day boundaries with zero visual indication — every
+        // tick showed only HH:mm, so a scrolled-back view of an entirely
+        // different calendar day looked identical to today except for the
+        // real price level itself, easy to mistake for "today, earlier."
+        // Real chart libraries (TradingView included) show a date exactly
+        // at day/month/year boundaries and time everywhere else — that is
+        // precisely what tickMarkType already tells us, computed by LWC's
+        // own real tick-placement logic. Using it here (rather than
+        // re-deriving day-boundary detection ourselves) means this can
+        // never disagree with where LWC actually puts the tick.
+        if (tickMarkType === TickMarkType.Time || tickMarkType === TickMarkType.TimeWithSeconds) {
+          return hhmm;
+        }
+        // Year/Month/DayOfMonth tick — a real day boundary. Show the CT
+        // calendar date (UTC methods on the pseudo-epoch, same rule as
+        // above) so a scrolled-back multi-day view is unambiguous, without
+        // reintroducing the original problem this formatter was written to
+        // avoid: a date repeated on EVERY tick. This only fires at the
+        // boundary itself.
+        const mm = String(d.getUTCMonth() + 1).padStart(2, '0');
+        const dd = String(d.getUTCDate()).padStart(2, '0');
+        return `${mm}/${dd}`;
       },
     },
     handleScroll:  true,
@@ -365,6 +413,27 @@ export const HeliosChart = React.memo(function HeliosChart({
   const hoverTimeRef   = useRef<number | null>(null);
 
   /**
+   * True whenever the visible time-scale range needs resetting to a sane
+   * default before the next successful render. Set on ticker/interval
+   * change, AND re-armed whenever backfilled.displayBars flips from empty
+   * to populated (see hadBackfillRef below) — a real, two-phase data
+   * arrival, not a one-time event: updateChartData first fires with only
+   * the small live-edge (before the interval's backfill fetch resolves),
+   * consuming a naive one-shot reset on that tiny dataset; when the real,
+   * much larger backfill then arrives, the leftover visible-range indices
+   * from the tiny dataset point at completely different bars (often the
+   * OLDEST ones) in the new, larger array. Reproduced exactly live: NVDA
+   * 1h first rendered ~9 live-only bars (reset fired, fine), then the real
+   * 174-bar backfill landed and the chart kept showing indices [0,8] —
+   * the first 9 bars of history (2026-08-24), not the recent ones — with
+   * a real but wrong-for-"now" VWAP value and garbage-looking early-August
+   * time labels next to a legend correctly reporting today's real time.
+   * See DEFAULT_VISIBLE_BARS below for the sizing.
+   */
+  const needsViewResetRef = useRef(true);
+  const hadBackfillRef    = useRef(false);
+
+  /**
    * Real bug found and fixed here (2026-09-08), live, on real data:
    * updateChartData returns early whenever the selected ticker's bars
    * aren't ready (loading, or genuinely stale — see barsStore's own
@@ -384,6 +453,8 @@ export const HeliosChart = React.memo(function HeliosChart({
     overlayRef.current     = { ema8: [], ema21: [], ema55: [], vwap: [] };
     hoverTimeRef.current   = null;
     setLegend(null);
+    needsViewResetRef.current = true;
+    hadBackfillRef.current    = false;
   }, [ticker, interval]);
 
   const _refreshLegend = useCallback(() => {
@@ -669,7 +740,45 @@ export const HeliosChart = React.memo(function HeliosChart({
       : liveEdge;
     if (displayBars.length === 0) return;
 
+    // Real bug found and fixed live (2026-09-08): switching ticker or
+    // interval hands the SAME long-lived series objects a completely
+    // different-sized/different-range array via setData(). Lightweight
+    // Charts' visible-range/logical-index state does not reset itself on
+    // that call — confirmed live: even an explicit setVisibleLogicalRange
+    // and fitContent() (deferred to the next animation frame, ruling out
+    // a timing issue) kept resolving against a STALE internal range (an
+    // 8.35-hour/500-logical-unit window matching the PREVIOUS dataset,
+    // not the new, verified-correct 174-bar/10-day one just supplied).
+    // Clearing each series to empty before handing it the real new data
+    // forces Lightweight Charts to treat this as a genuinely fresh
+    // dataset rather than a replacement of the previous one, which is
+    // what actually resolves it.
+    const hasBackfillNow = backfilled.displayBars.length > 0;
+    if (hasBackfillNow !== hadBackfillRef.current) {
+      // Backfill just arrived (or, on a re-subscribe, just went away) —
+      // the dataset size just changed in a way a one-shot flag can't
+      // catch. Re-arm the reset so the check below fires against the
+      // real, final-shape dataset instead of the transitional live-only
+      // one. See needsViewResetRef's own comment for why this two-phase
+      // arrival is real, not hypothetical.
+      needsViewResetRef.current = true;
+      hadBackfillRef.current    = hasBackfillNow;
+    }
+    if (needsViewResetRef.current) {
+      candleSeriesRef.current?.setData([]);
+      ema8Ref.current?.setData([]);
+      ema21Ref.current?.setData([]);
+      ema55Ref.current?.setData([]);
+      vwapRef.current?.setData([]);
+    }
+
     const overlays = _updatePriceData(displayBars, rawBars1m, candleSeriesRef.current, ema8Ref.current, ema21Ref.current, ema55Ref.current, vwapRef.current);
+
+    if (needsViewResetRef.current && priceChartRef.current) {
+      needsViewResetRef.current = false;
+      const chart = priceChartRef.current;
+      requestAnimationFrame(() => chart.timeScale().fitContent());
+    }
 
     // Feed the live legend from the exact series just drawn.
     displayBarsRef.current = displayBars;
