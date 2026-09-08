@@ -82,13 +82,49 @@ export function groupByTimeBucket<T>(
  */
 export function aggregateBars(bars: readonly Bar[], interval: ChartInterval): Bar[] {
   if (bars.length === 0) return [];
-  if (interval === '1m') return [...bars];
+  if (interval === '1m') return _assertAscending(bars, '1m passthrough');
 
   const bucketMs = INTERVAL_MINUTES[interval] * 60_000;
   const sorted = [...bars].sort((a, b) => a.tCT - b.tCT);
   const groups = groupByTimeBucket(sorted, bucketMs, (b) => b.tCT);
 
-  return groups.map((group) => _mergeGroup(group, bucketMs));
+  return _assertAscending(groups.map((group) => _mergeGroup(group, bucketMs)), interval);
+}
+
+/**
+ * Real defensive backstop (2026-09-08): a live crash — lightweight-charts'
+ * own "Assertion failed: data must be asc ordered by time" — was caught
+ * once, live, on real data, feeding HeliosChart's candle series. It could
+ * not be reproduced afterward despite real effort (822 real render cycles
+ * across multiple tickers/intervals with this exact check instrumented:
+ * zero violations found). The root cause is genuinely unidentified.
+ *
+ * Rather than ship nothing for a mechanism that isn't understood, this
+ * makes the failure mode itself impossible at the one real chokepoint
+ * every interval passes through before reaching the chart: drop any bar
+ * with a non-finite tCT, and drop any bar that doesn't strictly increase
+ * over the previous one, logging full detail either way. A genuinely
+ * correct upstream (the '1m' passthrough is barsStore's own already-
+ * ordered array; the aggregated path is freshly sorted immediately above)
+ * should make this a no-op every time — if it isn't, that log line is the
+ * next real lead, and the chart gets a safe array instead of a crash
+ * either way.
+ */
+function _assertAscending(bars: readonly Bar[], label: string): Bar[] {
+  const safe: Bar[] = [];
+  for (const bar of bars) {
+    if (!Number.isFinite(bar.tCT)) {
+      console.error(`[aggregateBars] ${label}: non-finite tCT, dropped:`, JSON.stringify(bar));
+      continue;
+    }
+    if (safe.length > 0 && bar.tCT <= safe[safe.length - 1].tCT) {
+      console.error(`[aggregateBars] ${label}: order violation, dropped — please report:`,
+        JSON.stringify({ prev: safe[safe.length - 1], dropped: bar }));
+      continue;
+    }
+    safe.push(bar);
+  }
+  return safe;
 }
 
 function _mergeGroup(group: Bar[], bucketMs: number): Bar {

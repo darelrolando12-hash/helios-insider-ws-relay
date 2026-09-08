@@ -364,6 +364,28 @@ export const HeliosChart = React.memo(function HeliosChart({
   const overlayRef     = useRef<OverlayData>({ ema8: [], ema21: [], ema55: [], vwap: [] });
   const hoverTimeRef   = useRef<number | null>(null);
 
+  /**
+   * Real bug found and fixed here (2026-09-08), live, on real data:
+   * updateChartData returns early whenever the selected ticker's bars
+   * aren't ready (loading, or genuinely stale — see barsStore's own
+   * staleness gate), which meant _refreshLegend() was simply never called
+   * for the new ticker. React state doesn't clear itself, so the legend
+   * kept rendering the PREVIOUS ticker's real numbers under the NEW
+   * ticker's name — reproduced exactly: switching to QQQ while QQQ was
+   * stale showed "QQQ" with SPY's real O/H/L/C/EMA/VWAP values, byte-
+   * identical to the prior SPY reading. A mislabeled real number is worse
+   * than a blank legend, so this clears the legend (and the refs it reads
+   * from) the instant ticker or interval changes, rather than trusting
+   * updateChartData to get around to it — it may never do so for a
+   * ticker whose feed is currently down.
+   */
+  useEffect(() => {
+    displayBarsRef.current = [];
+    overlayRef.current     = { ema8: [], ema21: [], ema55: [], vwap: [] };
+    hoverTimeRef.current   = null;
+    setLegend(null);
+  }, [ticker, interval]);
+
   const _refreshLegend = useCallback(() => {
     const bars = displayBarsRef.current;
     if (bars.length === 0) { setLegend(null); return; }
@@ -908,9 +930,46 @@ export function _mergeBarHistory(historical: Bar[], live: Bar[]): Bar[] {
  */
 export function _mergeDisplayBars(historical: Bar[], live: Bar[]): Bar[] {
   const byBucket = new Map<number, Bar>();
-  for (const b of live) byBucket.set(b.tCT, b);
-  for (const b of historical) byBucket.set(b.tCT, b); // historical wins on overlap
-  return Array.from(byBucket.values()).sort((a, b) => a.tCT - b.tCT);
+  for (const b of live) {
+    if (!Number.isFinite(b.tCT)) {
+      console.error('[HeliosChart] _mergeDisplayBars: non-finite tCT in LIVE bar, dropped:', JSON.stringify(b));
+      continue;
+    }
+    byBucket.set(b.tCT, b);
+  }
+  for (const b of historical) {
+    if (!Number.isFinite(b.tCT)) {
+      console.error('[HeliosChart] _mergeDisplayBars: non-finite tCT in HISTORICAL bar, dropped:', JSON.stringify(b));
+      continue;
+    }
+    byBucket.set(b.tCT, b); // historical wins on overlap
+  }
+  const result = Array.from(byBucket.values()).sort((a, b) => a.tCT - b.tCT);
+
+  // Real defensive backstop (2026-09-08): a live crash — "Assertion failed:
+  // data must be asc ordered by time" from lightweight-charts itself — was
+  // caught once, live, on real data, and could not be reproduced afterward
+  // despite real effort (822 real render cycles instrumented with the
+  // non-finite guard above plus a post-sort verification, across multiple
+  // tickers/intervals: zero violations). The root cause is genuinely
+  // unidentified. Rather than ship a fix for a mechanism that isn't
+  // understood, this makes the failure mode itself impossible: dedup by tCT
+  // plus a numeric sort on finite values is mathematically guaranteed
+  // ascending, so if this loop EVER finds a violation regardless, something
+  // is wrong in a way not yet imagined — log it loudly with full data (the
+  // next real lead, if it recurs) AND hand lightweight-charts a genuinely
+  // safe array either way, rather than let a real chart crash reach a real
+  // trader again.
+  const safe: Bar[] = [];
+  for (const bar of result) {
+    if (safe.length > 0 && bar.tCT <= safe[safe.length - 1].tCT) {
+      console.error('[HeliosChart] _mergeDisplayBars: order violation survived the sort — dropping bar, please report:',
+        JSON.stringify({ prev: safe[safe.length - 1], dropped: bar }));
+      continue;
+    }
+    safe.push(bar);
+  }
+  return safe;
 }
 
 /**
