@@ -239,6 +239,8 @@ Real gaps that are understood and deliberately not yet fixed. A gap recorded onl
 
 **Fixed 2026-09-11 — CVD totals ran from process boot, and the rebuild was partial.** Recorded here because the fix exposed faults the failure had hidden (see "Removing a redundancy…"). `cvdStore` totals were set once per ticker and only ever added to, so the 25-point factor scored days of stale flow on every non-deploy day; CVD is now the regular session only (8:30–15:00 CT), reset by the first trade of a new session, and reads `loading` — not yesterday — before it. The boot rebuild was rejected (HTTP 400) on every boot; fixing the request exposed a 25,000-trade cap (SPY's 2026-09-11 session was 470,114 trades), a timestamp cursor that skips ties (32,723 of those trades share their nanosecond with the one before), and a double count (it fetched to "now" through the live write path while live trades arrived over the relay's shared subscriptions). It now pages through Massive's `next_url` cursor, subscribes live first, and drops replayed trades at or after the first live one. Real run, SPY full session: 470,114 fetched, 10 pages, 40 s, 390 minutes. The browser copy (`src/stores/cvdStore.ts`) got the same session scope.
 
+**SPX and NDX can never be scored by the engine.** An index prints no trades, so its CVD is structurally absent — the 2026-09-11 rebuild reported both `absent` with 0 trades — and `confluenceEngine.ts` returns before scoring whenever CVD is not ready (`if (cvdResult.status !== 'ready') return;`). Two of the 23 feed tickers are therefore permanently silent, and "no SPX signals" looks exactly like a quiet day. Either their flow comes from a proxy (SPY/QQQ, or index-option flow) or they are dropped from scoring explicitly.
+
 **Browser CVD starts at page load.** The browser has no rebuild, so a tab opened at 11:00 CT scores (and, while browsers still write, signals on) CVD from 11:00. Same class as the boot bug above; ends when browser writes are switched off at Shadow Mode cutover.
 
 **Rebuilt CVD differs from live CVD in three measured ways.** Replayed trades classify by the uptick rule (no quotes in `/v3/trades`); fractional-share prints (`size: 0`, `decimal_size` carries the real amount — 10% of SPY's trades, 0.026% of its shares) are skipped by both paths; trades sharing the first live trade's millisecond but printed before it are in neither set. A relay upstream reconnect mid-session still loses the trades in the gap — the rebuild runs only at boot.
@@ -254,7 +256,7 @@ Real gaps that are understood and deliberately not yet fixed. A gap recorded onl
 3. `node relay/scripts/checkSyntax.mjs` on anything touched (NOT `node --check` for `.ts` — see rule 2), plus both type checks: `npm run typecheck` and `npx tsc -p relay/tsconfig.typecheck.json` (baseline: 4 pre-existing errors in contractDiscovery/paperExecution).
 4. Full test suite, per-file output.
 5. Show the real diff.
-6. Push. Railway auto-deploys.
-7. **Verify in the Railway logs that it actually did what was intended.**
+6. Push. Railway auto-deploys **from `main` only** (verified 2026-09-11 from `railway deployment list --json`: every deployment's `meta.branch` is `main`) — a branch push deploys nothing; fast-forward `main` to ship.
+7. **Verify in the Railway logs that it actually did what was intended.** `railway logs` returns only the last 500 lines, and ingestion logging fills that in minutes — use `railway logs --deployment --filter "<text>" --lines 200` to find boot-time lines.
 
 **Never deploy during market hours** unless the fix is more urgent than the interruption. Deploys drop the upstream connections and reset in-memory state.
