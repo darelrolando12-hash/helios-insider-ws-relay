@@ -216,7 +216,8 @@ function _neutralGexStub(ticker: string): MarketContext {
     ticker,
     gexRegime:  'neutral',
     walls:      { callWall: 0, putWall: 0 },
-    flipLevel:  0,
+    flipLevel:  null, // absent — a stub has no chain, so no flip (never a stand-in 0)
+    spotPrice:  null,
     upTarget:   0,
     downTarget: 0,
     netGex:     0,

@@ -4,10 +4,15 @@ import {
   perStrikeCallGex,
   perStrikePutGex,
   classifyRegime,
-  computeFlipLevel,
   computeMaxPain,
   type StrikeData,
 } from '../engines/gexEngine.ts';
+import {
+  bsGamma,
+  computeZeroGamma,
+  expiryCloseUtc,
+  type GammaContract,
+} from '../lib/zeroGamma.ts';
 
 // NEUTRAL_GEX_EPSILON is 50_000_000 in gexEngine.ts — not exported, hardcoded
 // here with the same real value so assertions stay self-contained.
@@ -56,26 +61,86 @@ describe('classifyRegime', () => {
   });
 });
 
-describe('computeFlipLevel', () => {
-  it('interpolates a sane flip level between two strikes when cumulative GEX crosses zero', () => {
-    // Hand-computed: strikes at 100 (net -40), 110 (net +20), 120 (net +75)
-    // cumulative: -40 -> -20 -> +55, sign flips between strike 110 and 120
-    // t = 20 / (20 + 55) = 4/15, flip = 110 + (4/15)*10 = 112.6666...
-    const strikeGex = [
-      { strike: 100, callGex: 10, putGex: 50 },
-      { strike: 110, callGex: 30, putGex: 10 },
-      { strike: 120, callGex: 80, putGex: 5 },
-    ];
-    expect(computeFlipLevel(strikeGex, 110)).toBeCloseTo(112.6667, 3);
+// ── Zero gamma (the rebuilt flip level) ─────────────────────────────────────
+//
+// The old computeFlipLevel walked cumulative per-strike GEX up from the
+// lowest strike and returned SPOT when it found no crossing; its own test
+// asserted that fallback ("returns spot price when no sign change exists").
+// On real chains it produced META $5.00 at a $641 price. See lib/zeroGamma.ts.
+
+describe('bsGamma', () => {
+  it('matches the closed form at the money', () => {
+    // S = K = 100, T = 1, σ = 0.2, r = q = 0:
+    // d1 = σ²T/2 / (σ√T) = 0.1,  φ(0.1) = 0.396953,  Γ = φ(d1) / (S σ √T)
+    expect(bsGamma(100, 100, 1, 0.2)).toBeCloseTo(0.396953 / 20, 6);
+  });
+});
+
+describe('expiryCloseUtc', () => {
+  it('is 3:00 PM CT — 20:00Z under CDT, 21:00Z under CST', () => {
+    expect(new Date(expiryCloseUtc('2026-09-18')).toISOString()).toBe('2026-09-18T20:00:00.000Z');
+    expect(new Date(expiryCloseUtc('2026-12-18')).toISOString()).toBe('2026-12-18T21:00:00.000Z');
+  });
+});
+
+describe('computeZeroGamma', () => {
+  const EXPIRY = '2026-10-16';
+  const IV = 0.2;
+  const T_DAYS = 30;
+  const NOW = expiryCloseUtc(EXPIRY) - T_DAYS * 86_400_000;
+  // Calls at 110 and puts at 90, equal OI and IV. Total GEX ∝ Γ(S,110) −
+  // Γ(S,90), zero where |d1| is equal for both strikes:
+  //   S* = √(110·90) · exp(−σ²T/2) = 99.4987 · 0.998357 = 99.3353
+  const symmetric: GammaContract[] = [
+    { strike: 110, expiry: EXPIRY, iv: IV, openInterest: 1_000, type: 'call' },
+    { strike: 90,  expiry: EXPIRY, iv: IV, openInterest: 1_000, type: 'put'  },
+  ];
+
+  it('finds the analytic crossing of a symmetric book', () => {
+    const r = computeZeroGamma(symmetric, 100, NOW);
+    expect(r.dataQuality).toBe('real');
+    expect(r.level!).toBeCloseTo(99.3353, 1);
+    expect(r.crossings).toHaveLength(1);
   });
 
-  it('returns spot price when no sign change exists in the chain', () => {
-    const strikeGex = [
-      { strike: 100, callGex: 10, putGex: 1 },
-      { strike: 110, callGex: 20, putGex: 1 },
-      { strike: 120, callGex: 30, putGex: 1 },
+  it('is not moved by a far-from-money artifact row (the META $5 failure)', () => {
+    // A deep-ITM $5 call carried a negative Massive gamma and set the old
+    // walk's cumulative sum negative. Re-pricing from IV gives it ~0 gamma
+    // near spot, so the level stays where the book says it is.
+    const withArtifact: GammaContract[] = [
+      ...symmetric,
+      { strike: 5, expiry: EXPIRY, iv: 1.5, openInterest: 10, type: 'call' },
     ];
-    expect(computeFlipLevel(strikeGex, 505)).toBe(505);
+    const r = computeZeroGamma(withArtifact, 100, NOW);
+    expect(r.level!).toBeCloseTo(99.3353, 1);
+  });
+
+  it('returns ABSENT — never spot — when the total never crosses zero', () => {
+    const callsOnly = symmetric.filter((c) => c.type === 'call');
+    const r = computeZeroGamma(callsOnly, 100, NOW);
+    expect(r.level).toBeNull();
+    expect(r.dataQuality).toBe('absent');
+    expect(r.reason).toMatch(/no zero crossing/);
+  });
+
+  it('returns ABSENT when too little open interest carries a usable IV', () => {
+    const mostlyNoIv: GammaContract[] = [
+      ...symmetric,
+      { strike: 100, expiry: EXPIRY, iv: 0, openInterest: 50_000, type: 'call' },
+    ];
+    const r = computeZeroGamma(mostlyNoIv, 100, NOW);
+    expect(r.level).toBeNull();
+    expect(r.reason).toMatch(/open interest has a usable IV/);
+  });
+
+  it('ignores contracts that have already expired', () => {
+    const withExpired: GammaContract[] = [
+      ...symmetric,
+      { strike: 100, expiry: '2026-09-01', iv: IV, openInterest: 1_000_000, type: 'call' },
+    ];
+    const r = computeZeroGamma(withExpired, 100, NOW);
+    expect(r.level!).toBeCloseTo(99.3353, 1);
+    expect(r.oiCoverage).toBe(1);
   });
 });
 
@@ -134,15 +199,51 @@ describe('computeGex — full integration against hand-computed values', () => {
     expect(result!.downTarget).toBe(480); // no second strike below -> falls back to wall
   });
 
+  it('reports a missing wall as ABSENT — never the spot price', () => {
+    // Nothing above spot: the old engine returned `spotPrice` as the call
+    // wall, which put price "within 0.3% of a wall" — a guaranteed BREAKOUT.
+    const belowOnly = strikes.filter((s) => s.strike < spot);
+    const result = computeGex('TEST', spot, belowOnly, 123456);
+    expect(result!.wallAbove).toBeNull();
+    expect(result!.upTarget).toBeNull();
+    expect(result!.wallBelow).toBe(480);
+  });
+
+  it('a strike with no gamma exposure is not a wall', () => {
+    const noGamma: StrikeData[] = [{ strike: 520, callOI: 600, putOI: 0, callGamma: 0, putGamma: 0 }, ...strikes.filter((s) => s.strike < spot)];
+    expect(computeGex('TEST', spot, noGamma, 123456)!.wallAbove).toBeNull();
+  });
+
   it('computes put/call OI ratio correctly', () => {
     const result = computeGex('TEST', spot, strikes, 123456);
     // totalCallOI = 1000, totalPutOI = 900 -> pcRatio = 0.9
     expect(result!.pcRatio).toBeCloseTo(0.9, 5);
   });
 
-  it('falls back flipLevel to spot when cumulative GEX never crosses zero', () => {
+  it('reports the flip as ABSENT — never spot — when rows carry no expiry or IV', () => {
+    // These hand-built rows have OI and gamma only (the backtestEngine shape),
+    // so nothing can be re-priced. The old engine returned `spot` here.
     const result = computeGex('TEST', spot, strikes, 123456);
-    // cumulative stays negative across all 3 strikes in this dataset -> no crossing
-    expect(result!.flipLevel).toBe(spot);
+    expect(result!.flipLevel).toBeNull();
+    expect(result!.flipAbsentReason).toMatch(/no open interest/);
+  });
+
+  it('reports the flip as ABSENT when the caller says the whole chain is not loaded', () => {
+    const result = computeGex('TEST', spot, strikes, 123456, null);
+    expect(result!.flipLevel).toBeNull();
+    expect(result!.flipAbsentReason).toBe('full option chain not loaded yet');
+  });
+
+  it('computes the flip from flipStrikes, not from the (possibly truncated) strikes', () => {
+    const expiry = '2026-10-16';
+    const now = expiryCloseUtc(expiry) - 30 * 86_400_000;
+    const full: StrikeData[] = [
+      { strike: 110, expiry, callOI: 1_000, putOI: 0, callGamma: 0, putGamma: 0, callIV: 0.2 },
+      { strike: 90,  expiry, callOI: 0, putOI: 1_000, callGamma: 0, putGamma: 0, putIV: 0.2 },
+    ];
+    const result = computeGex('TEST', 100, strikes, now, full);
+    expect(result!.flipLevel!).toBeCloseTo(99.3353, 1);
+    // Walls still come from `strikes`, untouched.
+    expect(result!.wallAbove).toBe(520);
   });
 });

@@ -24,6 +24,8 @@ import { FEED_TICKERS } from './state/directionState.ts';
 import { msUntilQuietWindow } from './lib/time.ts';
 
 import * as barsStore        from './stores/barsStore.ts';
+import * as marketStore      from './stores/marketStore.ts';
+import * as cvdStore         from './stores/cvdStore.ts';
 import * as luldStore        from './stores/luldStore.ts';
 import * as newsStore        from './stores/newsStore.ts';
 import * as cvdEngine        from './engines/cvdEngine.ts';
@@ -67,6 +69,55 @@ import { rebuildAll } from './session/cvdRebuild.ts';
  */
 export const __bus = massiveBus;
 
+/**
+ * The gamma flip for every ticker, computed ONCE here and read by every
+ * browser through relay/index.js's GET /engine/gex — instead of each open
+ * browser fetching whole option chains to compute the same number itself
+ * (~700 REST requests an hour per browser; see chainAggregator's full-chain
+ * cache, which now runs only in this process).
+ *
+ * Read-only and write-free, so it is served in shadow mode too. asOf is the
+ * chain snapshot's time: consumers judge freshness, this never hides age.
+ */
+export interface GexSnapshotRow {
+  ticker:           string;
+  flipLevel:        number | null;
+  flipAbsentReason: string | null;
+  gexRegime:        string;
+  asOf:             number;
+}
+export function gexSnapshot(): { method: string; generatedAt: number; tickers: GexSnapshotRow[] } {
+  return {
+    method: 'zero-gamma spot-grid reprice (engine/lib/zeroGamma.ts)',
+    generatedAt: Date.now(),
+    tickers: marketStore.getAllContextsRaw().map((c) => ({
+      ticker:           c.ticker,
+      flipLevel:        c.flipLevel,
+      flipAbsentReason: c.flipAbsentReason ?? null,
+      gexRegime:        c.gexRegime,
+      asOf:             c.asOf,
+    })),
+  };
+}
+
+/**
+ * The per-minute delta series for one ticker (cvdStore.getDeltaBars), for
+ * GET /engine/delta?ticker=SPY. Computed from classified trades in this
+ * process — the one place that holds the trade stream from the session open.
+ * `liveFromUtc` is where rebuilt (uptick-rule) minutes end and live
+ * (quote-classified) minutes begin; `coverage` says whether the rebuild
+ * reached the live feed — a partial session must be able to say so.
+ */
+export function deltaSnapshot(ticker: string): {
+  ticker: string; bootedAt: number | null; liveFromUtc: number | null;
+  coverage: cvdStore.SessionCoverage | null; bars: cvdStore.DeltaBar[];
+} {
+  return {
+    ticker, bootedAt: _bootedAt, liveFromUtc: cvdStore.getLiveFromUtc(ticker),
+    coverage: cvdStore.getCoverage(ticker), bars: cvdStore.getDeltaBars(ticker),
+  };
+}
+
 // Context tickers subscribed at boot so they are never stale waiting for a
 // cockpit to be opened (the browser had the same list for the same reason).
 const CONTEXT_TICKERS = ['TLT', 'HYG', 'I:VIX'] as const;
@@ -107,6 +158,8 @@ function everyInterval(fn: () => void, ms: number) {
 // ── Boot ─────────────────────────────────────────────────────────────────────
 
 let _booted = false;
+/** UTC ms the engine started. */
+let _bootedAt: number | null = null;
 
 /**
  * Start the engine.
@@ -130,6 +183,7 @@ export async function startEngine(
     return;
   }
   _booted = true;
+  _bootedAt = Date.now();
 
   // ── Phase 0: validate config, announce mode ───────────────────────────────
   logModeBanner();
@@ -157,19 +211,13 @@ export async function startEngine(
   chainAggregator.initChainAggregator(rest);
   cvdEngine.init();   // registers Q and T handlers — must precede subscriptions
 
-  // ── Phase 3b: rebuild CVD from the session open ───────────────────────────
-  // Runs BEFORE live subscriptions so the cumulative series starts from the
-  // open rather than from this restart. A rebuild that finds nothing reports
-  // 'absent' — never a ready CVD of zero.
-  try {
-    await rebuildAll(rest, FEED_TICKERS);
-  } catch (err) {
-    console.error('[engine] CVD rebuild failed — continuing with live ticks only. ' +
-      'CVD is PARTIAL for this session and must not be read as cumulative-from-open:', err);
-  }
-  if (_shuttingDown) return;
-
   // ── Phase 4: subscribe the feed ───────────────────────────────────────────
+  // Live FIRST, then the rebuild (4b). The live feed is continuous from its
+  // first trade; the rebuild fills [open, first live trade) and cvdStore drops
+  // any replayed trade the live feed already counted. The old order (rebuild,
+  // then subscribe) left a gap between each ticker's rebuild and its live
+  // feed, and — because the relay's shared subscriptions deliver trades
+  // regardless — counted the rebuild window twice.
   for (const ticker of FEED_TICKERS) {
     barsStore.subscribeTicker(ticker);
     cvdEngine.subscribeStock(ticker);
@@ -180,6 +228,18 @@ export async function startEngine(
     cvdEngine.subscribeStock(ticker);
   }
   console.log(`[engine] Subscribed ${FEED_TICKERS.length} feed + ${CONTEXT_TICKERS.length} context ticker(s).`);
+
+  // ── Phase 4b: rebuild CVD from the session open ───────────────────────────
+  // Scoring (Phase 5) waits for it, so nothing scores a CVD that starts at
+  // this restart. A rebuild that finds nothing reports 'absent' — never a
+  // ready CVD of zero; one that stops short reports 'partial'.
+  try {
+    await rebuildAll(rest, FEED_TICKERS);
+  } catch (err) {
+    console.error('[engine] CVD rebuild failed — continuing with live ticks only. ' +
+      'CVD is PARTIAL for this session and must not be read as cumulative-from-open:', err);
+  }
+  if (_shuttingDown) return;
 
   // ── Phase 5: scoring engines ──────────────────────────────────────────────
   confluenceEngine.init();

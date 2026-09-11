@@ -7,7 +7,11 @@ import {
   scoreConfluence,
   resolveSignalType,
   computeEma,
+  scoreBand,
+  scoreBandWithHysteresis,
+  BAND_HYSTERESIS_POINTS,
 } from '../engines/confluenceEngine.ts';
+import type { ScoreBand } from '../engines/confluenceEngine.ts';
 import type { CvdState } from '../stores/cvdStore.ts';
 import type { MarketContext } from '../stores/marketStore.ts';
 import type { CatalystTags } from '../engines/catalystGate.ts';
@@ -67,6 +71,69 @@ function makeBar(close: number): Bar {
 }
 
 // ── scoreCvd ────────────────────────────────────────────────────────────────────
+
+// ── Band latch hysteresis ────────────────────────────────────────────────────
+//
+// Reproduces the real 2026-09-10 failure: a score oscillating a point either
+// side of a threshold, re-scored many times per second, used to emit on every
+// crossing. `emissions` replays the engine's own latch loop so these assert on
+// behaviour (how many signals fire), not just on the helper's return value.
+
+function emissions(scores: number[], bandFn: (s: number, cur: ScoreBand) => ScoreBand): ScoreBand[] {
+  let latched: ScoreBand = 'none';
+  const fired: ScoreBand[] = [];
+  for (const s of scores) {
+    const band = bandFn(s, latched);
+    if (band !== latched) {
+      latched = band;
+      if (band !== 'none') fired.push(band);
+    }
+  }
+  return fired;
+}
+
+describe('scoreBandWithHysteresis — the duplicate-signal fix', () => {
+  // 54↔56 around the 55 EXIT floor, 20 times: the exact shape behind 426
+  // EXIT rows vs 3 ENTERs in the last real session.
+  const hovering = Array.from({ length: 40 }, (_, i) => (i % 2 === 0 ? 56 : 54));
+
+  it('without hysteresis, a score hovering at the EXIT floor fires on every crossing', () => {
+    expect(emissions(hovering, (s) => scoreBand(s)).length).toBe(20);
+  });
+
+  it('with hysteresis, the same hovering score fires exactly once', () => {
+    expect(emissions(hovering, scoreBandWithHysteresis)).toEqual(['EXIT']);
+  });
+
+  it('releases the latch once the score is clearly below the floor, then can fire again', () => {
+    // enter EXIT, drop decisively below 55 - 3, come back: two genuine crossings
+    const scores = [56, 54, 53, 51, 50, 56];
+    expect(emissions(scores, scoreBandWithHysteresis)).toEqual(['EXIT', 'EXIT']);
+  });
+
+  it('does not delay rising transitions — upward moves are immediate', () => {
+    expect(scoreBandWithHysteresis(55, 'none')).toBe('EXIT');
+    expect(scoreBandWithHysteresis(65, 'EXIT')).toBe('REVERSAL');
+    expect(scoreBandWithHysteresis(75, 'REVERSAL')).toBe('ENTER_BREAKOUT');
+  });
+
+  it('holds a band within the margin below its floor, and releases just past it', () => {
+    expect(scoreBandWithHysteresis(52, 'EXIT')).toBe('EXIT');   // 55 - 3 = 52: held
+    expect(scoreBandWithHysteresis(51.9, 'EXIT')).toBe('none'); // past the margin
+    expect(scoreBandWithHysteresis(72, 'ENTER_BREAKOUT')).toBe('ENTER_BREAKOUT');
+    expect(scoreBandWithHysteresis(71.9, 'ENTER_BREAKOUT')).toBe('REVERSAL');
+  });
+
+  it('cannot create a signal the plain thresholds would not — it only suppresses repeats', () => {
+    // A monotonic climb crosses each threshold once either way.
+    const climb = [40, 50, 55, 60, 65, 70, 75, 80];
+    expect(emissions(climb, scoreBandWithHysteresis)).toEqual(emissions(climb, (s) => scoreBand(s)));
+  });
+
+  it('uses a 3-point margin', () => {
+    expect(BAND_HYSTERESIS_POINTS).toBe(3);
+  });
+});
 
 describe('scoreCvd', () => {
   it('returns 25 pts for strong call-side conviction (>70%)', () => {
@@ -130,6 +197,19 @@ describe('scoreGex', () => {
     const ctx = makeCtx({ flipLevel: 100, gexRegime: 'negative' });
     // 0.6% away — outside band
     expect(scoreGex(ctx, 100.6).points).toBe(15);
+  });
+
+  // An absent flip (null — lib/zeroGamma) blocks the flip bonus; the real
+  // regime still scores. The old engine put the SPOT PRICE in flipLevel when
+  // no crossing existed, which made the 20-point bonus unconditional.
+  it('absent flip: no flip bonus, regime still scores (negative → 15)', () => {
+    const ctx = makeCtx({ flipLevel: null, gexRegime: 'negative' });
+    expect(scoreGex(ctx, 100).points).toBe(15);
+  });
+
+  it('absent flip: no flip bonus, regime still scores (positive → 10, neutral → 5)', () => {
+    expect(scoreGex(makeCtx({ flipLevel: null, gexRegime: 'positive' }), 100).points).toBe(10);
+    expect(scoreGex(makeCtx({ flipLevel: null, gexRegime: 'neutral' }), 100).points).toBe(5);
   });
 });
 
@@ -355,6 +435,20 @@ describe('resolveSignalType', () => {
   it('returns EXIT for a score >= 75 when isBullish is false (not bullish CVD, not favorable GEX/price)', () => {
     const cvd = makeCvd({ classification: 'bearish' });
     const ctx = makeCtx({ gexRegime: 'positive', flipLevel: currentPrice + 1000, walls: { callWall: 999, putWall: 1 } });
+    expect(resolveSignalType(80, cvd, ctx, currentPrice)).toBe('EXIT');
+  });
+
+  it('positive GEX + bullish CVD + price ABOVE a real flip → ENTER', () => {
+    const cvd = makeCvd({ classification: 'bullish' });
+    const ctx = makeCtx({ gexRegime: 'positive', flipLevel: currentPrice - 5, walls: { callWall: 999, putWall: 1 } });
+    expect(resolveSignalType(80, cvd, ctx, currentPrice)).toBe('ENTER');
+  });
+
+  it('positive GEX + bullish CVD + ABSENT flip → not bullish (EXIT): absent blocks', () => {
+    // With the old flip ($5 on META) "price > flip" was true everywhere, so
+    // bullish CVD alone decided direction. An absent flip must not do that.
+    const cvd = makeCvd({ classification: 'bullish' });
+    const ctx = makeCtx({ gexRegime: 'positive', flipLevel: null, walls: { callWall: 999, putWall: 1 } });
     expect(resolveSignalType(80, cvd, ctx, currentPrice)).toBe('EXIT');
   });
 

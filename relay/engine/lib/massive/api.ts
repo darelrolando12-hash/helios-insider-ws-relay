@@ -50,7 +50,8 @@ interface MassiveTradeResult {
 
 interface MassiveTradeResponse {
   status:  string;
-  results: MassiveTradeResult[];
+  /** Raw wire rows — see fetchTradesPage for the real field names. */
+  results: { price: number; size: number; sip_timestamp: number; conditions?: number[]; exchange?: number }[];
   next_url?: string;
 }
 
@@ -413,31 +414,54 @@ export class MassiveRestClient {
     return this._fetchBarRange(ticker, minutes, fromUtcMs, toUtcMs);
   }
 
-  // ── Trades (reconnect gap-fill only) ──────────────────────────────────────
+  // ── Trades (session CVD rebuild only) ─────────────────────────────────────
 
   /**
-   * Fetch raw trades for `ticker` after `afterUtcMs`.
+   * One page of raw trades for `ticker` in [fromUtcMs, toUtcMs), or the page
+   * after a previous page's `next` cursor.
    *
-   * Confirmed available on-plan. Used exclusively for reconnect gap-fill of
-   * trade history — NOT a live CVD source. Live CVD comes from the WS T/Q
-   * channels only. Do not call this for any other purpose.
+   * Used only by session/cvdRebuild — NOT a live CVD source. Live CVD comes
+   * from the WS T/Q channels only.
    *
-   * @param ticker     Stock or options ticker
-   * @param afterUtcMs Only return trades with timestamp > this value
-   * @param limit      Max results (default: 1000)
+   * Wire format, captured 2026-09-11 from /v3/trades/SPY:
+   *   filter  `timestamp.gte` / `timestamp.lt` in NANOSECONDS, built as
+   *           strings (ms × 1e6 ≈ 1.8e18 is past Number's exact range). The
+   *           original `timestamp=gt.<ms>` was rejected — HTTP 400 on every
+   *           ticker on every boot (Railway logs).
+   *   rows    `sip_timestamp` in NANOSECONDS; there is no `timestamp` field.
+   *   limit   50,000 per page is accepted. SPY's whole regular session on
+   *           2026-09-11 was 470,114 trades: 10 pages, 32 s.
+   *   paging  Massive's `next_url` cursor (a position anchor `ap=` plus the
+   *           last timestamp) — exact. A timestamp cursor is not: 32,723 of
+   *           that session's trades share their nanosecond with the trade
+   *           before them, so any `timestamp.gt` cursor skips trades at page
+   *           edges; and JSON.parse rounds a nanosecond value (…486 → …488),
+   *           so a cursor built from a parsed row can't even name the edge.
+   *           Checked at a real page boundary: 0 missing, 0 duplicated.
    */
-  public async fetchTradesSince(
-    ticker:    string,
-    afterUtcMs: number,
-    limit      = 1000,
-  ): Promise<MassiveTradeResult[]> {
-    const url = this._url(
-      `/v3/trades/${encodeURIComponent(ticker)}`,
-      { timestamp: `gt.${afterUtcMs}`, limit: String(limit), sort: 'timestamp' },
-    );
+  public async fetchTradesPage(
+    ticker: string,
+    range:  { fromUtcMs: number; toUtcMs: number } | { cursor: string },
+    limit = 50_000,
+  ): Promise<{ trades: MassiveTradeResult[]; next: string | null }> {
+    const url = 'cursor' in range
+      ? range.cursor
+      : this._url(`/v3/trades/${encodeURIComponent(ticker)}`, {
+          'timestamp.gte': `${Math.floor(range.fromUtcMs)}000000`,
+          'timestamp.lt':  `${Math.floor(range.toUtcMs)}000000`,
+          limit: String(limit), sort: 'timestamp', order: 'asc',
+        });
 
     const json = await this._get<MassiveTradeResponse>(url);
-    return json.results ?? [];
+    const trades: MassiveTradeResult[] = [];
+    for (const r of json.results ?? []) {
+      const ms = Math.floor(Number(r.sip_timestamp) / 1e6);
+      // Plausibility, not just type — a unit mix-up yields a valid-looking
+      // number in the wrong century (CLAUDE.md, the LULD nanosecond lesson).
+      if (!(ms > 946_684_800_000 && ms < 4_102_444_800_000)) continue; // 2000 … 2100
+      trades.push({ price: r.price, size: r.size, timestamp: ms, conditions: r.conditions, exchange: r.exchange });
+    }
+    return { trades, next: json.next_url ? this._relayUrl(json.next_url) : null };
   }
 
   // ── Options snapshot ──────────────────────────────────────────────────────

@@ -24,6 +24,7 @@
 import * as marketStore from '../stores/marketStore.ts';
 import type { MarketContext }  from '../stores/marketStore.ts';
 import type { GexRegime, ChainRow } from '../stores/types.ts';
+import { computeZeroGamma, type GammaContract } from '../lib/zeroGamma.ts';
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -64,17 +65,26 @@ export interface StrikeData {
   putVega?:   number;
 }
 
+/** A flip level computed somewhere else — null level means absent, with a reason. */
+export interface ExternalFlip {
+  level:  number | null;
+  reason: string | null;
+}
+
 export interface GexResult {
   ticker:     string;
   spotPrice:  number;
   netGex:     number;
   callGex:    number;   // total positive GEX from calls
   putGex:     number;   // total negative GEX from puts (stored as positive magnitude)
-  flipLevel:  number;
-  wallAbove:  number;
-  wallBelow:  number;
-  upTarget:   number;
-  downTarget: number;
+  /** Gamma flip, or null when absent — see lib/zeroGamma.ts. Never spot. */
+  flipLevel:  number | null;
+  /** Why the flip is absent; null when it is real. */
+  flipAbsentReason: string | null;
+  wallAbove:  number | null;   // null = absent, never spot
+  wallBelow:  number | null;
+  upTarget:   number | null;
+  downTarget: number | null;
   pcRatio:    number;
   regime:     GexRegime;
   asOf:       number;
@@ -90,12 +100,21 @@ export interface GexResult {
  * @param spotPrice  Current underlying price
  * @param strikes    Per-strike data array from the chain snapshot
  * @param asOf       UTC ms of the snapshot
+ * @param flipSource Where the flip level comes from:
+ *                     StrikeData[]  — rows to compute it from: the whole chain
+ *                                     (the relay's full-chain cache). Default: `strikes`.
+ *                     ExternalFlip  — a flip computed elsewhere (browsers read the
+ *                                     relay's, via lib/serverGex, rather than each
+ *                                     fetching whole chains).
+ *                     null          — the caller knows it has no usable source.
+ *                   Walls, max pain and the chain rows always come from `strikes`.
  */
 export function processChainSnapshot(
   ticker:    string,
   spotPrice: number,
   strikes:   StrikeData[],
   asOf:      number,
+  flipSource: StrikeData[] | ExternalFlip | null = strikes,
 ) {
   if (strikes.length < MIN_STRIKES) {
     console.warn(
@@ -105,7 +124,7 @@ export function processChainSnapshot(
     return;
   }
 
-  const result = computeGex(ticker, spotPrice, strikes, asOf);
+  const result = computeGex(ticker, spotPrice, strikes, asOf, flipSource);
   if (!result) return;
 
   // ── Max pain ─────────────────────────────────────────────────────────────────
@@ -150,12 +169,14 @@ export function processChainSnapshot(
 
   const ctx: MarketContext = {
     ticker,
+    spotPrice,
     gexRegime:   result.regime,
     walls: {
       callWall: result.wallAbove,
       putWall:  result.wallBelow,
     },
     flipLevel:   result.flipLevel,
+    flipAbsentReason: result.flipAbsentReason,
     vannaLevel:  undefined,
     charmLevel:  undefined,
     upTarget:    result.upTarget,
@@ -169,7 +190,7 @@ export function processChainSnapshot(
 
   marketStore.writeContext(ticker, ctx);
   console.log(
-    `[gexEngine] ${ticker} — regime: ${result.regime}, flip: ${result.flipLevel}, ` +
+    `[gexEngine] ${ticker} — regime: ${result.regime}, flip: ${result.flipLevel ?? `ABSENT (${result.flipAbsentReason})`}, ` +
     `wallAbove: ${result.wallAbove}, wallBelow: ${result.wallBelow}, netGex: ${result.netGex.toExponential(2)}`
   );
 }
@@ -185,6 +206,7 @@ export function computeGex(
   spotPrice: number,
   strikes:   StrikeData[],
   asOf:      number,
+  flipSource: StrikeData[] | ExternalFlip | null = strikes,
 ): GexResult | null {
   if (spotPrice <= 0 || strikes.length === 0) return null;
 
@@ -202,17 +224,35 @@ export function computeGex(
   const totalPutGex  = strikeGex.reduce((sum, s) => sum + s.putGex, 0);
   const netGex       = totalCallGex - totalPutGex;
 
-  // Flip level: strike where cumulative net GEX crosses zero (linear interpolation)
-  const flipLevel = computeFlipLevel(strikeGex, spotPrice);
+  // Flip level: total GEX re-priced across hypothetical spots — see
+  // lib/zeroGamma.ts for the method, its validation, and why the old
+  // cumulative-by-strike walk was replaced. Null (absent) is a real answer.
+  // A caller passes null when it knows its rows do not cover the whole
+  // chain (chainAggregator before its full-chain fetch lands): a flip from a
+  // truncated chain is a different number — SPY 761.38 from the first 2,000
+  // contracts vs 768.80 from all 12,966 — so it is absent, not approximated.
+  const flip: ExternalFlip = flipSource === null
+    ? { level: null, reason: 'full option chain not loaded yet' }
+    : Array.isArray(flipSource)
+      ? computeZeroGamma(toGammaContracts(flipSource), spotPrice, asOf)
+      : flipSource;
 
-  // Walls: top N strikes by absolute GEX magnitude, split above/below spot
-  const aboveSpot = strikeGex.filter((s) => s.strike > spotPrice)
-    .sort((a, b) => Math.abs(b.callGex) - Math.abs(a.callGex));
-  const belowSpot = strikeGex.filter((s) => s.strike < spotPrice)
-    .sort((a, b) => Math.abs(b.putGex) - Math.abs(a.putGex));
+  // Walls: the largest call GEX above spot, the largest put GEX below.
+  //
+  // ABSENT (null) when there is none — the same fix the flip got, for the
+  // same reason. This used to fall back to `spotPrice`: a chain with no
+  // strike above spot (or none carrying gamma) reported a "wall" exactly at
+  // the current price, which reads as maximal resistance right here and
+  // puts price "within 0.3% of a wall" — the BREAKOUT condition. Rows with
+  // zero or negative gamma exposure are not walls either: sorting by |GEX|
+  // used to let a zero-gamma strike win when nothing else was there.
+  const aboveSpot = strikeGex.filter((s) => s.strike > spotPrice && s.callGex > 0)
+    .sort((a, b) => b.callGex - a.callGex);
+  const belowSpot = strikeGex.filter((s) => s.strike < spotPrice && s.putGex > 0)
+    .sort((a, b) => b.putGex - a.putGex);
 
-  const wallAbove = aboveSpot[0]?.strike ?? spotPrice;
-  const wallBelow = belowSpot[0]?.strike ?? spotPrice;
+  const wallAbove = aboveSpot[0]?.strike ?? null;
+  const wallBelow = belowSpot[0]?.strike ?? null;
 
   // Targets: second significant wall cluster (beyond the primary wall)
   const upTarget   = aboveSpot[1]?.strike ?? wallAbove;
@@ -231,7 +271,8 @@ export function computeGex(
     netGex,
     callGex:    totalCallGex,
     putGex:     totalPutGex,
-    flipLevel,
+    flipLevel:  flip.level,
+    flipAbsentReason: flip.reason,
     wallAbove,
     wallBelow,
     upTarget,
@@ -240,6 +281,21 @@ export function computeGex(
     regime,
     asOf,
   };
+}
+
+/**
+ * One GammaContract per side that has open interest. A row without an
+ * expiry (backtestEngine builds OI/gamma-only rows) contributes nothing, so
+ * a chain made only of such rows yields an absent flip — never a guess.
+ */
+export function toGammaContracts(strikes: readonly StrikeData[]): GammaContract[] {
+  const out: GammaContract[] = [];
+  for (const s of strikes) {
+    if (!s.expiry) continue;
+    if (s.callOI > 0) out.push({ strike: s.strike, expiry: s.expiry, iv: s.callIV ?? 0, openInterest: s.callOI, type: 'call' });
+    if (s.putOI  > 0) out.push({ strike: s.strike, expiry: s.expiry, iv: s.putIV  ?? 0, openInterest: s.putOI,  type: 'put'  });
+  }
+  return out;
 }
 
 /**
@@ -271,42 +327,6 @@ export function perStrikePutGex(s: StrikeData, spotPrice: number): number {
 export function classifyRegime(netGex: number): GexRegime {
   if (Math.abs(netGex) < NEUTRAL_GEX_EPSILON) return 'neutral';
   return netGex > 0 ? 'positive' : 'negative';
-}
-
-/**
- * Compute the flip level: the strike price at which net cumulative GEX
- * transitions from positive to negative (or vice versa).
- *
- * Method: accumulate net GEX from lowest strike upward. The flip is at the
- * strike where the running sum changes sign. Linear interpolation between
- * the two surrounding strikes provides a sub-strike estimate.
- *
- * Returns the current spot price if no sign change is found (no flip in chain).
- */
-export function computeFlipLevel(
-  strikeGex: Array<{ strike: number; callGex: number; putGex: number }>,
-  spotPrice: number,
-): number {
-  const sorted = [...strikeGex].sort((a, b) => a.strike - b.strike);
-
-  let cumulative = 0;
-  let prev = sorted[0];
-
-  for (const curr of sorted) {
-    const net = curr.callGex - curr.putGex;
-    const prevCumulative = cumulative;
-    cumulative += net;
-
-    if (prevCumulative !== 0 && Math.sign(prevCumulative) !== Math.sign(cumulative)) {
-      // Linear interpolation between prev.strike and curr.strike
-      const t = Math.abs(prevCumulative) / (Math.abs(prevCumulative) + Math.abs(cumulative));
-      return prev.strike + t * (curr.strike - prev.strike);
-    }
-
-    prev = curr;
-  }
-
-  return spotPrice; // no flip found in chain
 }
 
 /**

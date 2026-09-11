@@ -77,12 +77,36 @@ const MAX_CONCURRENT_POLLS = 40;
  */
 const POLL_HARD_TIMEOUT_MS = 30_000;
 
+/**
+ * The 30-second poll fetches the NEAREST contracts only (fetchOptionsSnapshot's
+ * 2,000-contract cap, sorted by expiry): for SPY that is 6 expiries out of 33.
+ * Fine for walls, the chain view and near-term greeks — not for the gamma
+ * flip, which is a property of the whole book. Measured on the 2026-09-10
+ * close: SPY flip 761.38 from the first 2,000 contracts, 768.80 from all
+ * 12,966, 771.02 published (see lib/zeroGamma.ts).
+ *
+ * So the whole chain is fetched separately, cached, and merged in for the
+ * flip only. Open interest is end-of-day data and far-dated IV moves slowly,
+ * so an hourly refresh is enough; refreshes run ONE ticker at a time so a
+ * cold boot's 23 full chains (~700 pages) trickle through at a few requests
+ * a second instead of racing toward Massive's 100 req/s ceiling.
+ */
+const NEAR_TERM_CAP          = 2_000;
+const FULL_CHAIN_MAX         = 25_000;
+const FULL_CHAIN_REFRESH_MS  = 60 * 60_000;
+
 // ── Module state ──────────────────────────────────────────────────────────────
 
 let _client: MassiveRestClient | null = null;
 
 /** ticker → next-poll timeout handle (null while a poll is actively running). */
 const _polls = new Map<string, ReturnType<typeof setTimeout> | null>();
+
+/** ticker → the whole chain, for the flip level only. See NEAR_TERM_CAP. */
+const _fullChain = new Map<string, { strikes: StrikeData[]; fetchedAt: number }>();
+/** Tickers waiting for (or in) a full-chain fetch — processed one at a time. */
+const _fullChainQueue: string[] = [];
+let _fullChainRunning = false;
 
 /** Concurrency semaphore state — caps how many tickers can poll simultaneously. */
 let _activePolls = 0;
@@ -172,7 +196,7 @@ async function _poll(ticker: string) {
   await _acquireSlot();
   try {
     const contracts = await Promise.race([
-      _client.fetchOptionsSnapshot(_toMassiveUnderlying(ticker)),
+      _client.fetchOptionsSnapshot(_toMassiveUnderlying(ticker), NEAR_TERM_CAP),
       new Promise<never>((_, reject) =>
         setTimeout(() => reject(new Error(`_poll hard-timeout for ${ticker} after ${POLL_HARD_TIMEOUT_MS / 1000}s`)), POLL_HARD_TIMEOUT_MS)
       ),
@@ -209,12 +233,67 @@ async function _poll(ticker: string) {
       return;
     }
 
-    gexEngine.processChainSnapshot(ticker, spotPrice, strikes, Date.now());
+    const flipStrikes = _flipCoverage(ticker, contracts.length, strikes);
+    gexEngine.processChainSnapshot(ticker, spotPrice, strikes, Date.now(), flipStrikes);
     console.log(`[chainAggregator] ${ticker}: processed ${strikes.length} strikes @ spot ${spotPrice}`);
+    _queueFullChainRefresh(ticker);
   } catch (e) {
     console.error(`[chainAggregator] ${ticker} poll failed:`, e);
   } finally {
     _releaseSlot();
+  }
+}
+
+/**
+ * The rows the flip level should be computed from, or null when the whole
+ * chain is not available yet (the flip is then absent, never a truncated-
+ * chain approximation — see gexEngine.computeGex).
+ *
+ * A poll that came back under the cap already IS the whole chain. Otherwise:
+ * every expiry the poll covered completely comes from the fresh poll, and
+ * the rest — including the poll's last expiry, which the cap may have cut
+ * mid-way — from the cached full chain.
+ */
+function _flipCoverage(ticker: string, fetched: number, nearTerm: StrikeData[]): StrikeData[] | null {
+  if (fetched < NEAR_TERM_CAP) return nearTerm;
+  const cached = _fullChain.get(ticker);
+  if (!cached) return null;
+  let lastExpiry = '';
+  for (const s of nearTerm) if ((s.expiry ?? '') > lastExpiry) lastExpiry = s.expiry ?? '';
+  return [
+    ...nearTerm.filter((s) => (s.expiry ?? '') < lastExpiry),
+    ...cached.strikes.filter((s) => (s.expiry ?? '') >= lastExpiry),
+  ];
+}
+
+function _queueFullChainRefresh(ticker: string) {
+  const cached = _fullChain.get(ticker);
+  if (cached && Date.now() - cached.fetchedAt < FULL_CHAIN_REFRESH_MS) return;
+  if (_fullChainQueue.includes(ticker)) return;
+  _fullChainQueue.push(ticker);
+  void _drainFullChainQueue();
+}
+
+async function _drainFullChainQueue() {
+  if (_fullChainRunning || !_client) return;
+  _fullChainRunning = true;
+  try {
+    while (_fullChainQueue.length > 0) {
+      const ticker = _fullChainQueue[0];
+      try {
+        const t0 = Date.now();
+        const contracts = await _client.fetchOptionsSnapshot(_toMassiveUnderlying(ticker), FULL_CHAIN_MAX);
+        const strikes = _mapToStrikeData(contracts, ticker);
+        if (strikes.length > 0) _fullChain.set(ticker, { strikes, fetchedAt: Date.now() });
+        console.log(`[chainAggregator] ${ticker}: full chain for the flip level — ${contracts.length} contracts in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
+      } catch (e) {
+        // The previous cache (if any) stays in use; the next poll re-queues.
+        console.error(`[chainAggregator] ${ticker} full-chain fetch failed:`, e);
+      }
+      _fullChainQueue.shift();
+    }
+  } finally {
+    _fullChainRunning = false;
   }
 }
 

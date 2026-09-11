@@ -8,8 +8,14 @@
  * matchedPreference logic in isolation, since real live calls need a real
  * Massive key + Webull sandbox session this test file shouldn't depend on.
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { discoverContract } from '../execution/contractDiscovery.ts';
+
+// The fixtures expire 2026-09-05 and discoverContract drops expired contracts
+// against the real clock, so these tests started failing on their own on
+// 2026-09-06. Pin the clock to the day they were written.
+beforeEach(() => { vi.useFakeTimers({ toFake: ['Date'] }); vi.setSystemTime(new Date('2026-09-03T15:00:00Z')); });
+afterEach(() => { vi.useRealTimers(); });
 
 const SYMBOL = 'SPY';
 

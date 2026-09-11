@@ -145,6 +145,25 @@ describe('pickBestContract — real 8-criterion checks', () => {
     expect(pickBestContract(baseInput({ ctx: closeWall }))!.criteria.c6BreakEven).toBe(false);
   });
 
+  it('c6BreakEven FAILS with an absent wall or no market context — absent blocks', () => {
+    const noWall = { ...baseInput().ctx, walls: { callWall: null, putWall: null } } as any;
+    expect(pickBestContract(baseInput({ ctx: noWall }))!.criteria.c6BreakEven).toBe(false);
+    // With no context at all there is no chain, so there is no pick — also a block.
+    expect(pickBestContract(baseInput({ ctx: null } as any))).toBeNull();
+  });
+
+  it('c7IvRank FAILS when IV is absent (0) — estimateIvRank(0) is 0, which used to read as "cheap" and pass', () => {
+    const noIv = { ...baseInput().ctx, chain: [makeChainRow({ callIV: 0, putIV: 0 })] } as any;
+    expect(pickBestContract(baseInput())!.criteria.c7IvRank).toBe(true);
+    expect(pickBestContract(baseInput({ ctx: noIv }))!.criteria.c7IvRank).toBe(false);
+  });
+
+  it('c5Spread FAILS with no quote (zero premium) — it used to pass as "no spread problem"', () => {
+    const noQuote = { ...baseInput().ctx, chain: [makeChainRow({ callBid: 0, callAsk: 0 })] } as any;
+    const pick = pickBestContract(baseInput({ ctx: noQuote }));
+    expect(pick === null || pick.criteria.c5Spread === false).toBe(true);
+  });
+
   it('c8NoEarnings fails when a real earnings disclosure falls within the real 2-day window', () => {
     expect(pickBestContract(baseInput())!.criteria.c8NoEarnings).toBe(true);
     const withEarnings = { recentDisclosures: [{ category: 'earnings', filedAt: NOW + 24 * 3600_000 }] } as any;

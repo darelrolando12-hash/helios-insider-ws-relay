@@ -1,0 +1,23 @@
+{
+  // Type-check only — Node runs the engine by stripping types and never reads
+  // this file. Named *.typecheck.json so Vite/vitest don't pick it up as the
+  // project tsconfig. Run from the repo root (it uses the root's TypeScript):
+  //
+  //   npx tsc -p relay/tsconfig.typecheck.json
+  //
+  // Baseline 2026-09-11: 4 pre-existing errors (contractDiscovery.ts:183 ×2,
+  // paperExecution.ts:224/323). Anything beyond those is new.
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "allowImportingTsExtensions": true,
+    "noEmit": true,
+    "strict": true,
+    "skipLibCheck": true,
+    "types": ["node"],
+    "typeRoots": ["../node_modules/@types"]
+  },
+  "include": ["engine/**/*.ts", "backtests/**/*.ts"],
+  "exclude": ["engine/**/__tests__/**"]
+}

@@ -24,8 +24,16 @@ import { type Bar, type Result, ready, loading, error } from './types.ts';
 /** Maximum age of the most recent bar before the ticker is considered stale. */
 const STALE_THRESHOLD_MS = 2 * 60 * 1000; // 2 minutes
 
-/** Maximum bars retained per ticker in memory (one full session + buffer). */
-const MAX_BARS_PER_TICKER = 500;
+/**
+ * Maximum bars retained per ticker — one FULL extended session. The feed
+ * runs ~03:00–19:00 CT = 960 one-minute bars; 1,000 holds all of it.
+ *
+ * It was 500, commented "one full session + buffer" — true only for the
+ * 390-minute regular session. Session VWAP (lib/sessionVwap) needs every bar
+ * since the session start, and 500 bars stopped reaching it by ~11:20 CT:
+ * measured −9¢ on QQQ at 14:59 CT and −22¢ on SPY at 18:59 CT, 2026-09-09/10.
+ */
+const MAX_BARS_PER_TICKER = 1_000;
 
 /**
  * Tolerance window for signal-outcome bar lookup.

@@ -245,18 +245,24 @@ export function pickBestContract(input: PickBestContractInput): BestContractPick
   const actionableTypes = new Set(['ENTER', 'BREAKOUT', 'REVERSAL', 'RIP']);
   const c4SignalState = actionableTypes.has(signalType) && confidence >= 65;
 
+  // Criteria 5–7 PASS ONLY ON DATA THAT IS THERE. Each used to pass on its
+  // absence — the same shape as the 0DTE cockpit's "79 on every row": c5
+  // passed a zero premium as "no spread problem", c6 passed with no market
+  // context, and c7 passed an IV of 0 (estimateIvRank(0) is 0, "cheap").
+
   // ── Criterion 5: spread < 8% ───────────────────────────────────────────────
-  const c5Spread = spreadPctOfMid < SPREAD_MAX_PCT || midPremium === 0;
+  const c5Spread = midPremium > 0 && spreadPctOfMid < SPREAD_MAX_PCT;
 
   // ── Criterion 6: break-even reachable before the nearest GEX wall ────────
-  let c6BreakEven = true;
-  if (ctx) {
+  // An absent wall (null — gexEngine no longer stands spot in for it) fails.
+  let c6BreakEven = false;
+  if (ctx && midPremium > 0) {
     const wall = direction === 'call' ? ctx.walls.callWall : ctx.walls.putWall;
-    c6BreakEven = midPremium < Math.abs(wall - price);
+    c6BreakEven = wall !== null && midPremium < Math.abs(wall - price);
   }
 
   // ── Criterion 7: IV rank < 75th percentile ────────────────────────────────
-  const c7IvRank = ivRank < IV_RANK_WARN;
+  const c7IvRank = side.iv > 0 && ivRank < IV_RANK_WARN;
 
   // ── Criterion 8: no earnings within 2 days ────────────────────────────────
   const c8NoEarnings = !hasEarningsBlocker;

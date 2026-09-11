@@ -211,9 +211,23 @@ async function _onSignal(signal: Signal): Promise<void> {
     factors,
   };
 
+  // Conflict on the NATURAL key, not on `id` — see the browser ledger's
+  // matching comment (src/ledger/signalLedger.ts) for the measured evidence.
+  // In short: `id` embeds a per-session counter and Date.now(), so two
+  // writers never collide on it, and 14 page sessions wrote signals within
+  // two hours on 2026-09-10. This engine will be one more writer the moment
+  // it leaves shadow mode — CLAUDE.md already warns that running browser and
+  // server live together "would guarantee duplicates". The unique index
+  // makes that structurally impossible rather than a coordination problem.
+  //
+  // Signals are insert-once, so DO NOTHING on the natural key is correct —
+  // CLAUDE.md's ignoreDuplicates warning was about a table whose later rows
+  // had to UPDATE earlier ones, which this one never does.
+  //
+  // REQUIRES backups/signals-unique-constraint.sql to have run first.
   const { error: dbError } = await supabase
     .from('signals')
-    .upsert(row, { onConflict: 'id', ignoreDuplicates: true });
+    .upsert(row, { onConflict: 'ticker,entry_tct,direction,signal_type', ignoreDuplicates: true });
 
   if (dbError) {
     // Log but never throw — a ledger write failure must never propagate back

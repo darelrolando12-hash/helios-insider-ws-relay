@@ -343,6 +343,57 @@ server.on('request', (req, res) => {
     return;
   }
 
+  // Engine read endpoint: the gamma flip for every ticker, computed once in
+  // this process (see engine/index.ts gexSnapshot) so browsers read it
+  // instead of each fetching whole option chains to compute it themselves.
+  // 503 — never an empty 200 — when the engine is not running, so a client
+  // can tell "no engine" from "no flip".
+  // Engine read endpoint: the per-minute delta series for one ticker (the
+  // chart's CVD panel; see engine/index.ts deltaSnapshot). Same 503 rule.
+  if (req.method === 'GET' && req.url && req.url.startsWith('/engine/delta')) {
+    const headers = { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*', 'Cache-Control': 'no-store' };
+    const ticker = new URL(req.url, 'http://internal').searchParams.get('ticker') ?? '';
+    if (!/^[A-Z:.]{1,12}$/.test(ticker)) {
+      const body = JSON.stringify({ error: 'ticker query parameter required, e.g. ?ticker=SPY' });
+      res.writeHead(400, { ...headers, 'Content-Length': Buffer.byteLength(body) });
+      res.end(body);
+      return;
+    }
+    if (!engineModule || typeof engineModule.deltaSnapshot !== 'function') {
+      const body = JSON.stringify({ error: 'engine not running' });
+      res.writeHead(503, { ...headers, 'Content-Length': Buffer.byteLength(body) });
+      res.end(body);
+      return;
+    }
+    const body = JSON.stringify(engineModule.deltaSnapshot(ticker));
+    res.writeHead(200, { ...headers, 'Content-Length': Buffer.byteLength(body) });
+    res.end(body);
+    return;
+  }
+
+  if (req.method === 'OPTIONS' && req.url === '/engine/gex') {
+    res.writeHead(204, {
+      'Access-Control-Allow-Origin': '*',
+      'Access-Control-Allow-Methods': 'GET, OPTIONS',
+      'Access-Control-Allow-Headers': 'Content-Type, Accept',
+    });
+    res.end();
+    return;
+  }
+  if (req.method === 'GET' && req.url === '/engine/gex') {
+    const headers = { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*', 'Cache-Control': 'no-store' };
+    if (!engineModule || typeof engineModule.gexSnapshot !== 'function') {
+      const body = JSON.stringify({ error: 'engine not running' });
+      res.writeHead(503, { ...headers, 'Content-Length': Buffer.byteLength(body) });
+      res.end(body);
+      return;
+    }
+    const body = JSON.stringify(engineModule.gexSnapshot());
+    res.writeHead(200, { ...headers, 'Content-Length': Buffer.byteLength(body) });
+    res.end(body);
+    return;
+  }
+
   if (req.method === 'OPTIONS' && req.url && req.url.startsWith('/rest/')) {
     res.writeHead(204, {
       'Access-Control-Allow-Origin': '*',
