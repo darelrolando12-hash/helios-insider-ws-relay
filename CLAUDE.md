@@ -20,9 +20,19 @@ Every claim about behaviour must be backed by something real: actual command out
 
 This standard exists because a previous tool made **six** confident false claims in a single session — reporting a healthy production app as broken, claiming code was removed that wasn't, claiming a file was server-side when it was the browser's, and claiming a function handled reconnects when it was dead code never called.
 
-### 2. `node --check` before every push
+### 2. A real syntax check before every push
 
 Non-negotiable. A copy-paste error once put chat prose inside `index.js` at line 375 and **Railway crash-looped 441 times**. Two seconds of checking prevents a production outage.
+
+**`node --check` does not do this for `.ts` files.** Measured 2026-09-11 on Node v24.20.0: for a `.ts` file that begins with an `import`, `node --check` exits 0 no matter what follows — chat prose at line 3, a broken function signature and a non-erasable `enum` all "passed". (It parses as CommonJS, hits the import, retries as an ES module and reports nothing.) Every engine file starts with an import, so the check this rule relied on was empty for the whole engine. It still works for `.js`. Use:
+
+```
+node relay/scripts/checkSyntax.mjs <files…>
+```
+
+It strips types with Node's own stripper (which rejects enums and malformed code) and `--check`s the result as an ES module; it verifiably fails on all three cases above. Type errors are the type checker's job — see WORKFLOW.
+
+**The same session found `tsc -p .` checks nothing** (the root `tsconfig.json` lists no files and only references others). The real checks are `npm run typecheck` (browser) and `npx tsc -p relay/tsconfig.typecheck.json` (engine).
 
 ### 3. Run the full test suite, not a subset
 
@@ -207,13 +217,41 @@ Real gaps that are understood and deliberately not yet fixed. A gap recorded onl
 
 **`BestContractsCockpit.tsx`'s insider check has zero filtering.** `insiderBuy: fundData.insiderTransactions.length > 0` — no buy/sell check, no 10b5-1 exclusion, despite a comment claiming "only discretionary buys stored" (also stale — see `fundamentalsStore.ts`'s real, current contract: it stores everything unfiltered). Found 2026-09-02, same audit. Dead code, same disposition as above.
 
+*Added 2026-09-11 (funnel Step 1 audit). Each verified against code or data; none fixed yet.*
+
+**0DTE active-trade conviction compounds its multiplier every candle.** `ZeroDteCockpit.tsx` `computeConviction` starts from `monitor.currentConviction` and returns `score × convictionMultiplier(tradeType)`, and the monitor loop feeds that back in on every new bar — so a continuation trade (×1.05) drifts toward 100 and a counter-session trade decays, whatever the market does. It also returns the prior value unchanged (× multiplier) when CVD or GEX data is missing.
+
+**The Indexes "% change" is against the previous 1-minute bar, not the prior close.** `IndexesCockpit.tsx` `_buildTile`: `changePct = (last.close − prev.close) / prev.close` where `prev` is the bar before the last one. Labelled and read as a day change; it is a one-minute change.
+
+**barsStore's cold start asks for a date that has no bars between ~01:30 and 03:00 CT.** `fetchRecentBars` builds `from = now − 390 min` and `_fetchBarRange` sends only the UTC *date*. From ~01:30 CT (06:30Z) until the feed opens, that date is the new UTC day with no bars yet, so a reload in that window starts with an empty buffer (seen 2026-09-11 02:09 CT). The chart now fetches the latest session itself; barsStore consumers (direction state, cockpits) still start empty.
+
+**`dailyHighLowIngestion` runs in every browser, over thousands of tickers.** The browser console shows it walking the whole universe (ACTG, ACTU, ACU, ACVA, …), one REST gap-fill per ticker, in every open tab — on top of the relay engine running the same job. Same request-load class as Track B and as the per-browser full-chain fetch that was moved server-side (see `/engine/gex`). Ingestion belongs to the engine alone; browsers should not run it.
+
+**GEX walls are the largest single (expiry, strike) row, not the strike's total across expiries.** `gexEngine.computeGex` sorts `strikeGex` rows as the chain delivers them — one per expiry per strike — so a strike whose exposure is split over several expiries loses to one large single-expiry row. Walls matched the published SPY walls on 2026-09-10 (765/755), so the effect may be small near-term; it has not been measured.
+
+**The paper-execution ladder path passes `side: 'buy'` where its type (and the direct path) uses `'BUY'`.** `paperExecution.ts:224` and `:323` — two of the four errors in the relay type-check baseline. Whether Webull accepts or mis-reads the lowercase side has not been checked. Paper mode only, but it is the path that will go live.
+
+**Swing's earnings criterion passes when earnings data is absent.** `SwingCockpit.tsx`: `earningsPass = nearestEarnings === null` — "no earnings found" and "earnings data never loaded" both pass.
+
+**No IV history exists, so "IV rank" cannot be computed anywhere.** The 0DTE criterion is now honestly blocked; `bestContractPicker.estimateIvRank` is a documented shape-based estimate from a single IV, not a rank.
+
+**The relay's `/engine/gex` and `/engine/delta` endpoints are not deployed yet.** Browsers now read the flip from `/engine/gex` (see `src/lib/serverGex.ts`) instead of fetching whole chains, and the chart's CVD panels read `/engine/delta` (`src/lib/serverDelta.ts`). Until the relay ships, every browser correctly shows the flip as absent ("server flip unavailable") and the CVD panels as "CVD · UNAVAILABLE".
+
+**Fixed 2026-09-11 — CVD totals ran from process boot, and the rebuild was partial.** Recorded here because the fix exposed faults the failure had hidden (see "Removing a redundancy…"). `cvdStore` totals were set once per ticker and only ever added to, so the 25-point factor scored days of stale flow on every non-deploy day; CVD is now the regular session only (8:30–15:00 CT), reset by the first trade of a new session, and reads `loading` — not yesterday — before it. The boot rebuild was rejected (HTTP 400) on every boot; fixing the request exposed a 25,000-trade cap (SPY's 2026-09-11 session was 470,114 trades), a timestamp cursor that skips ties (32,723 of those trades share their nanosecond with the one before), and a double count (it fetched to "now" through the live write path while live trades arrived over the relay's shared subscriptions). It now pages through Massive's `next_url` cursor, subscribes live first, and drops replayed trades at or after the first live one. Real run, SPY full session: 470,114 fetched, 10 pages, 40 s, 390 minutes. The browser copy (`src/stores/cvdStore.ts`) got the same session scope.
+
+**Browser CVD starts at page load.** The browser has no rebuild, so a tab opened at 11:00 CT scores (and, while browsers still write, signals on) CVD from 11:00. Same class as the boot bug above; ends when browser writes are switched off at Shadow Mode cutover.
+
+**Rebuilt CVD differs from live CVD in three measured ways.** Replayed trades classify by the uptick rule (no quotes in `/v3/trades`); fractional-share prints (`size: 0`, `decimal_size` carries the real amount — 10% of SPY's trades, 0.026% of its shares) are skipped by both paths; trades sharing the first live trade's millisecond but printed before it are in neither set. A relay upstream reconnect mid-session still loses the trades in the gap — the rebuild runs only at boot.
+
+**A whole minute can be missing from the browser's live bars.** Seen 2026-09-11 13:48Z on all 11 checked tickers after a reload during market hours: no provisional bar and no AM for that minute, ever — 13:47 and 13:49 present. The reload-time ingestion storm had the tab saturated (chain polls hitting their 40s hard timeout), so the most likely mechanism is a relay heartbeat termination and a reconnect without a gap-fill, but the console buffer had rotated before that could be confirmed. Mechanism unproven.
+
 ---
 
 ## WORKFLOW
 
 1. Branch. Never work directly on `main`.
 2. Make the change.
-3. `node --check` on anything touched.
+3. `node relay/scripts/checkSyntax.mjs` on anything touched (NOT `node --check` for `.ts` — see rule 2), plus both type checks: `npm run typecheck` and `npx tsc -p relay/tsconfig.typecheck.json` (baseline: 4 pre-existing errors in contractDiscovery/paperExecution).
 4. Full test suite, per-file output.
 5. Show the real diff.
 6. Push. Railway auto-deploys.
