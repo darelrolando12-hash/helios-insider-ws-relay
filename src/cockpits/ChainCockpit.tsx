@@ -122,8 +122,9 @@ function _fmtExpiry(expiry: string): string {  if (expiry === 'Current') return 
 function _isATM(r: ChainRow, spot: number): boolean {
   return Math.abs(r.strike - spot) < spot * 0.003;
 }
-function _isFlip(r: ChainRow, flip: number, spot: number): boolean {
-  return Math.abs(r.strike - flip) < spot * 0.003;
+// An absent flip (null — lib/zeroGamma) marks no row as FLIP.
+function _isFlip(r: ChainRow, flip: number | null, spot: number): boolean {
+  return flip !== null && Math.abs(r.strike - flip) < spot * 0.003;
 }
 
 // ── Skeleton / Error ──────────────────────────────────────────────────────────
@@ -685,8 +686,8 @@ function FooterCard({ ctx }: { ctx: MarketContext | null }) {
       {[
         { label: 'P/C', val: pcRatio > 0 ? pcRatio.toFixed(2) : '—', col: pcRatio > 1 ? 'var(--r)' : pcRatio > 0 ? 'var(--g)' : 'var(--dim)' },
         { label: 'IV RANK', val: ivRank != null ? `${ivRank.toFixed(0)}%` : '—', col: 'var(--ink)' },
-        { label: 'CALL WALL', val: walls?.callWall > 0 ? _fmtP(walls.callWall) : '—', col: 'var(--g)' },
-        { label: 'PUT WALL', val: walls?.putWall > 0 ? _fmtP(walls.putWall) : '—', col: 'var(--r)' },
+        { label: 'CALL WALL', val: walls?.callWall != null ? _fmtP(walls.callWall) : '—', col: 'var(--g)' },
+        { label: 'PUT WALL', val: walls?.putWall != null ? _fmtP(walls.putWall) : '—', col: 'var(--r)' },
         { label: 'NET GEX', val: netGex !== 0 ? _fmtGex(netGex) : '—', col: netGex >= 0 ? 'var(--g)' : 'var(--r)' },
       ].map(({ label, val, col }) => (
         <div key={label} className="flex flex-col items-center">

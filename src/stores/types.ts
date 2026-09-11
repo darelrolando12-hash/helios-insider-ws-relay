@@ -89,10 +89,10 @@ export interface Bar {
 export type GexRegime = 'positive' | 'negative' | 'neutral';
 
 export interface GexWalls {
-  /** Largest call OI cluster above current price — acts as resistance */
-  callWall: number;
-  /** Largest put OI cluster below current price — acts as support */
-  putWall: number;
+  /** Largest call GEX above current price — acts as resistance. NULL when absent (never spot). */
+  callWall: number | null;
+  /** Largest put GEX below current price — acts as support. NULL when absent (never spot). */
+  putWall: number | null;
 }
 
 export interface MarketContextSnapshot {
@@ -107,8 +107,17 @@ export interface MarketContextSnapshot {
   /**
    * Price at which net GEX crosses zero — market tends to shift character
    * (mean-reverting ↔ trending) around this level.
+   *
+   * NULL WHEN ABSENT — no zero crossing within ±15% of spot, or too little
+   * of the chain carries a usable IV (see lib/zeroGamma.ts). Never a stand-in
+   * value: the old engine returned the spot price here, which made "within
+   * 0.5% of flip" permanently true. Every consumer must handle null as
+   * "unknown", and anything that scores on it must block, not pass.
    */
-  flipLevel: number;
+  flipLevel: number | null;
+
+  /** Why flipLevel is null; null/undefined when it is real. */
+  flipAbsentReason?: string | null;
 
   /**
    * Dominant vanna exposure level — price point where delta sensitivity to

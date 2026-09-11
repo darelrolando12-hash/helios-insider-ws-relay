@@ -16,6 +16,7 @@ import { supabase }      from '@/lib/supabase';
 import { massiveBus }    from '@/lib/massive/websocket';
 import * as barsStore    from '@/stores/barsStore';
 import { isFeedScheduleActive } from '@/lib/time';
+import * as marketStatusStore from '@/stores/marketStatusStore';
 import { fetchChartSignalMarkers } from '@/lib/chartSignals';
 import { computeChartBackfillWindow } from '@/lib/chartWindow';
 import type { Result } from '@/stores/types';
@@ -230,7 +231,20 @@ function useFeedState(): FeedState {
   const [state, setState] = useState<FeedState>('ok');
   useEffect(() => {
     function check() {
-      const feedActive = isFeedScheduleActive();
+      // Prefer the venue's own answer (Massive /v1/marketstatus/now, polled
+      // in main.tsx and published via marketStatusStore). It is the only
+      // source here that gets holidays and early closes right —
+      // isFeedScheduleActive() is a hardcoded 03:00–19:00 CT window that
+      // documents its own missing weekend check, and CLAUDE.md records that
+      // no holiday calendar exists anywhere in this system. So on
+      // Thanksgiving the old path would insist the feed should be live and
+      // then shout "stale" all day.
+      //
+      // Fall back to the hardcoded schedule only while the first poll is
+      // still in flight, so a cold start still suppresses the misleading
+      // RECONNECTING banner overnight.
+      const expectedLive = marketStatusStore.isFeedExpectedLive();
+      const feedActive = expectedLive === null ? isFeedScheduleActive() : expectedLive;
       if (!feedActive) {
         setState('market_closed');
         return;
@@ -241,7 +255,8 @@ function useFeedState(): FeedState {
     check();
     const interval = setInterval(check, 10_000);
     const unsub    = barsStore.subscribe(check);
-    return () => { clearInterval(interval); unsub(); };
+    const unsubMkt = marketStatusStore.subscribe(check);
+    return () => { clearInterval(interval); unsub(); unsubMkt(); };
   }, []);
   return state;
 }
@@ -718,6 +733,8 @@ function SettingsOverlay({ watchlist, onAdd, onRemove, onClose }: SettingsOverla
 // Import FEED_TICKERS + CONTEXT_ONLY_TICKERS from directionState
 import { FEED_TICKERS } from '@/state/directionState';
 import type { ChartInterval } from '@/lib/aggregateBars';
+import * as marketStore from '@/stores/marketStore';
+import { toCentralTime } from '@/lib/time';
 
 const NON_CHARTABLE = new Set(['SPX', 'NDX', 'I:VIX', 'HYG', 'TLT']);
 const CHART_TICKERS = FEED_TICKERS.filter(t => !NON_CHARTABLE.has(t));
@@ -727,7 +744,125 @@ const INTERVAL_OPTIONS: { value: ChartInterval; label: string }[] = [
   { value: '5m',  label: '5m'  },
   { value: '15m', label: '15m' },
   { value: '1h',  label: '1H'  },
+  { value: '1d',  label: '1D'  },
 ];
+
+// ── Key Levels card ──────────────────────────────────────────────────────────
+// The mockup's "Key Levels" card under the chart: VWAP · Call Wall · Put Wall
+// · Zero Gamma. Every number is the one the chart itself draws — never a
+// second computation that could disagree with it:
+//   VWAP        HeliosChart's onSessionVwap (latest session, from 1-minute
+//               bars, the same value at every interval)
+//   walls/flip  marketStore — the exact fields the chart's CALL WALL /
+//               PUT WALL / FLIP price lines are drawn from
+
+interface GexLevels {
+  /** null = absent — no strike with gamma exposure on that side (never spot). */
+  callWall: number | null; putWall: number | null; asOf: number; stale: boolean;
+  /** null = absent (lib/zeroGamma) — no crossing, or not enough of the chain. */
+  flip: number | null;
+  flipAbsentReason: string | null;
+}
+
+function _readGexLevels(ticker: string): GexLevels | null {
+  const ctx = marketStore.getContextRaw(ticker);
+  if (!ctx) return null;
+  return {
+    callWall: ctx.walls.callWall,
+    putWall:  ctx.walls.putWall,
+    flip:     ctx.flipLevel,
+    flipAbsentReason: ctx.flipAbsentReason ?? null,
+    asOf:     ctx.asOf,
+    // getResult's own rule (>5 min old), so the card and every engine agree
+    // on what "stale" means.
+    stale:    marketStore.getResult(ticker).status !== 'ready',
+  };
+}
+
+function _sameGex(a: GexLevels | null, b: GexLevels | null): boolean {
+  if (a === null || b === null) return a === b;
+  return a.callWall === b.callWall && a.putWall === b.putWall && a.flip === b.flip && a.flipAbsentReason === b.flipAbsentReason
+      && a.asOf === b.asOf && a.stale === b.stale;
+}
+
+/** "14:32 CT", or "09/09 14:32 CT" when not from today (CT). */
+function _formatAsOfCT(utcMs: number): string {
+  const t = toCentralTime(utcMs), now = toCentralTime(Date.now());
+  const hhmm = `${String(t.hour).padStart(2, '0')}:${String(t.minute).padStart(2, '0')}`;
+  const sameDay = t.year === now.year && t.month === now.month && t.day === now.day;
+  return sameDay ? `${hhmm} CT` : `${String(t.month).padStart(2, '0')}/${String(t.day).padStart(2, '0')} ${hhmm} CT`;
+}
+
+function KeyLevelsCard({ ticker, vwap }: { ticker: string; vwap: number | null }) {
+  const [gex, setGex] = useState<GexLevels | null>(() => _readGexLevels(ticker));
+
+  useEffect(() => {
+    const read = () => {
+      const next = _readGexLevels(ticker);
+      setGex(prev => (_sameGex(prev, next) ? prev : next));
+    };
+    read();
+    const unsub = marketStore.subscribe(read);
+    // Staleness is a function of elapsed time: a GEX engine that simply
+    // stops writing sends no notification, so re-check on a timer too.
+    const timer = setInterval(read, 30_000);
+    return () => { unsub(); clearInterval(timer); };
+  }, [ticker]);
+
+  const fmt = (v: number | null | undefined) => (v === null || v === undefined ? '—' : v.toFixed(2));
+  const gexOpacity = gex?.stale ? 0.55 : 1;
+
+  const cell = (label: string, value: string, color: string, opacity = 1, note?: React.ReactNode) => (
+    <div style={{ background: 'var(--panel2)', border: '1px solid var(--line)', padding: '8px 10px', minWidth: 0 }}>
+      <div style={{ fontSize: '8px', color: 'var(--mut)', letterSpacing: '.08em', textTransform: 'uppercase', marginBottom: '3px' }}>
+        {label}
+      </div>
+      <div style={{ fontSize: '13px', fontWeight: 700, fontFamily: "'JetBrains Mono', monospace", color, opacity }}>
+        {value}
+      </div>
+      {note}
+    </div>
+  );
+
+  return (
+    <div style={{ flexShrink: 0 }}>
+      <div style={{ padding: '14px 16px 4px' }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', marginBottom: '9px', gap: '8px' }}>
+          <span style={{ fontSize: '10.5px', fontWeight: 700, letterSpacing: '.1em', textTransform: 'uppercase', color: 'var(--mut)' }}>
+            Key Levels
+          </span>
+          {/* Where the GEX numbers came from and how old they are — the
+              card shows old data labelled, never silently. */}
+          <span style={{ fontSize: '9px', fontFamily: "'JetBrains Mono', monospace", letterSpacing: '.04em', color: gex?.stale ? 'var(--amb-solid)' : 'var(--mut)' }}>
+            {gex === null ? 'GEX NOT LOADED' : `GEX ${_formatAsOfCT(gex.asOf)}${gex.stale ? ' · STALE' : ''}`}
+          </span>
+        </div>
+      </div>
+      <div style={{ background: 'var(--panel)', border: '1px solid var(--line)', padding: '13px 14px', margin: '0 16px 10px' }}>
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px' }}>
+          {cell('VWAP', fmt(vwap), 'var(--amb-solid)')}
+          {cell('Call Wall', fmt(gex?.callWall), 'var(--g)', gexOpacity)}
+          {cell('Put Wall', fmt(gex?.putWall), 'var(--r)', gexOpacity)}
+          {/* Zero Gamma is the rebuilt flip (lib/zeroGamma: total GEX re-
+              priced across spot, validated against published SPY/QQQ
+              levels). Absent is shown as absent, with the reason — the old
+              engine's stand-ins ($5 on META, spot itself on QQQ) are gone. */}
+          {cell(
+            'Zero Gamma',
+            gex === null ? '—' : gex.flip === null ? 'absent' : gex.flip.toFixed(2),
+            gex?.flip === null ? 'var(--mut)' : 'var(--ink)',
+            gexOpacity,
+            gex !== null && gex.flip === null && gex.flipAbsentReason && (
+              <div style={{ fontSize: '8px', color: 'var(--mut)', letterSpacing: '.04em', marginTop: '3px' }}>
+                {gex.flipAbsentReason}
+              </div>
+            ),
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
 
 /** Real trading-day lookback for signal markers — matches chartBars.ts's own
  * live-verified default (computeChartBackfillWindow), so signal history
@@ -777,8 +912,15 @@ function ChartScreen({ initialTickerRef, watchlistTickers = [] }: ChartScreenPro
 
   const markers = markersResult.status === 'ready' ? markersResult.data : [];
 
+  // Reported by the chart itself — see KeyLevelsCard's header. A stable
+  // setter, so HeliosChart (React.memo) is not re-rendered by passing it.
+  const [sessionVwap, setSessionVwap] = useState<number | null>(null);
+
   return (
-    <section id="chart" style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
+    // minHeight, not height: the section grows past the viewport and the
+    // screen scrolls to the Key Levels card below the chart, as in the
+    // mockup. See the chart wrapper below for why this is also a fix.
+    <section id="chart" style={{ display: 'flex', flexDirection: 'column', minHeight: '100%' }}>
       {/* Ticker selector row */}
       <div style={{
         display: 'flex', gap: '6px', padding: '10px 12px',
@@ -856,10 +998,18 @@ function ChartScreen({ initialTickerRef, watchlistTickers = [] }: ChartScreenPro
           Signal history unavailable
         </div>
       )}
-      {/* Chart */}
-      <div style={{ flex: 1, overflow: 'hidden' }}>
-        <HeliosChart ticker={ticker} markers={markers} interval={interval} />
+      {/* Chart — at its own full height, never squeezed to fit.
+          Real bug found 2026-09-10 while fitting the Key Levels card: this
+          wrapper was `flex: 1; overflow: hidden` inside a fixed-height
+          section. On a 375x812 phone that gave it 593px for a 640px chart,
+          so the bottom 48px were clipped — and the bottom of the chart is
+          the aggressor panel's time axis, the only visible x-axis on the
+          chart (measured: panel 704–800px, wrapper ending at 752px). The
+          chart screen had no readable time axis on a phone. */}
+      <div style={{ flexShrink: 0 }}>
+        <HeliosChart ticker={ticker} markers={markers} interval={interval} onSessionVwap={setSessionVwap} />
       </div>
+      <KeyLevelsCard ticker={ticker} vwap={sessionVwap} />
     </section>
   );
 }

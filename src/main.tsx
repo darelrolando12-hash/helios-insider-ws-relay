@@ -12,6 +12,7 @@ import * as dumpRipDetector   from './engines/dumpRipDetector';
 import * as chainAggregator from './engines/chainAggregator';
 import { initLedger }     from './ledger/signalLedger';
 import { startResolver, setMarketOpen } from './ledger/outcomeResolver';
+import * as marketStatusStore from './stores/marketStatusStore';
 import { replayTodaySession } from './engines/backtestEngine';
 import { MassiveRestClient } from './lib/massive/api';
 import { massiveBus }     from './lib/massive/websocket';
@@ -98,6 +99,10 @@ function _refreshMarketStatus() {
       console.error(`[main] Market status poll result: ${status.market}`);
       confluenceEngine.setMarketStatus(status.market);
       setMarketOpen(isOpen);
+      // Publish the venue's own answer so the UI stops re-deriving it from a
+      // hardcoded schedule (no holidays) or from bar age (no market
+      // awareness at all). See marketStatusStore's header.
+      marketStatusStore.setMarketStatus(status.market, status.serverTimeMs);
 
       if (_wasMarketOpen === true && isOpen === false) {
         console.log('[main] Market just closed — running today\'s backtest replay for all FEED_TICKERS.');

@@ -18,6 +18,13 @@ import type { Bar, MarketStatus } from '../../stores/types';
 import { toCentralTime } from '../time';
 import { RELAY_REST_URL } from '../../config';
 
+// ── Constants ─────────────────────────────────────────────────────────────────
+
+/** Per-request deadline for every relay REST call. See _get's own comment for
+ *  why this is a deadline and not, despite the old error string, a measured
+ *  network duration. */
+const REST_TIMEOUT_MS = 25_000;
+
 // ── Internal types ────────────────────────────────────────────────────────────
 
 interface MassiveAggResult {
@@ -82,7 +89,8 @@ interface MassiveTradeResult {
 
 interface MassiveTradeResponse {
   status:  string;
-  results: MassiveTradeResult[];
+  /** Raw wire rows — see fetchTradesSince for the real field names. */
+  results: { price: number; size: number; sip_timestamp: number; conditions?: number[]; exchange?: number }[];
   next_url?: string;
 }
 
@@ -438,13 +446,31 @@ export class MassiveRestClient {
     afterUtcMs: number,
     limit      = 1000,
   ): Promise<MassiveTradeResult[]> {
+    // Wire format, captured 2026-09-11 from /v3/trades/SPY — NOT what this
+    // method originally assumed:
+    //   filter  `timestamp.gt=<nanoseconds>`. The previous `timestamp=gt.<ms>`
+    //           is rejected: HTTP 400 "failed to parse timestamp query params:
+    //           time string was not any valid format: gt.1789047000000".
+    //           Railway's logs show the engine's cvdRebuild failing exactly
+    //           that way for every ticker on every boot.
+    //   time    `sip_timestamp`, in NANOSECONDS. There is no `timestamp` field.
+    // The nanosecond bound is built as a string: ms × 1e6 (~1.8e18) is past
+    // Number's exact-integer range.
     const url = this._url(
       `/v3/trades/${encodeURIComponent(ticker)}`,
-      { timestamp: `gt.${afterUtcMs}`, limit: String(limit), sort: 'timestamp' },
+      { 'timestamp.gt': `${Math.floor(afterUtcMs)}000000`, limit: String(limit), sort: 'timestamp', order: 'asc' },
     );
 
     const json = await this._get<MassiveTradeResponse>(url);
-    return json.results ?? [];
+    const out: MassiveTradeResult[] = [];
+    for (const r of json.results ?? []) {
+      const ms = Math.floor(Number(r.sip_timestamp) / 1e6);
+      // Plausibility, not just type — a unit mix-up yields a valid-looking
+      // number in the wrong century (CLAUDE.md, the LULD nanosecond lesson).
+      if (!(ms > 946_684_800_000 && ms < 4_102_444_800_000)) continue; // 2000 … 2100
+      out.push({ price: r.price, size: r.size, timestamp: ms, conditions: r.conditions, exchange: r.exchange });
+    }
+    return out;
   }
 
   // ── Options snapshot ──────────────────────────────────────────────────────
@@ -850,7 +876,41 @@ export class MassiveRestClient {
 
   private async _get<T>(url: string): Promise<T> {
     const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 25000);
+    const startedAt  = performance.now();
+
+    // Real bug found and fixed live (2026-09-09). setTimeout is a WALL-CLOCK
+    // deadline, and this abort used to fire unconditionally. When the browser
+    // main thread is blocked past the deadline — measured on a freshly loaded
+    // page: 77.3% of wall clock inside long tasks, worst single task 4,677ms —
+    // the sequence is:
+    //
+    //   t≈0.3s   relay responds 200 (verified live: the very endpoints being
+    //            reported as timeouts answer in 197–366ms from a clean tab)
+    //            → the fetch continuation is QUEUED, but cannot run
+    //   t=25s    the abort timer's callback is QUEUED behind it
+    //   t=60s+   thread frees → abort fires → kills a request that had
+    //            ALREADY SUCCEEDED → reported as "timeout after 25s"
+    //
+    // Nothing on the network ever took 25 seconds. Every subsystem funnels
+    // through this one method (chainAggregator, ratiosIngestion,
+    // insiderIngestion, bars1mIngestion, fetchMarketStatus, the chart
+    // backfill), so a single client-side stall surfaced everywhere at once as
+    // fabricated server timeouts — which is what made this read as a relay
+    // capacity problem for so long.
+    //
+    // Two guards, deliberately both:
+    //  1. `responded` — the fetch continuation is queued BEFORE the timer
+    //     callback (0.3s vs 25s), so it runs first when the thread frees and
+    //     disarms the abort. clearTimeout alone is not enough: a timer whose
+    //     callback is already queued can still run.
+    //  2. The message now reports REAL elapsed time and calls out a deadline
+    //     overshoot explicitly, so any future occurrence diagnoses itself
+    //     instead of blaming the server again.
+    let responded = false;
+    const timeoutId = setTimeout(() => {
+      if (responded) return;
+      controller.abort();
+    }, REST_TIMEOUT_MS);
 
     try {
       const res = await fetch(url, {
@@ -858,13 +918,20 @@ export class MassiveRestClient {
         headers: { Accept: 'application/json' },
         signal:  controller.signal,
       });
+      responded = true;
+      clearTimeout(timeoutId);
       if (!res.ok) {
         throw new Error(`MassiveREST ${res.status} ${res.statusText} — ${url.split('?')[0]}`);
       }
       return await res.json() as T;
     } catch (err) {
       if (err instanceof Error && err.name === 'AbortError') {
-        throw new Error(`MassiveREST timeout after 25s — ${url.split('?')[0]}`);
+        const elapsed = Math.round(performance.now() - startedAt);
+        const overshoot = elapsed - REST_TIMEOUT_MS;
+        const blocked = overshoot > REST_TIMEOUT_MS * 0.2
+          ? ` — deadline overshot by ${overshoot}ms, so the MAIN THREAD WAS BLOCKED; this is a client-side stall, not a slow server`
+          : '';
+        throw new Error(`MassiveREST aborted after ${elapsed}ms (deadline ${REST_TIMEOUT_MS}ms)${blocked} — ${url.split('?')[0]}`);
       }
       throw err;
     } finally {

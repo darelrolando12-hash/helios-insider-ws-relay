@@ -230,17 +230,25 @@ function _inferActiveState(signal: Signal, candles: number): ActiveState {
 
   // Flip detected: price crossed through flipLevel against signal direction
   const isCallSignal = _isCallSignal(signal);
-  if (isCallSignal && price < ctx.flipLevel)  return 'FLIP_DETECTED';
-  if (!isCallSignal && price > ctx.flipLevel) return 'FLIP_DETECTED';
+  // Only against a known flip — an absent one (null, lib/zeroGamma) cannot
+  // be crossed. With the old flip far below price ($580 SPY, $5 META) every
+  // put signal read FLIP_DETECTED and no call signal ever could.
+  if (ctx.flipLevel !== null) {
+    if (isCallSignal && price < ctx.flipLevel)  return 'FLIP_DETECTED';
+    if (!isCallSignal && price > ctx.flipLevel) return 'FLIP_DETECTED';
+  }
 
   // Consolidation: price between put wall and call wall for 2+ candles
-  if (price > ctx.walls.putWall && price < ctx.walls.callWall) {
+  // Both need real walls — an absent wall (null) is neither "between" nor
+  // "beyond". They used to be the spot price when missing.
+  const { callWall, putWall } = ctx.walls;
+  if (callWall !== null && putWall !== null && price > putWall && price < callWall) {
     return candles >= 4 ? 'CONSOLIDATING' : 'ACTIVE';
   }
 
   // Continuation: price beyond primary wall
-  if (isCallSignal && price >= ctx.walls.callWall)  return 'CONTINUATION';
-  if (!isCallSignal && price <= ctx.walls.putWall)  return 'CONTINUATION';
+  if (isCallSignal && callWall !== null && price >= callWall)  return 'CONTINUATION';
+  if (!isCallSignal && putWall !== null && price <= putWall)  return 'CONTINUATION';
 
   return 'ACTIVE';
 }

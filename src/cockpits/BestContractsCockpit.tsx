@@ -192,14 +192,14 @@ interface RankedCard {
   usedFallbackStrike: boolean; // true if ATM failed spread/IV and an adjacent strike was used instead
 
   // Risk / reward
-  callWall:       number;
-  putWall:        number;
-  flipLevel:      number;
+  callWall:       number | null;   // null = absent, never 0 or spot
+  putWall:        number | null;
+  flipLevel:      number | null;
   maxPain:        number;
   gexRegime:      string;
-  upTarget:       number;
-  downTarget:     number;
-  distToWall:     number; // points from current price to nearest blocking wall
+  upTarget:       number | null;
+  downTarget:     number | null;
+  distToWall:     number | null; // points from current price to nearest blocking wall; null when there is no wall
 
   // Timing blockers
   blockers:       TimingBlocker[];
@@ -599,7 +599,11 @@ export default function BestContractsCockpit({
       // Opening observation blocker (first candle not yet closed after open)
       const ct = toCentralTime(Date.now());
       const minuteOfDay = ct.hour * 60 + ct.minute;
-      const marketOpenMin = 9 * 60 + 30;
+      // NYSE regular open, 9:30 AM ET = 8:30 AM CT — `ct` is Central. This
+      // was 9 * 60 + 30: the Eastern time in a Central frame, so the blocker
+      // fired 9:30–9:35 CT and the real opening candle (8:30–8:35 CT) went
+      // unblocked. Line ~442 of this file already had it right.
+      const marketOpenMin = 8 * 60 + 30;
       const firstCandleClosedMin = marketOpenMin + 5;
       const firstCandleClosed = !!(bars && bars.length >= 2 && minuteOfDay >= firstCandleClosedMin);
 
@@ -748,36 +752,38 @@ export default function BestContractsCockpit({
       const c4SignalState = actionableTypes.has(signal.type) && signal.confidence >= 65;
 
       // ── Criterion 5: Spread < 8% ────────────────────────────────────────────
-      const c5Spread = spreadPct < SPREAD_MAX_PCT || midPremium === 0;
+      // Criteria 5–7 pass only on data that is there — same fix as the 0DTE
+      // cockpit and relay/engine/ledger/bestContractPicker.ts. Each used to
+      // pass on its absence (zero premium, no context/bars, no IV).
+      const c5Spread = midPremium > 0 && spreadPct < SPREAD_MAX_PCT;
 
       // ── Criterion 6: Break-even achievable before GEX wall ──────────────────
       const breakEvenMove = midPremium; // points needed (simplified: 1 delta ATM)
-      let c6BreakEven = true;
-      if (ctx && bars && bars.length > 0) {
+      let c6BreakEven = false;
+      if (ctx && bars && bars.length > 0 && midPremium > 0) {
         const price     = bars[bars.length - 1].close;
         const wall      = direction === 'call' ? ctx.walls.callWall : ctx.walls.putWall;
-        const distWall  = Math.abs(wall - price);
-        c6BreakEven     = breakEvenMove < distWall;
+        c6BreakEven     = wall !== null && breakEvenMove < Math.abs(wall - price);
       }
 
       // ── Criterion 7: IV rank < 75th percentile ───────────────────────────────
-      const c7IvRank = ivRank === null || ivRank < IV_RANK_WARN;
+      const c7IvRank = ivRank !== null && ivRank < IV_RANK_WARN;
 
       // ── Criterion 8: No earnings within 2 days ───────────────────────────────
       const c8NoEarnings = earningsDate === null;
 
       // ── GEX / price levels ───────────────────────────────────────────────────
-      const callWall   = ctx?.walls.callWall  ?? 0;
-      const putWall    = ctx?.walls.putWall   ?? 0;
-      const flipLevel  = ctx?.flipLevel       ?? 0;
+      // Absent stays absent (null) — these were `?? 0`, a wall at $0.
+      const callWall   = ctx?.walls.callWall  ?? null;
+      const putWall    = ctx?.walls.putWall   ?? null;
+      const flipLevel  = ctx?.flipLevel       ?? null;
       const maxPain    = ctx?.maxPain         ?? 0;
       const gexRegime  = ctx?.gexRegime       ?? 'neutral';
-      const upTarget   = ctx?.upTarget        ?? 0;
-      const downTarget = ctx?.downTarget      ?? 0;
+      const upTarget   = ctx?.upTarget        ?? null;
+      const downTarget = ctx?.downTarget      ?? null;
       const price      = bars ? bars[bars.length - 1].close : 0;
-      const distToWall = direction === 'call'
-        ? Math.abs(callWall - price)
-        : Math.abs(putWall - price);
+      const blockingWall = direction === 'call' ? callWall : putWall;
+      const distToWall = blockingWall === null ? null : Math.abs(blockingWall - price);
 
       // ── DTE recommendation ───────────────────────────────────────────────────
       const dte = computeDteRecommendation(signal, baseRate, ctx);
@@ -1008,8 +1014,7 @@ export default function BestContractsCockpit({
   }, [onOpenCockpit, rebuildCards]);
 
   function upTarget(card: RankedCard): number | null {
-    if (card.direction === 'call') return card.upTarget > 0 ? card.upTarget : null;
-    return card.downTarget > 0 ? card.downTarget : null;
+    return card.direction === 'call' ? card.upTarget : card.downTarget;
   }
 
   // ── Discipline ack ────────────────────────────────────────────────────────────
@@ -1633,15 +1638,15 @@ function RiskRewardSection({ card }: { card: RankedCard }) {
       <div className="grid grid-cols-2 gap-x-6 gap-y-1.5 text-xs">
         <EconRow
           label="Call Wall"
-          value={callWall > 0 ? callWall.toFixed(2) : '—'}
+          value={callWall !== null ? callWall.toFixed(2) : '—'}
         />
         <EconRow
           label="Put Wall"
-          value={putWall > 0 ? putWall.toFixed(2) : '—'}
+          value={putWall !== null ? putWall.toFixed(2) : '—'}
         />
         <EconRow
           label="Flip Level"
-          value={flipLevel > 0 ? flipLevel.toFixed(2) : '—'}
+          value={flipLevel !== null ? flipLevel.toFixed(2) : '—'}
         />
         <EconRow
           label="Max Pain"
@@ -1649,9 +1654,7 @@ function RiskRewardSection({ card }: { card: RankedCard }) {
         />
         <EconRow
           label={direction === 'call' ? 'Up Target' : 'Down Target'}
-          value={(direction === 'call' ? upTarget : downTarget) > 0
-            ? (direction === 'call' ? upTarget : downTarget).toFixed(2)
-            : '—'}
+          value={(() => { const t = direction === 'call' ? upTarget : downTarget; return t !== null ? t.toFixed(2) : '—'; })()}
           highlight
         />
         <EconRow
@@ -1660,7 +1663,7 @@ function RiskRewardSection({ card }: { card: RankedCard }) {
         />
         <EconRow
           label="Dist to Wall"
-          value={distToWall > 0 ? `${distToWall.toFixed(2)} pts` : '—'}
+          value={distToWall !== null && distToWall > 0 ? `${distToWall.toFixed(2)} pts` : '—'}
           warn={!card.c6BreakEven}
         />
         <EconRow

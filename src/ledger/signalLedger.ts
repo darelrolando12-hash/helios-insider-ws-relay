@@ -136,6 +136,56 @@ export function initLedger(): () => void {
   return unsub;
 }
 
+// ── Per-bar duplicate suppression ──────────────────────────────────────────────
+//
+// Real, measured defect (2026-09-10). 50.2% of the last real session's
+// signal rows were byte-identical duplicates: same ticker, same bar, same
+// direction, same type, same price. 42.9% of (ticker, bar) buckets carried
+// more than one row; the worst historical case was 398 identical call/EXIT
+// rows at one price inside 7 seconds. Verified directly against the live
+// table, not inferred.
+//
+// The mechanism is NOT a missing gate — confluenceEngine already refuses to
+// re-emit while the score stays inside the same band:
+//
+//     if (_lastBand.get(ticker) === band) return;
+//
+// What that gate lacks is HYSTERESIS. It is a bare equality check, so a
+// score oscillating by a point either side of a threshold re-triggers on
+// every crossing, and _onStoreUpdate() re-scores every watched ticker on
+// every store notification — with WS frames arriving at ~313/sec (measured
+// during the Track B work). A score hovering at 55 therefore flips
+// none↔EXIT repeatedly and emits each time, which is exactly why EXIT
+// (the 55–64 band, and so the most-hovered boundary) accounted for 426 of
+// 548 rows against just 3 ENTERs.
+//
+// Fixing the oscillation properly means adding hysteresis to the scoring
+// gate, which changes real signal-generation behaviour and Brain's training
+// input — that is a deliberate product decision, not a cleanup. This guard
+// is the structural backstop underneath it: whatever the scorer does, the
+// ledger records a given (ticker, bar, direction, type) at most once.
+//
+// Price is deliberately NOT part of the key. entry_price is the bar's close
+// and is therefore constant within a bar — confirmed against the live table:
+// across the last session, zero keys showed any price drift, so a
+// byte-identical key and this key suppress exactly the same 275 rows.
+// Leaving price out costs nothing today and stays correct if the scorer ever
+// starts sampling an intra-bar price.
+const _seenThisBar = new Set<string>();
+/** Bounded so a long session cannot grow this without limit. Comfortably
+ *  larger than (watched tickers × directions × types) for one bar. */
+const _SEEN_CAP = 2_000;
+
+function _rememberThisBar(key: string) {
+  if (_seenThisBar.size >= _SEEN_CAP) {
+    // Oldest-first eviction — Set preserves insertion order, and keys from
+    // older bars are always the oldest entries.
+    const oldest = _seenThisBar.values().next().value;
+    if (oldest !== undefined) _seenThisBar.delete(oldest);
+  }
+  _seenThisBar.add(key);
+}
+
 // ── Signal handler ─────────────────────────────────────────────────────────────
 
 async function _onSignal(signal: Signal): Promise<void> {
@@ -167,9 +217,44 @@ async function _onSignal(signal: Signal): Promise<void> {
     factors,
   };
 
+  // One signal per (ticker, bar, direction, type). See _seenThisBar.
+  const dedupeKey = `${signal.ticker}|${signal.firedAtCT}|${direction}|${signal.type}`;
+  if (_seenThisBar.has(dedupeKey)) {
+    console.log(
+      `[signalLedger] Suppressed duplicate ${signal.ticker} ${signal.type} (${direction}) ` +
+      `for bar ${signal.firedAtCT} — already recorded this bar.`
+    );
+    return;
+  }
+  _rememberThisBar(dedupeKey);
+
+  // Conflict on the NATURAL key, not on `id`.
+  //
+  // `id` is `sig_<per-session counter>_<ticker>_<Date.now()>`, so two writers
+  // can never produce the same id for the same signal — onConflict:'id' could
+  // only ever catch a literal retry of one row. Measured 2026-09-10 after
+  // Wegic's cleanup: 14 separate page sessions wrote signals within two hours
+  // (every open tab, every device, every reload, Wegic's production build and
+  // local dev all share this table), and 5 of 8 duplicated buckets came from
+  // DIFFERENT sessions — exactly the case the in-memory guard above cannot
+  // see. The unique index on (ticker, entry_tct, direction, signal_type)
+  // makes a second copy impossible from any writer, including the relay
+  // engine once it leaves shadow mode alongside the browser.
+  //
+  // CLAUDE.md's ignoreDuplicates warning (the 91%-unrepairable disclosures
+  // bug) does not apply here, and deliberately so: that table needed later
+  // rows to UPDATE earlier ones. A signal row is insert-once by design (see
+  // this file's header — "never updated after insert"; outcomes live in
+  // signal_outcomes), and the first write IS the genuine first emission.
+  // DO NOTHING on the natural key is exactly the right semantics.
+  //
+  // REQUIRES the unique index from backups/signals-unique-constraint.sql to
+  // exist first. Without it PostgREST rejects every write ("no unique or
+  // exclusion constraint matching the ON CONFLICT specification") — that
+  // failure is logged below, never thrown, so it would look like a quiet day.
   const { error: dbError } = await supabase
     .from('signals')
-    .upsert(row, { onConflict: 'id', ignoreDuplicates: true });
+    .upsert(row, { onConflict: 'ticker,entry_tct,direction,signal_type', ignoreDuplicates: true });
 
   if (dbError) {
     // Log but never throw — a ledger write failure must never propagate back

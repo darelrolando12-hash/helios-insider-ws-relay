@@ -160,12 +160,30 @@ export async function refreshBrainStore(): Promise<void> {
     // Fetch all outcome rows for resolved signals
     const signalIds = (signals as ResolvedSignalRow[]).map(s => s.id);
 
-    const { data: outcomes, error: outErr } = await supabase
-      .from('signal_outcomes')
-      .select('signal_id, window_ms, pnl_pct, result')
-      .in('signal_id', signalIds);
-
-    if (outErr) throw new Error(outErr.message);
+    // Chunked, because PostgREST puts .in() into the URL QUERY STRING.
+    //
+    // Real failure, reproduced live 2026-09-10: the Brain screen showed
+    // "Failed to load engine data: TypeError: Failed to fetch". Every table
+    // involved returned 200 when queried directly, so it was not a missing
+    // table or a permissions problem — it was the request never leaving the
+    // browser. There are 22,818 resolved signals, and at ~29 bytes per id
+    // that is a ~662KB URL against browser/server limits of roughly 8-64KB.
+    // A URL that long fails at the network layer, which surfaces as exactly
+    // this TypeError rather than as a Supabase error object.
+    //
+    // Note this is NOT fixed by the duplicate-signal cleanup on its own:
+    // even at ~2,600 resolved rows the URL would still be ~75KB, still over
+    // the limit. The cleanup reduces it; only chunking makes it correct.
+    const CHUNK = 200; // ~6KB of URL per request — comfortably inside every limit
+    const outcomes: OutcomeRow[] = [];
+    for (let i = 0; i < signalIds.length; i += CHUNK) {
+      const { data: page, error: outErr } = await supabase
+        .from('signal_outcomes')
+        .select('signal_id, window_ms, pnl_pct, result')
+        .in('signal_id', signalIds.slice(i, i + CHUNK));
+      if (outErr) throw new Error(outErr.message);
+      if (page) outcomes.push(...(page as OutcomeRow[]));
+    }
 
     // Build a lookup: signalId → outcomes[]
     const outcomesBySignal = new Map<string, OutcomeRow[]>();

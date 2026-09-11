@@ -25,8 +25,16 @@ import { formatError } from '../lib/errors';
 /** Maximum age of the most recent bar before the ticker is considered stale. */
 const STALE_THRESHOLD_MS = 2 * 60 * 1000; // 2 minutes
 
-/** Maximum bars retained per ticker in memory (one full session + buffer). */
-const MAX_BARS_PER_TICKER = 500;
+/**
+ * Maximum bars retained per ticker — one FULL extended session. The feed
+ * runs ~03:00–19:00 CT = 960 one-minute bars; 1,000 holds all of it.
+ *
+ * It was 500, commented "one full session + buffer" — true only for the
+ * 390-minute regular session. Session VWAP (lib/sessionVwap) needs every bar
+ * since the session start, and 500 bars stopped reaching it by ~11:20 CT:
+ * measured −9¢ on QQQ at 14:59 CT and −22¢ on SPY at 18:59 CT, 2026-09-09/10.
+ */
+const MAX_BARS_PER_TICKER = 1_000;
 
 /**
  * Max number of tickers allowed to have a reconnect gap-fill REST call in
@@ -131,12 +139,15 @@ export function subscribeTicker(ticker: string) {
 
   _state.set(ticker, { bars: [], backfilling: false, subscribed: false });
 
-  // Subscribe to per-minute aggregates on the WS bus
+  // Subscribe to per-minute aggregates on the WS bus, plus per-second
+  // aggregates so the currently-forming bar stays live between minutes.
   massiveBus.subscribeStock('AM', ticker);
+  massiveBus.subscribeStock('A', ticker);
   _getOrCreate(ticker).subscribed = true;
 
-  // Register the AM message handler
+  // Register the message handlers
   massiveBus.on('AM', _handleAM);
+  massiveBus.on('A', _handleA);
 
   // Cold-start backfill — async, status stays 'loading' until it resolves
   _backfill(ticker, 'cold-start');
@@ -147,6 +158,7 @@ export function subscribeTicker(ticker: string) {
  */
 export function unsubscribeTicker(ticker: string) {
   massiveBus.unsubscribeStock('AM', ticker);
+  massiveBus.unsubscribeStock('A', ticker);
   _state.delete(ticker);
   _notify();
 }
@@ -265,16 +277,152 @@ function _handleAM(msg: WSMessageWithCT) {
   _notify();
 }
 
-function _appendBar(ticker: string, state: TickerState, bar: Bar) {
-  // Deduplicate by tUtc — a reconnect can replay the current-minute bar
+/**
+ * Per-second aggregate — keeps the CURRENTLY-FORMING minute bar live.
+ *
+ * Why this exists (2026-09-10): AM only arrives once a minute, at the
+ * minute's close, so between ticks the newest candle was frozen — its high,
+ * low and close could not move until the bar was already finished. This
+ * folds Massive's 'A' (per-second aggregate) channel into that same bar so
+ * it grows in real time, while AM continues to be the authority that
+ * finalises it.
+ *
+ * 'A' rather than raw 'T' trades, deliberately. Both are real Massive
+ * channels and 'T' is already subscribed (cvdEngine uses it for trade
+ * classification), but trades arrive far faster than the ~313 WS
+ * frames/sec measured during the Track B work, and feeding that rate into
+ * the chart's setData path is precisely how the main thread was blocked
+ * 77% of the time. 'A' delivers the same sub-minute behaviour at ~1/sec.
+ *
+ * The bar is only ever EXTENDED, never rewritten: open and tUtc stay as AM
+ * established them, high/low only widen, close follows the newest second.
+ * If no forming bar exists yet for this second's minute, nothing is
+ * invented — AM opens bars, this only grows them.
+ */
+function _handleA(msg: WSMessageWithCT) {
+  const ticker = msg.sym;
+  const state  = _state.get(ticker);
+  if (!state) return;
+
+  const c = msg.c as number | undefined;
+  const h = msg.h as number | undefined;
+  const l = msg.l as number | undefined;
+  const o = msg.o as number | undefined;
+  const v = msg.v as number | undefined;
+  const s = msg.s as number | undefined;
+  if (typeof c !== 'number' || !Number.isFinite(c)) return;
+  if (typeof s !== 'number' || !Number.isFinite(s)) return;
+
+  // The minute this second belongs to, in both frames. AM labels a bar with
+  // its own bucket start (msg.s), so flooring a second's start to the minute
+  // produces exactly the key AM will use for the same minute — which is what
+  // lets _appendBar replace this bar in place when AM finally lands.
+  const minuteUtc = Math.floor(s / 60_000) * 60_000;
+  const minuteCT  = Math.floor(msg._ct.ctMs / 60_000) * 60_000;
+
   const last = state.bars[state.bars.length - 1];
-  if (last && last.tUtc === bar.tUtc) {
-    // Update in place: live bar gets updated ticks before the minute closes
-    state.bars[state.bars.length - 1] = bar;
+
+  // Plausibility, not just validity — CLAUDE.md's own rule from the
+  // nanosecond-timestamp incident. A technically-valid but wrong print here
+  // does not make a slightly-off candle; a zero low or a decimal-shifted
+  // high owns the whole price scale and flattens every other candle into a
+  // line. Reference the bar we already trust where we have one.
+  const ref = last ? last.close : (typeof o === 'number' ? o : c);
+  const plausible = (x: number) =>
+    Number.isFinite(x) && x > 0 && ref > 0 && Math.abs(x - ref) / ref < 0.20;
+  if (!plausible(c)) {
+    console.warn(`[barsStore] ${ticker}: implausible 'A' close ${c} against ${ref} — ignored.`);
     return;
   }
 
-  state.bars.push(bar);
+  // Case 1 — a bar for this minute already exists (provisional, or a real AM
+  // bar that landed early). Extend it: open never moves, high/low only widen.
+  if (last && last.tUtc === minuteUtc) {
+    let changed = false;
+    if (typeof h === 'number' && plausible(h) && h > last.high) { last.high = h; changed = true; }
+    if (typeof l === 'number' && plausible(l) && l < last.low)  { last.low  = l; changed = true; }
+    if (c !== last.close) { last.close = c; changed = true; }
+    if (typeof v === 'number' && Number.isFinite(v) && v > 0) { last.volume += v; changed = true; }
+    if (changed) _notifyCoalesced();
+    return;
+  }
+
+  // Case 2 — this second belongs to a minute NEWER than anything we hold, so
+  // open the forming bar ourselves.
+  //
+  // This is the part the first version of this function got wrong. It assumed
+  // AM opens a bar and 'A' extends it — but AM only arrives at a minute's
+  // CLOSE, so during the forming minute there is no AM bar to extend. Live
+  // instrumentation was unambiguous: 14 of 14 'A' messages were rejected for
+  // belonging to a minute 1-7 minutes ahead of the newest AM bar, and the
+  // forming candle never moved.
+  //
+  // vwap/transactions are deliberately left undefined rather than derived
+  // from one second — same discipline as aggregateBars' own merge, where a
+  // confidently-wrong number is worse than an honest absence. AM replaces
+  // this bar wholesale (via _appendBar's tUtc match) and brings the real
+  // vwap/transactions with it.
+  if (!last || minuteUtc > last.tUtc) {
+    _appendBar(ticker, state, {
+      ticker,
+      open:   typeof o === 'number' && plausible(o) ? o : c,
+      high:   typeof h === 'number' && plausible(h) ? h : c,
+      low:    typeof l === 'number' && plausible(l) ? l : c,
+      close:  c,
+      volume: typeof v === 'number' && Number.isFinite(v) ? v : 0,
+      vwap:         undefined,
+      transactions: undefined,
+      tCT:  minuteCT,
+      tUtc: minuteUtc,
+    });
+    _notifyCoalesced();
+  }
+  // Otherwise the second is older than our newest bar — a late or replayed
+  // message. Ignore it rather than rewriting settled history.
+}
+
+// ── Coalesced notification ────────────────────────────────────────────────────
+//
+// Non-negotiable constraint carried over from the Track B fix: subscriber
+// fan-out must not run more than once per animation frame. Every consumer of
+// this store re-derives real work from a notification — the chart alone
+// merges ~10k one-minute bars, rebuilds VWAP, runs three EMA passes and
+// calls setData on five series. Notifying per incoming second would rebuild
+// that ~60× a minute per ticker across ~23 tickers.
+//
+// AM keeps calling _notify() directly: one message per minute per ticker is
+// already rare, and a completed bar should land immediately.
+let _rafPending = 0;
+function _notifyCoalesced() {
+  if (_rafPending !== 0) return;
+  if (typeof requestAnimationFrame !== 'function') { _notify(); return; }
+  _rafPending = requestAnimationFrame(() => { _rafPending = 0; _notify(); });
+}
+
+/**
+ * Put `bar` where its minute belongs: replace the bar with the same tUtc, or
+ * insert in time order. Returns false when the bar was placed, not appended.
+ *
+ * Comparing against the last bar alone was wrong once `_handleA` began
+ * opening the forming minute (2026-09-11): Massive's AM for minute M lands a
+ * few seconds AFTER the first 'A' of minute M+1, so AM(M) was pushed behind
+ * the provisional M+1 bar. Seen live on TSLA — buffer [08:40 provisional,
+ * 08:39 AM, 08:40 again] — and the chart's order guard then dropped the
+ * authoritative 08:39 bar and every later update to 08:40.
+ */
+export function placeBar(bars: Bar[], bar: Bar): 'appended' | 'replaced' | 'inserted' {
+  let i = bars.length - 1;
+  while (i >= 0 && bars[i].tUtc > bar.tUtc) i--;
+  if (i >= 0 && bars[i].tUtc === bar.tUtc) { bars[i] = bar; return 'replaced'; }
+  if (i === bars.length - 1) { bars.push(bar); return 'appended'; }
+  bars.splice(i + 1, 0, bar);
+  return 'inserted';
+}
+
+function _appendBar(ticker: string, state: TickerState, bar: Bar) {
+  // A reconnect can replay the current-minute bar, and AM finalises a bar the
+  // 'A' channel opened — both replace in place.
+  if (placeBar(state.bars, bar) === 'replaced') return;
 
   // Trim to MAX_BARS_PER_TICKER — drop oldest
   if (state.bars.length > MAX_BARS_PER_TICKER) {

@@ -88,3 +88,30 @@ export function clusterMarkersForDisplay(
 
   return result;
 }
+
+/**
+ * 1D: one marker per day per direction, carrying the day's entry count.
+ *
+ * clusterMarkersForDisplay's "never collapse a mix" rule is right intraday,
+ * where a call and a put inside one 5-minute candle is a real event worth
+ * seeing. A daily candle holds a whole session, so a mix is the normal
+ * case, not an event — and the rule collapses nothing. Measured 2026-09-10,
+ * SPY, the chart's real 7-trading-day signal window: 445 markers over 8
+ * daily candles, 445 after clustering, drawn as a solid column ~55 markers
+ * tall on each candle.
+ *
+ * So at 1D each direction is clustered on its own — every group is then
+ * homogeneous and collapses to its strongest marker with a count (×N).
+ * EXIT markers are left out: their text is one signal's P&L, which has no
+ * meaning summed over a day; the outcomes are on the intraday charts.
+ */
+export function summariseMarkersByDay(
+  markers: readonly ChartSignalMarker[],
+  dayMs: number,
+): ChartSignalMarker[] {
+  const entries = markers.filter((m) => m.state !== 'EXIT');
+  return [
+    ...clusterMarkersForDisplay(entries.filter((m) => m.direction === 'call'), dayMs),
+    ...clusterMarkersForDisplay(entries.filter((m) => m.direction !== 'call'), dayMs),
+  ].sort((a, b) => a.tCT - b.tCT);
+}

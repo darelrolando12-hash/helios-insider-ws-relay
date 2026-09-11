@@ -40,6 +40,7 @@ import type { MarketContext } from '../stores/marketStore';
 import type { Bar }         from '../stores/types';
 import { computeEma }       from '../engines/confluenceEngine';
 import { toCentralTime }    from '../lib/time';
+import { latestSessionVwap } from '../lib/sessionVwap';
 
 // ── Constants ──────────────────────────────────────────────────────────────────
 
@@ -73,22 +74,16 @@ interface TileData {
   asOf:        string;       // last bar time formatted
   loading:     boolean;
   error:       string | null;
+  /** Bars are real but older than barsStore's 2-minute freshness window. */
+  stale:       boolean;
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
 
-function _sessionVwap(bars: Bar[]): number | null {
-  if (bars.length === 0) return null;
-  let cumPV = 0;
-  let cumV  = 0;
-  for (const b of bars) {
-    const v = b.volume;
-    const p = b.vwap ?? (b.high + b.low + b.close) / 3;
-    cumPV += p * v;
-    cumV  += v;
-  }
-  return cumV > 0 ? cumPV / cumV : null;
-}
+// Session VWAP is lib/sessionVwap's latestSessionVwap — the one definition.
+// This file used to compute its own: Massive's per-bar `vw` over the whole
+// buffer, never reset at the session boundary.
+const _sessionVwap = (bars: Bar[]): number | null => latestSessionVwap(bars);
 
 function _buildTile(ticker: string): TileData {
   const barsR  = barsStore.getResult(ticker);
@@ -103,20 +98,30 @@ function _buildTile(ticker: string): TileData {
       ticker, price: null, changePct: null, vwap: null, ema8: null,
       ema21: null, cvd: null, gex: null, direction: null, halted,
       hasHaltCoverage: haltCoverage,
-      asOf: '', loading: true, error: null,
+      asOf: '', loading: true, error: null, stale: false,
     };
   }
 
-  if (barsR.status === 'error') {
+  // Stale is not empty. barsStore reports 'error' once the newest bar is
+  // over 2 minutes old — which on a closed market is every ticker, all
+  // night. The tiles used to show "—" and "SPY bars are stale (last bar
+  // 11081s ago)" instead of the last close, hiding exactly what a trader
+  // opens a closed-market screen to read. Same fix the chart got
+  // (getBarsRaw is valid on stale data): render the real last bars, and
+  // label them with their time instead. Only a ticker with no bars at all
+  // is an error.
+  const stale = barsR.status === 'error';
+  const bars  = barsR.status === 'ready' ? barsR.data : barsStore.getBarsRaw(ticker);
+  if (bars.length === 0) {
     return {
       ticker, price: null, changePct: null, vwap: null, ema8: null,
       ema21: null, cvd: null, gex: null, direction: null, halted,
       hasHaltCoverage: haltCoverage,
-      asOf: '', loading: false, error: barsR.reason,
+      asOf: '', loading: false, error: barsR.status === 'error' ? barsR.reason : 'no bars',
+      stale,
     };
   }
 
-  const bars   = barsR.data;
   const last   = bars[bars.length - 1];
   const prev   = bars.length >= 2 ? bars[bars.length - 2] : null;
   const closes = bars.map(b => b.close);
@@ -126,7 +131,10 @@ function _buildTile(ticker: string): TileData {
   const vwap      = _sessionVwap(bars);
   const ema8      = closes.length >= 1 ? computeEma(closes, 8)  : null;
   const ema21     = closes.length >= 1 ? computeEma(closes, 21) : null;
-  const _ct = last ? toCentralTime(last.tCT) : null;
+  // From tUtc, not tCT. tCT is already the CT pseudo-epoch; running it
+  // through toCentralTime applied the offset twice, so this label read five
+  // hours early (the 2026-09-04 chart bug, still alive here).
+  const _ct = last ? toCentralTime(last.tUtc) : null;
   const asOf = _ct
     ? `${String(_ct.hour).padStart(2, '0')}:${String(_ct.minute).padStart(2, '0')}`
     : '';
@@ -146,6 +154,7 @@ function _buildTile(ticker: string): TileData {
     asOf,
     loading:   false,
     error:     null,
+    stale,
   };
 }
 
@@ -221,7 +230,7 @@ function GexBadge({ regime }: { regime: string }) {
   return                            <span className="text-[9px] font-bold px-1.5 py-0.5 rounded bg-white/5  text-white/40 border border-white/10">NEU</span>;
 }
 
-function PriceLevel({ label, value, highlight }: { label: string; value: number; highlight?: 'green' | 'red' | 'amber' }) {
+function PriceLevel({ label, value, highlight }: { label: string; value: number | null; highlight?: 'green' | 'red' | 'amber' }) {
   const cls = highlight === 'green' ? 'text-col-g'
             : highlight === 'red'   ? 'text-col-r'
             : highlight === 'amber' ? 'text-amb'
@@ -229,7 +238,7 @@ function PriceLevel({ label, value, highlight }: { label: string; value: number;
   return (
     <div className="flex justify-between items-center">
       <span className="text-[9px] text-white/25 uppercase tracking-wider">{label}</span>
-      <span className={`text-[11px] font-mono font-semibold ${cls}`}>{value.toFixed(2)}</span>
+      <span className={`text-[11px] font-mono font-semibold ${value === null ? 'text-white/25' : cls}`}>{value === null ? 'absent' : value.toFixed(2)}</span>
     </div>
   );
 }
@@ -275,10 +284,20 @@ function IndexTile({ tile }: { tile: TileData }) {
         <div className="absolute top-0 left-0 right-0 h-1 bg-amb animate-pulse" />
       )}
 
-      {/* Header row */}
+      {/* Header row.
+          min-w-0 on the left column is load-bearing, not cosmetic: a flex item
+          defaults to min-width:auto, so without it this column refuses to
+          shrink below its own content width. At the sm: breakpoint the tiles
+          become a 3-up grid (~200px each), neither column yields, and the
+          right-hand badges render straight on top of the ticker and price —
+          reproduced live at a 700px viewport: NEUTRAL over "QQQ", −GEX over
+          "710.59", BULLISH over "IWM".
+          flex-wrap lets the halt/CTX chips drop to their own line instead of
+          forcing width, and shrink-0 keeps the badge column intact so the
+          text side is the one that gives. */}
       <div className="flex items-start justify-between gap-2">
-        <div>
-          <div className="flex items-center gap-2">
+        <div className="min-w-0 flex-1">
+          <div className="flex items-center gap-2 flex-wrap">
             <span className="text-sm font-bold text-white tracking-wide">{tile.ticker}</span>
             {tile.halted && (
               <span className="text-[9px] font-bold px-1.5 py-0.5 bg-amb/15 text-amb border border-amb/30 rounded tracking-widest">HALT</span>
@@ -306,11 +325,13 @@ function IndexTile({ tile }: { tile: TileData }) {
             )}
           </div>
           {tile.asOf && (
-            <div className="text-[9px] text-white/20 mt-0.5">{tile.asOf} CT</div>
+            <div className={`text-[9px] mt-0.5 ${tile.stale ? 'text-amb/70' : 'text-white/20'}`}>
+              {tile.stale ? `LAST ${tile.asOf} CT · NOT LIVE` : `${tile.asOf} CT`}
+            </div>
           )}
         </div>
 
-        <div className="flex flex-col items-end gap-1.5">
+        <div className="flex flex-col items-end gap-1.5 shrink-0">
           {!isContext && tile.direction && (
             <BiasPill bias={tile.direction.sessionBias} />
           )}
@@ -613,7 +634,7 @@ export default function IndexesCockpit() {
       {/* Primary index tiles — SPY / QQQ / IWM */}
       <div>
         <div className="text-[10px] text-dim uppercase tracking-widest mb-2">Tradeable Indexes</div>
-        <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+        <div className="grid gap-3 [grid-template-columns:repeat(auto-fit,minmax(280px,1fr))]">
           {indexTiles.map(t => <IndexTile key={t.ticker} tile={t} />)}
         </div>
       </div>
@@ -627,7 +648,7 @@ export default function IndexesCockpit() {
       {/* Context tiles — TLT / HYG / VIX */}
       <div>
         <div className="text-[10px] text-dim uppercase tracking-widest mb-2">Macro Context</div>
-        <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+        <div className="grid gap-3 [grid-template-columns:repeat(auto-fit,minmax(280px,1fr))]">
           {contextTiles.map(t => <IndexTile key={t.ticker} tile={t} />)}
         </div>
       </div>

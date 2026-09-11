@@ -18,11 +18,30 @@
  * against the freshest spread in each batch. This store trusts that ordering.
  *
  * isDataReady(ticker):
- *   'ready' iff tickCount >= 1 AND the most recent tick is < 30 s old.
- *   A zeroed-out CVD with 0 ticks is 'loading', never 'ready'.
+ *   'ready' iff at least one tick of TODAY's regular session has been
+ *   classified. A zeroed-out CVD with 0 ticks is 'loading', never 'ready' —
+ *   and so is yesterday's total before today's first trade.
+ *
+ * ── Session scope (fixed 2026-09-11, same as relay/engine/stores/cvdStore.ts) ──
+ * Only regular-session trades count (8:30 AM–3:00 PM CT = NYSE 9:30 AM–4:00
+ * PM ET), and the first trade of a new session resets every total. Before
+ * this the totals only ever grew, so a tab left open across sessions scored
+ * the 25-point CVD factor — and wrote signals — on days of stale flow.
  */
 
 import { type CvdTick, type AssetClass, type Result, ready, loading } from './types';
+import { toCentralTime } from '../lib/time';
+
+const DAY_MS = 86_400_000;
+const SESSION_OPEN_MIN  = 8 * 60 + 30;  // NYSE 9:30 AM ET = 8:30 AM CT
+const SESSION_CLOSE_MIN = 15 * 60;      // NYSE 4:00 PM ET = 3:00 PM CT
+
+/** CT day index of the regular session `tCT` falls in, or null outside regular hours. */
+export function regularSessionDay(tCT: number): number | null {
+  const day = Math.floor(tCT / DAY_MS);
+  const min = Math.floor((tCT - day * DAY_MS) / 60_000);
+  return min >= SESSION_OPEN_MIN && min < SESSION_CLOSE_MIN ? day : null;
+}
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -79,6 +98,8 @@ interface TickerCvdState {
   lastTickAt:  number;   // UTC ms of most recent tick
   subscribed:  boolean;
   assetClass:  AssetClass;
+  /** CT day index of the regular session the totals belong to. */
+  sessionDay:  number | null;
 }
 
 const _state     = new Map<string, TickerCvdState>();
@@ -105,6 +126,7 @@ export function subscribeTicker(ticker: string, assetClass: AssetClass = 'stock'
     lastTickAt:  0,
     subscribed:  true,
     assetClass,
+    sessionDay:  null,
   });
 
   // WS subscriptions are managed by cvdEngine — not by this store.
@@ -128,6 +150,8 @@ export function unsubscribeTicker(ticker: string) {
 export function getResult(ticker: string): Result<CvdState> {
   const state = _state.get(ticker);
   if (!state || state.tickCount === 0) return loading();
+  // An earlier session's totals are not today's CVD.
+  if (state.sessionDay !== Math.floor(toCentralTime(Date.now()).ctMs / DAY_MS)) return loading();
 
   const ageMs = Date.now() - state.lastTickAt;
   if (ageMs > STALE_TICK_THRESHOLD_MS) {
@@ -161,6 +185,17 @@ export function appendClassifiedTick(ticker: string, tick: CvdTick) {
   const state = _state.get(ticker);
   if (!state) return;
 
+  // The uptick fallback compares against the last trade of any session.
+  state.prevPrice = tick.price;
+  const day = regularSessionDay(tick.tCT);
+  if (day === null) return;                       // extended hours: not session CVD
+  if (state.sessionDay === null || day > state.sessionDay) {
+    state.sessionDay = day;
+    state.buyDelta = 0; state.sellDelta = 0; state.tickCount = 0; state.ticks = [];
+  } else if (day < state.sessionDay) {
+    return;
+  }
+
   state.ticks.push(tick);
   if (state.ticks.length > MAX_TICKS_PER_TICKER) {
     state.ticks.splice(0, state.ticks.length - MAX_TICKS_PER_TICKER);
@@ -174,7 +209,6 @@ export function appendClassifiedTick(ticker: string, tick: CvdTick) {
     state.sellDelta += tick.size;
   }
 
-  state.prevPrice = tick.price;
   _notify();
 }
 

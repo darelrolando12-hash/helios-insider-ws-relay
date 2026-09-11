@@ -67,7 +67,7 @@ let   _signalCounter = 0;
 // same band (e.g. wobbling at score 76-78 would otherwise spam ENTER on
 // every tick). A ticker must fully exit a band (drop to 'none' or move to a
 // different band) before it can re-fire that band again.
-type ScoreBand = 'none' | 'EXIT' | 'REVERSAL' | 'ENTER_BREAKOUT';
+export type ScoreBand = 'none' | 'EXIT' | 'REVERSAL' | 'ENTER_BREAKOUT';
 const _lastBand = new Map<string, ScoreBand>();
 
 // ── SCORE-DIAG throttling ────────────────────────────────────────────────────
@@ -107,6 +107,46 @@ export function scoreBand(score: number): ScoreBand {
   if (score >= REVERSAL_THRESHOLD) return 'REVERSAL';
   if (score >= EXIT_THRESHOLD)     return 'EXIT';
   return 'none';
+}
+
+/**
+ * How far BELOW a band's own floor the score must fall before the latch
+ * releases it downward. Upward moves are immediate and unchanged.
+ *
+ * Real, measured defect (2026-09-10): the edge-triggered gate compared bands
+ * with a bare equality check, so a score oscillating a point either side of
+ * a threshold re-triggered on every crossing — and _onStoreUpdate() rescores
+ * every watched ticker on every store notification, ~313 WS frames/sec. The
+ * last full session carried 426 EXIT rows against 3 ENTERs; EXIT is the
+ * 55–64 band, and 55 is the most-hovered boundary on the scale.
+ *
+ * 3 points is a Schmitt trigger, not a threshold change: it cannot make a
+ * signal fire that would not have fired before, it only stops the same
+ * crossing being counted many times. 3 is ~5% of the 55-point entry floor —
+ * wider than tick-to-tick scoring jitter, far narrower than any band.
+ */
+export const BAND_HYSTERESIS_POINTS = 3;
+
+const _BAND_RANK: Record<ScoreBand, number> = { none: 0, EXIT: 1, REVERSAL: 2, ENTER_BREAKOUT: 3 };
+const _BAND_FLOOR: Record<ScoreBand, number> = {
+  none:           -Infinity,
+  EXIT:           EXIT_THRESHOLD,
+  REVERSAL:       REVERSAL_THRESHOLD,
+  ENTER_BREAKOUT: ENTER_THRESHOLD,
+};
+
+/**
+ * The band `score` belongs to, given the band the ticker is currently latched
+ * in. Pure and exported so the latch can be tested without a live feed.
+ *
+ *   rising (or staying): the plain threshold applies — no change in behaviour.
+ *   falling: stay in the current band until the score is clearly below its
+ *            floor (floor − BAND_HYSTERESIS_POINTS), then take the raw band.
+ */
+export function scoreBandWithHysteresis(score: number, current: ScoreBand): ScoreBand {
+  const raw = scoreBand(score);
+  if (_BAND_RANK[raw] >= _BAND_RANK[current]) return raw;
+  return score >= _BAND_FLOOR[current] - BAND_HYSTERESIS_POINTS ? current : raw;
 }
 
 // ── Public API ────────────────────────────────────────────────────────────────
@@ -211,7 +251,7 @@ function _scoreTicker(ticker: string) {
       console.log(
         `[SCORE-DIAG] ${ticker} total=${score} ` +
         `cvd=${scoreCvd(cvd).points}(call=${cvd.callPct.toFixed(1)},put=${cvd.putPct.toFixed(1)},cls=${cvd.classification}) ` +
-        `gex=${scoreGex(ctx, currentPrice).points}(regime=${ctx.gexRegime},flipDist=${(Math.abs(currentPrice - ctx.flipLevel) / currentPrice * 100).toFixed(3)}%) ` +
+        `gex=${scoreGex(ctx, currentPrice).points}(regime=${ctx.gexRegime},flipDist=${ctx.flipLevel === null ? `ABSENT(${ctx.flipAbsentReason ?? 'unknown'})` : (Math.abs(currentPrice - ctx.flipLevel) / currentPrice * 100).toFixed(3) + '%'}) ` +
         `ema=${scoreEmaTrend(bars).points} ` +
         `catalyst=${scoreCatalyst(catalyst).points}(quality=${scoreCatalyst(catalyst).dataQuality}) ` +
         `sources=[${sources.join(',')}]`
@@ -221,16 +261,24 @@ function _scoreTicker(ticker: string) {
     }
   }
 
+  // Edge-triggered gate with hysteresis: only emit on a genuine transition
+  // into a new band, and never re-count the same crossing.
+  const prevBand = _lastBand.get(ticker) ?? 'none';
+  const band     = scoreBandWithHysteresis(score, prevBand);
+
   const signalType = resolveSignalType(score, cvd, ctx, currentPrice);
   if (!signalType) {
-    _lastBand.set(ticker, 'none');
+    // Second oscillation path, fixed alongside the first. This used to reset
+    // the latch to 'none' on ANY null signal type — and resolveSignalType
+    // depends on CVD, GEX context and price as well as score, so a jitter in
+    // any of those flipped it null↔non-null while the score never left its
+    // band. The next tick then saw 'none' → band and emitted again. Release
+    // the latch only once the SCORE itself has genuinely left the bands.
+    if (band === 'none') _lastBand.set(ticker, 'none');
     return;
   }
 
-  // Edge-triggered gate: only emit if this is a genuine transition into the
-  // current band, not a repeat evaluation while still inside it.
-  const band = scoreBand(score);
-  if (_lastBand.get(ticker) === band) return;
+  if (prevBand === band) return;
   _lastBand.set(ticker, band);
 
   _emit({
@@ -370,8 +418,15 @@ export function scoreGex(ctx: MarketContext, currentPrice: number): ComponentSco
   // In positive GEX regime and price is between walls (pinned range) → bullish context
   // In negative GEX regime (trending) → directional setup
   // At or near flip level (within 0.5%) → highest alignment
-  const flipDist = Math.abs(currentPrice - ctx.flipLevel) / currentPrice;
-  if (flipDist <= 0.005) return { points: 20 }; // at the flip — maximum GEX alignment
+  //
+  // A null flip is ABSENT (lib/zeroGamma.ts), and absent blocks: the flip
+  // bonus cannot be earned; the regime, which is real, still scores. This
+  // used to read a flip that was $5 on META and exactly spot wherever no
+  // crossing was found — dead on ten tickers, permanently maxed on the rest.
+  if (ctx.flipLevel !== null) {
+    const flipDist = Math.abs(currentPrice - ctx.flipLevel) / currentPrice;
+    if (flipDist <= 0.005) return { points: 20 }; // at the flip — maximum GEX alignment
+  }
 
   if (ctx.gexRegime === 'negative') return { points: 15 }; // trending regime
   if (ctx.gexRegime === 'positive') return { points: 10 }; // mean-reverting regime
@@ -426,13 +481,18 @@ export function resolveSignalType(
   if (score < EXIT_THRESHOLD) return null;
 
   const isBullish =
-    cvd.classification === 'bullish' && (ctx.gexRegime === 'negative' || currentPrice > ctx.flipLevel);
+    cvd.classification === 'bullish' &&
+    // "Above the flip" only counts when the flip is known. With the old flip
+    // ($5 META, $580 SPY) this clause was true on nearly every ticker, so
+    // bullish CVD alone decided direction; an absent flip must not do the same.
+    (ctx.gexRegime === 'negative' || (ctx.flipLevel !== null && currentPrice > ctx.flipLevel));
 
   if (score >= ENTER_THRESHOLD) {
     // BREAKOUT if price is within 0.3% of a wall (breaking through structure)
-    const nearWall =
-      Math.abs(currentPrice - ctx.walls.callWall) / currentPrice <= 0.003 ||
-      Math.abs(currentPrice - ctx.walls.putWall)  / currentPrice <= 0.003;
+    // An absent wall (null) is never "near". It used to be the spot price
+    // itself when missing, which is always within 0.3% — a guaranteed BREAKOUT.
+    const near = (wall: number | null) => wall !== null && Math.abs(currentPrice - wall) / currentPrice <= 0.003;
+    const nearWall = near(ctx.walls.callWall) || near(ctx.walls.putWall);
     if (nearWall) return 'BREAKOUT';
     return isBullish ? 'ENTER' : 'EXIT';
   }

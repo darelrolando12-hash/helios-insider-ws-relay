@@ -40,6 +40,7 @@ import * as luldStore          from '../stores/luldStore';
 import * as fundamentalsStore  from '../stores/fundamentalsStore';
 import * as brainStore         from '../ledger/brainStore';
 import { toCentralTime }       from '../lib/time';
+import { latestSessionVwap }   from '../lib/sessionVwap';
 import {
   getDirectionState,
   subscribe as subscribeDirection,
@@ -63,8 +64,14 @@ const BRAIN_WIN_FLOOR    = 0.55;  // swing uses 55% floor (lower than 0DTE's 60%
 const BRAIN_N_FLOOR      = 15;
 const EARNINGS_GATE_DAYS = 5;
 const BRAIN_REFRESH_MS   = 5 * 60 * 1000;
-const SHORT_INTEREST_HIGH = 0.20;  // 20% SI float = elevated
-const SHORT_VOL_HIGH      = 0.45;  // 45% short vol ratio = elevated
+// Both in PERCENT (0–100), the unit the store holds. Captured 2026-09-11:
+// Massive's /stocks/v1/short-volume returns short_volume_ratio 39.38 for JPM
+// (09-10), and fundamentalsStore keeps that scale (shortVolume / reported ×
+// 100); relay's computeShortPctOfFloat is × 100 as well. These were 0.20 and
+// 0.45 with the display multiplying by 100 again — JPM read "SV ratio
+// 3937.8%", and any ticker with SI data passed the criterion.
+const SHORT_INTEREST_HIGH = 20;  // 20% of float short = elevated
+const SHORT_VOL_HIGH      = 45;  // 45% of volume short = elevated
 
 // ── Local types ────────────────────────────────────────────────────────────────
 
@@ -135,14 +142,9 @@ function _buildCard(ticker: string): SwingCard | null {
   const ema8  = computeEma(closes, 8);
   const ema21 = computeEma(closes, 21);
   const ema55 = computeEma(closes, 55);
-  const vwapVal = (() => {
-    let pv = 0, vol = 0;
-    for (const b of bars) {
-      const p = b.vwap ?? (b.high + b.low + b.close) / 3;
-      pv += p * b.volume; vol += b.volume;
-    }
-    return vol > 0 ? pv / vol : null;
-  })();
+  // The one VWAP definition (lib/sessionVwap). This used Massive's per-bar
+  // `vw` over the whole buffer with no session reset.
+  const vwapVal = latestSessionVwap(bars);
 
   const mktCtx       = mktR.status === 'ready' ? mktR.data : null;
 
@@ -218,8 +220,8 @@ function _buildCard(ticker: string): SwingCard | null {
   // elevated SI = squeeze fuel (pass for calls) or caution (pass for puts)
   const shortDetail    = fd
     ? [
-        siPct    ? `SI ${(siPct * 100).toFixed(1)}%` : 'SI n/a',
-        svRatio  ? `SV ratio ${(svRatio * 100).toFixed(1)}%` : 'SV n/a',
+        siPct   !== null ? `SI ${siPct.toFixed(1)}%` : 'SI n/a',
+        svRatio !== null ? `SV ratio ${svRatio.toFixed(1)}%` : 'SV n/a',
       ].join(' · ')
     : 'Fundamentals loading';
 

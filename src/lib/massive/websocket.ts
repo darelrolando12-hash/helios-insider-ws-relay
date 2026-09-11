@@ -379,9 +379,32 @@ export class MassiveWebSocketBus {
     // milliseconds, but LULD has been observed sending nanoseconds, which
     // produces an out-of-range Date and crashes the Intl formatter inside
     // toCentralTime.
-    const _ct = toCentralTime(
-      typeof raw.t === 'number' ? normaliseTimestampMs(raw.t) : Date.now()
-    );
+    // Aggregate channels ('AM' per minute, 'A' per second) do NOT carry `t`.
+    // They carry `s` (bucket start) and `e` (bucket end). Without this, the
+    // expression below fell through to Date.now() and stamped every aggregate
+    // with its ARRIVAL wall-clock instead of the bucket it actually
+    // represents.
+    //
+    // That was survivable for 'AM' purely by accident: a minute bar arrives
+    // within a few hundred ms of its own boundary, so arrival-time ≈
+    // bucket-start, and barsStore separately took tUtc from msg.s so only tCT
+    // was subtly wrong. Subscribing 'A' (2026-09-10) removed the accident —
+    // per-second messages arrive spread across the whole minute, so
+    // arrival-time is up to 59s away from the bucket start. Bars then carried
+    // a tCT belonging to a different minute than their own data, which
+    // mis-bucketed them in aggregateBars/_mergeDisplayBars and left the 1m
+    // chart with a handful of bars that fitContent() blew up into one
+    // full-width block, with every EMA blank for want of 8 bars.
+    //
+    // Exactly the shape CLAUDE.md warns about: removing a redundancy exposes
+    // the fault it was hiding. The fault is this fallback; `s` is the real
+    // source of truth for an aggregate and is what the rest of the pipeline
+    // already treats as authoritative.
+    const rawTs =
+      typeof raw.s === 'number' ? normaliseTimestampMs(raw.s) :
+      typeof raw.t === 'number' ? normaliseTimestampMs(raw.t) :
+      Date.now();
+    const _ct = toCentralTime(rawTs);
     const msg: WSMessageWithCT = { ...raw, _ct };
 
     // Dispatch to event-specific handlers

@@ -28,6 +28,7 @@ import * as gexEngine from './gexEngine';
 import type { StrikeData } from './gexEngine';
 import * as barsStore from '../stores/barsStore';
 import { formatError } from '../lib/errors';
+import { getServerFlip, startServerGex } from '../lib/serverGex';
 
 // ── Constants ──────────────────────────────────────────────────────────────────
 
@@ -93,6 +94,7 @@ function _releaseSlot(): void {
  */
 export function initChainAggregator(client: MassiveRestClient) {
   _client = client;
+  startServerGex(); // one request a minute for every ticker's flip — see lib/serverGex
 }
 
 /**
@@ -180,7 +182,12 @@ async function _poll(ticker: string) {
       return;
     }
 
-    gexEngine.processChainSnapshot(ticker, spotPrice, strikes, Date.now());
+    // The flip is NOT computed here. It needs the whole chain (SPY: 12,966
+    // contracts vs the 2,000 this poll fetches — 761.38 vs 768.80), and
+    // fetching whole chains from every open browser would be ~700 REST
+    // requests an hour each. The relay engine computes it once; this reads
+    // it (lib/serverGex), absent with a reason when the relay can't say.
+    gexEngine.processChainSnapshot(ticker, spotPrice, strikes, Date.now(), getServerFlip(ticker));
     console.log(`[chainAggregator] ${ticker}: processed ${strikes.length} strikes @ spot ${spotPrice}`);
   } catch (e) {
     const _elapsedMs = performance.now() - _t0;

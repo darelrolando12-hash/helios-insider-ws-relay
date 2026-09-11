@@ -7,25 +7,26 @@
  *
  * Data sources (all read-only, zero outbound calls):
  *   Price candles       → barsStore
- *   CVD accumulation    → cvdStore (callPct / putPct per session window)
+ *   Delta (CVD)         → the relay engine's per-minute delta series (lib/serverDelta)
  *   GEX levels/walls    → marketStore
  *   Session direction   → directionState
  *
  * Panels (top to bottom):
  *   1. Price panel  — OHLC candles + static GEX levels + EMA overlays +
  *                     session bias tint + VWAP + signal markers on triggering candles
- *   2. CVD panel    — per-bar (callPct − putPct) as a directional skew line,
- *                     zero-line, color-coded by slope (rising green / falling red)
- *   3. Aggressor panel — histogram of CVD skew rate-of-change over last 3 bars
+ *   2. CVD panel    — cumulative delta (classified buy − sell volume) from the
+ *                     session's first classified minute, at each candle's close
+ *   3. Aggressor panel — each candle's own delta, green buying / red selling;
+ *                     also hosts the chart's only visible time axis
  *
- * CVD data source (FIX 4):
- *   cvdStore exposes CvdState with callPct, putPct, netDelta — NOT a ticks array.
- *   The CVD line is built from per-bar snapshots: for each bar in barsStore,
- *   the directional skew value is (callPct − putPct) captured at that bar's time.
- *   Because cvdStore holds only the current session window state (not a per-bar
- *   history), we use the current snapshot applied to all bars, building a flat
- *   line that updates in real-time as the session progresses. This is the correct
- *   approach given the available data contract.
+ * CVD data source (rebuilt 2026-09-11):
+ *   These panels used to be a PROJECTION ("FIX 4"): browser cvdStore holds one
+ *   session-level call/put skew, not a series, so the CVD line was a straight
+ *   ramp from 0 to the current skew drawn across every bar, and the aggressor
+ *   histogram was that ramp's constant slope. It read as order-flow history
+ *   and was not. The real per-minute series is built in the relay engine,
+ *   which holds the trade stream from the session open, and read here. When
+ *   the engine can't supply it the panels are empty and say why.
  *
  * GEX walls (FIX 5):
  *   MarketContextSnapshot.walls is GexWalls { callWall, putWall } (singular values).
@@ -72,6 +73,7 @@ import {
   LineSeries,
   HistogramSeries,
   type IChartApi,
+  type IRange,
   type ISeriesApi,
   type ISeriesMarkersPluginApi,
   type SeriesMarker,
@@ -79,25 +81,33 @@ import {
   type UTCTimestamp,
   type CandlestickData,
   type LineData,
-  type HistogramData,
 } from 'lightweight-charts';
 import * as barsStore      from '../stores/barsStore';
-import * as cvdStore       from '../stores/cvdStore';
+import { fetchDeltaSeries, bucketDelta, type DeltaSeries } from '../lib/serverDelta';
 import * as marketStore    from '../stores/marketStore';
 import * as directionState from '../state/directionState';
-import { toCTMidnight } from '../lib/time';
+import { toCentralTime } from '../lib/time';
+import { sessionVwapSeries } from '../lib/sessionVwap';
 import { aggregateBars, INTERVAL_MINUTES, type ChartInterval } from '../lib/aggregateBars';
-import { fetchChartBackfill, type ChartBackfill } from '../lib/chartBarsBackfill';
+import {
+  fetchChartBackfill,
+  regularSessionOnly,
+  REGULAR_OPEN_CT_MIN,
+  REGULAR_CLOSE_CT_MIN,
+  type ChartBackfill,
+} from '../lib/chartBarsBackfill';
 import { computeChartBackfillWindow } from '../lib/chartWindow';
-import { clusterMarkersForDisplay } from '../lib/markerClustering';
+import { clusterMarkersForDisplay, summariseMarkersByDay } from '../lib/markerClustering';
+import * as marketStatusStore from '../stores/marketStatusStore';
+import { formatAge } from '../stores/marketStatusStore';
 import type { Bar, Result } from '../stores/types';
 import type { MarketContext } from '../stores/marketStore';
 
 /**
  * Real backfill lookback per interval, in TRADING days.
  *
- * 1m stays live-buffer-only — barsStore's 500-bar cap is ~8 real hours,
- * which already exceeds what a 1-minute chart usefully shows.
+ * 1m has no lookback in trading days: it fetches the latest session (see
+ * chartBarsBackfill's 1m branch) and the live buffer carries it forward.
  *
  * ── Corrected against real data (2026-09-05) ──────────────────────────────
  * The previous derivation here assumed a 6.5-hour regular session and
@@ -121,12 +131,42 @@ import type { MarketContext } from '../stores/marketStore';
  * days: more than the corrected math strictly requires, but it is the
  * already-shipped, already-verified value and 3x margin on a 55-period EMA
  * is not worth churning.
+ *
+ * 1d @ 250 days -> ~250 daily bars: about one trading year, the span a
+ * daily chart is read over, and 4.5x EMA55's seeding period. One request —
+ * the daily endpoint returns a year in a single page.
  */
 const BACKFILL_LOOKBACK_TRADING_DAYS: Partial<Record<ChartInterval, number>> = {
   '5m':  7,
   '15m': 7,
   '1h': 10,
+  '1d': 250,
 };
+
+/**
+ * Real root cause, confirmed against this file's own math above (2026-09-09):
+ * fitContent() forces the ENTIRE fetched backfill into whatever width the
+ * chart container happens to have. 5m @ 7 days is ~1344 bars (this file's own
+ * comment, line ~114); a real mobile chart container is ~245-350px wide.
+ * lightweight-charts' default minBarSpacing is 0.5px, so fitContent() was
+ * cramming ~1344 bars into ~300px — a bar spacing at or below the floor,
+ * rendering bodies as sub-pixel slivers indistinguishable from wicks. This
+ * is a DIFFERENT, additional mechanism from the stale-viewport bug fixed
+ * 2026-09-08 (ae8edf7) — that fix made fitContent() actually run; it did not
+ * change what fitContent() does with a dataset this large.
+ *
+ * Fix: show only the most recent N bars that fit at a readable width,
+ * computed from the chart's own real rendered width (timeScale().width()),
+ * not a hardcoded container size — see the fitContent() call site below.
+ * The full backfill stays loaded (EMA55 continuity, scroll-back); only the
+ * INITIAL visible window is narrowed.
+ */
+const TARGET_PX_PER_BAR = 6;
+
+/** Used only when neither the time scale nor the container has a real width
+ *  yet. Deliberately a bar COUNT, not "show everything" — falling back to
+ *  fitContent() here is what silently reintroduces the crowding bug. */
+const DEFAULT_VISIBLE_BARS = 60;
 
 /**
  * Real bug found and fixed live (2026-09-08): switching ticker or interval
@@ -252,6 +292,14 @@ export interface HeliosChartProps {
    * real header comment for why it stays interval-invariant.
    */
   interval?: ChartInterval;
+  /**
+   * The latest session's VWAP, as of the newest 1-minute bar — the same
+   * number the intraday VWAP line ends on, and identical at every interval
+   * (it is read from the minute series, never the candles). Null when there
+   * is no minute data at all. Fired only when the value changes at cent
+   * resolution, not on every redraw.
+   */
+  onSessionVwap?: (vwap: number | null) => void;
 }
 
 /**
@@ -263,6 +311,8 @@ interface OverlayData {
   ema21: LineData<Time>[];
   ema55: LineData<Time>[];
   vwap:  LineData<Time>[];
+  /** Last point of the un-aligned minute VWAP — see onSessionVwap. */
+  sessionVwap: number | null;
 }
 
 /** One rendered row of the live legend — the hovered or newest candle. */
@@ -319,8 +369,36 @@ function _makeChartOptions(
     },
     timeScale: {
       borderColor:        C.border,
+      // Real bug found and fixed live (2026-09-09): `timeVisible` only
+      // controls whether the DEFAULT (non-custom) formatter includes a
+      // time-of-day portion — it does NOT hide the axis row itself. The
+      // actual row-visibility option is the separate `visible` flag
+      // (default true). Only setting timeVisible left the price and CVD
+      // panels' own time-axis rows fully rendered — each computing its
+      // OWN, uncoordinated tick placement independent of the aggressor
+      // panel's real, intended single shared axis. That is the real
+      // mechanism behind three separate, inconsistent-looking date/time
+      // rows stacking on top of each other (repeated/malformed date
+      // labels, a floating disconnected time label) — not three different
+      // formatting bugs, one visibility bug with three visible symptoms.
+      visible:            opts.showTimeAxis,
       timeVisible:        opts.showTimeAxis,
       secondsVisible:     false,
+      // Real bug found and fixed live (2026-09-09): `ticksVisible` docs only
+      // describe it as drawing the small vertical dash next to each label
+      // ("Draw small vertical line on time axis labels") — but in this LWC
+      // version it gates the LABEL TEXT itself, not just the dash. Default
+      // is `false`. With it unset, the aggressor panel's shared axis (the
+      // only panel with `visible:true` after the fix above) called
+      // tickMarkFormatter with real, correctly-formatted, non-empty HH:mm/
+      // MM/DD strings every time (confirmed live via console
+      // instrumentation) yet painted zero non-background pixels — verified
+      // directly via canvas.getImageData on its dedicated axis canvas,
+      // ruling out a formatter bug, a stale-paint timing issue (a real
+      // ResizeObserver-driven resize() didn't fix it either), and a
+      // text-colour issue. Setting this to `true` is what actually made the
+      // real glyph pixels (matching C.text, #c9d1d9) appear.
+      ticksVisible:       true,
       tickMarkFormatter: (timeAsSeconds: number, tickMarkType: TickMarkType) => {
         // `timeAsSeconds` is already a CT pseudo-UTC epoch (every series feeds
         // the chart Math.floor(b.tCT / 1000) — see _buildLtwMarkers and the
@@ -349,6 +427,11 @@ function _makeChartOptions(
         if (tickMarkType === TickMarkType.Time || tickMarkType === TickMarkType.TimeWithSeconds) {
           return hhmm;
         }
+        // The 1D view spans a year, so it genuinely crosses a year boundary;
+        // "01/02" there would not say which year the axis just entered.
+        if (tickMarkType === TickMarkType.Year) {
+          return String(d.getUTCFullYear());
+        }
         // Year/Month/DayOfMonth tick — a real day boundary. Show the CT
         // calendar date (UTC methods on the pseudo-epoch, same rule as
         // above) so a scrolled-back multi-day view is unambiguous, without
@@ -374,8 +457,20 @@ export const HeliosChart = React.memo(function HeliosChart({
   height      = 640,
   className   = '',
   interval    = '1m',
+  onSessionVwap,
 }: HeliosChartProps) {
   const containerRef = useRef<HTMLDivElement>(null);
+
+  // Same stable-indirection pattern as onMarkerClickRef: updateChartData
+  // must not be re-created (and the chart re-subscribed) because a parent
+  // passed a new callback identity.
+  const onSessionVwapRef = useRef(onSessionVwap);
+  useEffect(() => { onSessionVwapRef.current = onSessionVwap; }, [onSessionVwap]);
+  const lastSessionVwapRef = useRef<string | null | undefined>(undefined);
+
+  // What the CVD/aggressor panels are actually showing — see its render site.
+  const [cvdPanelLabel, setCvdPanelLabel] = useState<string | null>(null);
+  const cvdPanelLabelRef = useRef<string | null>(null);
 
   // Chart instance refs
   const priceChartRef = useRef<IChartApi | null>(null);
@@ -409,7 +504,7 @@ export const HeliosChart = React.memo(function HeliosChart({
 
   const [legend, setLegend] = useState<LegendSnapshot | null>(null);
   const displayBarsRef = useRef<Bar[]>([]);
-  const overlayRef     = useRef<OverlayData>({ ema8: [], ema21: [], ema55: [], vwap: [] });
+  const overlayRef     = useRef<OverlayData>({ ema8: [], ema21: [], ema55: [], vwap: [], sessionVwap: null });
   const hoverTimeRef   = useRef<number | null>(null);
 
   /**
@@ -450,9 +545,13 @@ export const HeliosChart = React.memo(function HeliosChart({
    */
   useEffect(() => {
     displayBarsRef.current = [];
-    overlayRef.current     = { ema8: [], ema21: [], ema55: [], vwap: [] };
+    overlayRef.current     = { ema8: [], ema21: [], ema55: [], vwap: [], sessionVwap: null };
     hoverTimeRef.current   = null;
     setLegend(null);
+    // Same reasoning for the parent's VWAP: the previous ticker's number
+    // must not sit under the new ticker's name until the next redraw.
+    lastSessionVwapRef.current = null;
+    onSessionVwapRef.current?.(null);
     needsViewResetRef.current = true;
     hadBackfillRef.current    = false;
   }, [ticker, interval]);
@@ -467,6 +566,7 @@ export const HeliosChart = React.memo(function HeliosChart({
       : bars.find(b => Math.floor(b.tCT / 1000) === hoverT) ?? bars[bars.length - 1];
 
     const at = Math.floor(bar.tCT / 1000);
+
 
     // EMAs are computed ON displayBars, so their points land exactly on bar
     // times. Exact match only, never nearest: an EMA genuinely has no value
@@ -490,7 +590,25 @@ export const HeliosChart = React.memo(function HeliosChart({
     }
 
     setLegend({
-      timeLabel: formatChartTime(at as UTCTimestamp),
+      // Show the DATE too whenever the bar being read is not from the same CT
+      // calendar day as the newest bar on the chart.
+      //
+      // Real gap (2026-09-10): the legend correctly follows the crosshair —
+      // verified live, hovering different candles returns their own real
+      // O/H/L/C — but it only ever rendered HH:mm. A 1h chart shows ~70 bars
+      // at its default zoom, which is 3+ calendar days, and the backfill
+      // behind it spans 13. So hovering a bar from another day produced a
+      // bare "05:30" with nothing to say WHICH 05:30 — the timestamp was
+      // there and still unreadable. Same-day hovering stays clean.
+      //
+      // At 1D every bar is a whole day keyed at midnight, so a time of day
+      // would always read "00:00" — show the date alone, with the year,
+      // because the 1D view spans one.
+      timeLabel: interval === '1d'
+        ? `${_formatChartDate(bar.tCT)}/${String(new Date(bar.tCT).getUTCFullYear()).slice(2)}`
+        : _isSameCTDay(bar.tCT, bars[bars.length - 1].tCT)
+          ? formatChartTime(at as UTCTimestamp)
+          : `${_formatChartDate(bar.tCT)} ${formatChartTime(at as UTCTimestamp)}`,
       open:  bar.open,
       high:  bar.high,
       low:   bar.low,
@@ -632,11 +750,29 @@ export const HeliosChart = React.memo(function HeliosChart({
       priceScaleId: 'right',
     });
 
-    // Sync time axis across all three panels
-    priceChart.timeScale().subscribeVisibleLogicalRangeChange(range => {
+    // Sync the three panels by ABSOLUTE TIME, not logical index.
+    //
+    // Logical indices address each CHART's own merged time-point array, and
+    // the three charts genuinely hold different numbers of points — the
+    // price chart carries the always-1-minute VWAP series (10,350 points on
+    // a real QQQ 1h view) alongside 183 candles, while the CVD and
+    // aggressor charts carry only their own series. Pushing the price
+    // chart's logical range onto them therefore addressed completely
+    // different bars, which is what left the shared time axis with nothing
+    // in range to draw. See the setVisibleRange call in updateChartData for
+    // the instrumented proof.
+    // The one real cost of moving off logical ranges: a timestamp can only
+    // be resolved against data that already exists, so setVisibleRange
+    // throws LWC's own "Value is null" assertion on a chart that has no
+    // points yet — and the price chart's range genuinely does change before
+    // the CVD/aggressor series have been populated (reproduced live). A
+    // logical range never hit this because it is just a number LWC will
+    // happily extrapolate. getVisibleRange() is documented to return null
+    // in exactly that "no data at all" state, so it is the real guard.
+    priceChart.timeScale().subscribeVisibleTimeRangeChange(range => {
       if (range !== null) {
-        cvdChart.timeScale().setVisibleLogicalRange(range);
-        aggrChart.timeScale().setVisibleLogicalRange(range);
+        _syncPanelRange(cvdChart, range);
+        _syncPanelRange(aggrChart, range);
       }
     });
 
@@ -672,7 +808,7 @@ export const HeliosChart = React.memo(function HeliosChart({
 
   // ── Real backfill from Massive's native aggregates ──────────────────────────
   //
-  // 1m stays live-buffer-only. 5m/15m/1h fetch real, natively pre-aggregated
+  // 1m fetches the latest session. 5m/15m/1h fetch real, natively pre-aggregated
   // bars at the selected interval (plus a fixed 1-minute series for VWAP) —
   // see chartBarsBackfill.ts for the two-source split and the real seam
   // handling. Result<T> throughout: a fetch failure stays distinguishable
@@ -683,13 +819,27 @@ export const HeliosChart = React.memo(function HeliosChart({
     { status: 'ready', data: { displayBars: [], minuteBars: [] }, asOf: 0 },
   );
 
+  // The engine's per-minute delta series for the CVD/aggressor panels (see
+  // the header). One request per 30 s for the ticker on screen — cheap, and
+  // the series only grows by a minute at a time.
+  const [deltaResult, setDeltaResult] = useState<Result<DeltaSeries>>({ status: 'loading' });
   useEffect(() => {
-    const lookbackDays = BACKFILL_LOOKBACK_TRADING_DAYS[interval];
-    if (lookbackDays === undefined) {
-      // 1m — no backfill needed, real live buffer suffices.
-      setBackfillResult({ status: 'ready', data: EMPTY_BACKFILL, asOf: Date.now() });
-      return;
-    }
+    let cancelled = false;
+    setDeltaResult({ status: 'loading' });
+    const load = () => { void fetchDeltaSeries(ticker).then((r) => { if (!cancelled) setDeltaResult(r); }); };
+    load();
+    const id = setInterval(load, 30_000);
+    return () => { cancelled = true; clearInterval(id); };
+  }, [ticker]);
+
+  useEffect(() => {
+    // 1m has no lookback in trading days, but it does fetch: the latest
+    // session's minutes, for its candles and its VWAP. It used to skip the
+    // fetch, drawing only the live buffer and computing VWAP over the
+    // 500-bar buffer alone (measured wrong by 7 cents on SPY; see
+    // _fetchLatestSessionMinutes). fetchChartBackfill's 1m branch ignores
+    // the window below.
+    const lookbackDays = BACKFILL_LOOKBACK_TRADING_DAYS[interval] ?? 0;
 
     let cancelled = false;
     setBackfillResult({ status: 'loading' });
@@ -699,7 +849,17 @@ export const HeliosChart = React.memo(function HeliosChart({
       // Guard against a slow fetch for a previously-selected ticker/interval
       // landing after the user has already switched — same pattern as
       // ChartScreen's marker fetch (Home/index.tsx).
-      if (!cancelled) setBackfillResult(result);
+      if (cancelled) return;
+      // A failed fetch is otherwise indistinguishable from a thin chart:
+      // updateChartData folds any non-'ready' result into EMPTY_BACKFILL and
+      // renders the live buffer alone, which looks like a real (if short)
+      // chart. That is exactly the silent-zero shape CLAUDE.md documents, so
+      // say so out loud rather than letting "data unavailable" render as
+      // "genuinely nothing".
+      if (result.status === 'error') {
+        console.error(`[HeliosChart] backfill FAILED for ${ticker} @ ${interval} — falling back to the live buffer alone, so the chart will be short and the EMA stack may not seed: ${result.reason}`);
+      }
+      setBackfillResult(result);
     });
 
     return () => { cancelled = true; };
@@ -709,16 +869,40 @@ export const HeliosChart = React.memo(function HeliosChart({
 
   const updateChartData = useCallback(() => {
     const barsResult   = barsStore.getResult(ticker);
-    const cvdResult    = cvdStore.getResult(ticker);
     const marketResult = marketStore.getResult(ticker);
 
-    if (barsResult.status !== 'ready') return;
-    const liveBars = barsResult.data;
-    if (liveBars.length === 0) return;
+    // Real bug found and fixed live (2026-09-09): this used to be a bare
+    // `if (barsResult.status !== 'ready') return;`. barsStore reports a
+    // ticker as `error` once its newest bar is older than 2 minutes
+    // (STALE_THRESHOLD_MS) — so during any stale/reconnecting window this
+    // returned before drawing ANYTHING. Switching interval while stale
+    // therefore did nothing at all: the toolbar highlighted the new
+    // interval while the canvas kept the PREVIOUS interval's candles, EMAs
+    // and legend. Reproduced live on QQQ — the toolbar read 15m while the
+    // trace confirmed updateChartData had last run with interval '1h'.
+    //
+    // Showing one timeframe's candles under another timeframe's label is
+    // far worse than showing old data: the bars themselves are real and
+    // still correct, only their freshness is in question, and the staleness
+    // banner already says so explicitly. getBarsRaw exists for exactly this
+    // ("valid on stale data" — see its own doc comment), so render what we
+    // genuinely have and let the banner carry the freshness signal.
+    const liveBars = barsResult.status === 'ready'
+      ? barsResult.data
+      : barsStore.getBarsRaw(ticker);
 
     const backfilled = backfillResult.status === 'ready'
       ? backfillResult.data
       : EMPTY_BACKFILL;
+
+    // An empty LIVE buffer is not the same as having nothing to draw. On a
+    // cold start, and on any closed market, barsStore can legitimately hold
+    // zero bars for a ticker while this interval's own multi-day backfill is
+    // fully loaded — this used to `return` on the live buffer alone and
+    // leave "Waiting for bars…" over a chart that had days of real history
+    // ready to render. Reproduced live on a closed market with SPY.
+    // Only bail when BOTH sources are genuinely empty.
+    if (liveBars.length === 0 && backfilled.displayBars.length === 0) return;
 
     // Real, finest-grain 1-minute series: backfilled 1-minute history merged
     // with the live buffer's tail. VWAP is always computed from THIS, never
@@ -734,11 +918,36 @@ export const HeliosChart = React.memo(function HeliosChart({
     // forming candle and any bucket that completed since the fetch — is
     // rolled up client-side from the live 1-minute stream. '1m' is a real,
     // tested identity passthrough inside aggregateBars.
-    const liveEdge = aggregateBars(liveBars, interval);
+    //
+    // 1D differs in two ways, both from measured data (chartBarsBackfill.ts,
+    // "Daily bars"): Massive's daily OHLC is the regular session only, so the
+    // live day is rolled from regular-session minutes only; and it is rolled
+    // from rawBars1m (today's fetched minutes + the live tail), not the live
+    // buffer alone — the fetched session is the one source guaranteed to
+    // reach the 08:30 open, and a day candle missing its morning would show
+    // the wrong open, high and low.
+    const liveEdge = interval === '1d'
+      ? aggregateBars(regularSessionOnly(rawBars1m), '1d')
+      : aggregateBars(liveBars, interval);
     const displayBars = backfilled.displayBars.length > 0
       ? _mergeDisplayBars(backfilled.displayBars, liveEdge)
       : liveEdge;
     if (displayBars.length === 0) return;
+
+    // No VWAP line at 1D. VWAP is a session indicator and at 1D a session is
+    // one candle, so there is no path to draw — only one number per day, and
+    // no consistent source for it. The obvious one, Massive's daily `vw`, is
+    // a DIFFERENT definition from the close-weighted VWAP this chart draws
+    // intraday: it includes prints that never update a bar's OHLC (measured
+    // 2026-09-10 — SPY minute bars with vw above the bar's own high, e.g.
+    // 14:59 CT h 758.03 / vw 758.98), and on 09-10 it came out 758.86
+    // against the intraday line's 758.30. A 1D line of daily `vw` points
+    // ending on today's close-weighted value would jump 56¢ at the last bar.
+    // Computing close-weighted per day instead needs a year of minute bars.
+    // Today's session VWAP stays on screen at every interval via the Key
+    // Levels card.
+    const plotVwap = interval !== '1d';
+
 
     // Real bug found and fixed live (2026-09-08): switching ticker or
     // interval hands the SAME long-lived series objects a completely
@@ -772,12 +981,61 @@ export const HeliosChart = React.memo(function HeliosChart({
       vwapRef.current?.setData([]);
     }
 
-    const overlays = _updatePriceData(displayBars, rawBars1m, candleSeriesRef.current, ema8Ref.current, ema21Ref.current, ema55Ref.current, vwapRef.current);
+    const overlays = _updatePriceData(displayBars, rawBars1m, INTERVAL_MINUTES[interval] * 60_000, candleSeriesRef.current, ema8Ref.current, ema21Ref.current, ema55Ref.current, vwapRef.current, plotVwap);
 
     if (needsViewResetRef.current && priceChartRef.current) {
       needsViewResetRef.current = false;
-      const chart = priceChartRef.current;
-      requestAnimationFrame(() => chart.timeScale().fitContent());
+      const chart      = priceChartRef.current;
+      const container  = containerRef.current;
+      const windowBars = displayBars;
+      requestAnimationFrame(() => {
+        const ts = chart.timeScale();
+        // ts.width() genuinely returns 0 on a fresh mount at this point in
+        // the frame (observed live 2026-09-09), so fall back to the real
+        // container width, then to a fixed count rather than to "show
+        // everything" — which is the crowding bug this window exists to fix.
+        const widthPx     = ts.width() || container?.clientWidth || 0;
+        const total       = windowBars.length;
+        const wanted      = widthPx > 0
+          ? Math.floor(widthPx / TARGET_PX_PER_BAR)
+          : DEFAULT_VISIBLE_BARS;
+        const visibleBars = Math.max(1, Math.min(total, wanted));
+
+        if (visibleBars >= total) {
+          ts.fitContent();
+        } else {
+          // Set the window by ABSOLUTE TIME, never by logical index.
+          //
+          // Real root cause, proven live 2026-09-09 — this is the bug the
+          // 2026-09-08 note above ran into and could not explain ("logical
+          // index 173 of a freshly-set 174-bar array is NOT resolving to
+          // that array's own last element"). Logical indices address the
+          // CHART's merged time-point array, not any one series' array. The
+          // price chart carries the VWAP line, which is deliberately always
+          // 1-MINUTE data (see chartBarsBackfill.ts's header) — so at 1h a
+          // 183-bar candle series shares its chart with 10,350 VWAP points,
+          // and the logical axis runs 0..10,355. Instrumented read-back on
+          // real QQQ 1h data: asking for logical {0..182} came back as
+          // {9981..10355}, a 6.5-hour window over 16 days of candles.
+          //
+          // That single mismatch produced three separate reported symptoms:
+          // 1h "renders as a white line with two tiny candles" (the line is
+          // VWAP, which has a point every minute; the candles are the two
+          // that happen to fall in the wrong window), EMA8/21/55 all reading
+          // blank at 1h (the window sits where those series have no points),
+          // and the shared time axis going blank (the same out-of-range
+          // logical range was being pushed onto the CVD/aggressor charts,
+          // whose point counts differ again).
+          //
+          // Timestamps are absolute and identical across all three panels,
+          // so they cannot drift with series length.
+          ts.setVisibleRange({
+            from: Math.floor(windowBars[total - visibleBars].tCT / 1000) as UTCTimestamp,
+            to:   Math.floor(windowBars[total - 1].tCT / 1000) as UTCTimestamp,
+          });
+        }
+        _syncPanelsTo(chart, [cvdChartRef.current, aggrChartRef.current]);
+      });
     }
 
     // Feed the live legend from the exact series just drawn.
@@ -785,32 +1043,118 @@ export const HeliosChart = React.memo(function HeliosChart({
     overlayRef.current     = overlays;
     _refreshLegend();
 
-    // FIX 4: CVD line built from per-bar snapshots using current cvdStore state.
-    // cvdStore holds callPct/putPct (not a ticks array). We project the current
-    // directional skew value across all bar timestamps to build the chart line,
-    // and compute aggressor ROC from the same synthetic per-bar series.
-    // Uses displayBars — the CVD/aggressor panels stay time-aligned with the
-    // candle panel above them, same as before this change.
-    if (cvdResult.status === 'ready') {
-      _updateCvdFromBars(displayBars, cvdResult.data, cvdLineRef.current, aggrHistRef.current);
+    // Only on a change the parent could display (cents) — this runs up to
+    // once per animation frame.
+    const vwapKey = overlays.sessionVwap === null ? null : overlays.sessionVwap.toFixed(2);
+    if (vwapKey !== lastSessionVwapRef.current) {
+      lastSessionVwapRef.current = vwapKey;
+      onSessionVwapRef.current?.(overlays.sessionVwap);
     }
+
+    // ── CVD + aggressor panels: the engine's real per-minute delta ─────────
+    // (see the header's "CVD data source"). Rolled into this interval's
+    // buckets; plotted only where classified trades exist.
+    //
+    // Every display bar still gets a point on the aggressor panel — real
+    // delta where there is some, a zero-height transparent bar elsewhere —
+    // because that panel hosts the chart's only visible time axis. Measured
+    // 2026-09-10: with whitespace-only data lightweight-charts draws labels
+    // but treats the time scale as empty for positioning (setVisibleRange is
+    // ignored; the axis showed Sep–Dec 2025 under Jun–Sep 2026 candles).
+    // The CVD panel has no axis, so it takes plain whitespace where there is
+    // no data — a transparent 0 there would put a "0.00" CVD label on it.
+    const bucketMs = INTERVAL_MINUTES[interval] * 60_000;
+    const buckets = interval !== '1d' && deltaResult.status === 'ready'
+      ? bucketDelta(deltaResult.data.bars, bucketMs)
+      : [];
+    const byTime = new Map(buckets.map(b => [Math.floor(b.tCT / 1000), b]));
+    const hasDelta = buckets.length > 0;
+    aggrHistRef.current?.applyOptions({ lastValueVisible: hasDelta, priceLineVisible: false });
+    // No data: transparent scale text rather than a hidden scale — hiding it
+    // would change the panel's plot width and shift its axis off the candles.
+    aggrChartRef.current?.priceScale('right').applyOptions({ textColor: hasDelta ? C.textMuted : 'rgba(0,0,0,0)' });
+    const times = displayBars.map(b => Math.floor(b.tCT / 1000) as UTCTimestamp);
+    cvdLineRef.current?.setData(times.map(time => {
+      const b = byTime.get(time);
+      return b ? { time, value: b.cumDelta } : { time };
+    }));
+    aggrHistRef.current?.setData(times.map(time => {
+      const b = byTime.get(time);
+      return b
+        ? { time, value: b.delta, color: b.delta >= 0 ? C.aggrBull : C.aggrBear }
+        : { time, value: 0, color: 'rgba(0,0,0,0)' };
+    }));
+
+    // Say what the lower panels show, on the panels themselves.
+    const fmtCT = (tCT: number) => `${String(new Date(tCT).getUTCHours()).padStart(2, '0')}:${String(new Date(tCT).getUTCMinutes()).padStart(2, '0')}`;
+    const panelLabel = interval === '1d'
+      ? 'CVD · NO DAILY HISTORY'
+      : deltaResult.status === 'error'
+        ? `CVD · UNAVAILABLE — ${deltaResult.reason}`
+        : deltaResult.status === 'loading'
+          ? 'CVD · LOADING'
+          : hasDelta
+            ? `CVD · CLASSIFIED TRADES SINCE ${fmtCT(deltaResult.data.bars[0].tCT)} CT`
+            : 'CVD · NO CLASSIFIED TRADES THIS SESSION';
+    if (panelLabel !== cvdPanelLabelRef.current) {
+      cvdPanelLabelRef.current = panelLabel;
+      setCvdPanelLabel(panelLabel);
+    }
+    _syncPanelsTo(priceChartRef.current, [cvdChartRef.current, aggrChartRef.current]);
 
     if (marketResult.status === 'ready') {
       _applyGexLevelsInternal(candleSeriesRef.current, marketResult.data);
     }
-  }, [ticker, interval, backfillResult, EMPTY_BACKFILL, _refreshLegend]);
+  }, [ticker, interval, backfillResult, deltaResult, EMPTY_BACKFILL, _refreshLegend]);
 
   useEffect(() => {
-    updateChartData();
-    const unsub1 = barsStore.subscribe(updateChartData);
-    const unsub2 = cvdStore.subscribe(updateChartData);
-    const unsub3 = marketStore.subscribe(updateChartData);
+    // Coalesce store notifications into at most ONE redraw per animation
+    // frame.
+    //
+    // Real, measured problem (2026-09-09), not a speculative optimisation.
+    // These three stores were each wired straight to updateChartData, so every
+    // notification ran the whole pipeline: merge ~10k one-minute bars, rebuild
+    // VWAP, three EMA passes, and setData on five series. Instrumented over a
+    // real 47s window on a live feed:
+    //
+    //   ws.frame            14,705 calls  (~313 WS frames/sec)
+    //   chart.update.1m      4,906 calls
+    //   chart.update.5m      2,401 calls   → ~155 redraws/sec
+    //   main thread blocked  58% of wall clock
+    //   worst single task    6,484ms
+    //
+    // The worst long task, the worst ws.frame and the worst chart.update all
+    // came back as the SAME 6,484ms — i.e. the single worst blocking event in
+    // the app is a WS frame whose store notification fans out into a full
+    // chart redraw. A chart cannot usefully redraw 155 times a second; the
+    // display only changes once per paint.
+    //
+    // This also directly addresses the reconnect-burst shape suspected behind
+    // the original Track B incident: a burst that delivers hundreds of frames
+    // at once now collapses into one redraw instead of hundreds.
+    //
+    // And it bounds the cost I knowingly added: the stale-render fix removed
+    // an early-return, so this pipeline now also runs during stale windows
+    // where it used to bail. Coalescing is what makes that correctness fix
+    // affordable.
+    let rafId = 0;
+    const schedule = () => {
+      if (rafId !== 0) return;            // already queued for this frame
+      rafId = requestAnimationFrame(() => { rafId = 0; updateChartData(); });
+    };
+
+    updateChartData();                    // first paint is immediate, not deferred
+    const unsub1 = barsStore.subscribe(schedule);
+    const unsub3 = marketStore.subscribe(schedule);
     const unsub4 = directionState.subscribe((_t, state) => {
       if (_t === ticker) setDirection(state);
     });
     // Seed direction from current state
     setDirection(directionState.getDirectionState(ticker));
-    return () => { unsub1(); unsub2(); unsub3(); unsub4(); };
+    return () => {
+      if (rafId !== 0) cancelAnimationFrame(rafId);
+      unsub1(); unsub3(); unsub4();
+    };
   }, [ticker, updateChartData]);
 
   // ── Signal markers ────────────────────────────────────────────────────────────
@@ -822,9 +1166,18 @@ export const HeliosChart = React.memo(function HeliosChart({
   useEffect(() => {
     if (!markersPluginRef.current) return;
     const bucketMs = INTERVAL_MINUTES[interval] * 60_000;
-    const clustered = clusterMarkersForDisplay(markers, bucketMs);
-    markersPluginRef.current.setMarkers(_buildLtwMarkers(clustered));
+    const clustered = interval === '1d'
+      ? summariseMarkersByDay(markers, bucketMs)
+      : clusterMarkersForDisplay(markers, bucketMs);
+    markersPluginRef.current.setMarkers(_buildLtwMarkers(clustered, bucketMs));
   }, [markers, interval]);
+
+  // At 1D the aggressor panel's axis would stamp "00:00" on every crosshair
+  // label — every daily bar is keyed at midnight. Dates only there. Re-applied
+  // on ticker/height too, because those re-create the chart with defaults.
+  useEffect(() => {
+    aggrChartRef.current?.applyOptions({ timeScale: { timeVisible: interval !== '1d' } });
+  }, [interval, ticker, height]);
 
   // ── Session bias tint ─────────────────────────────────────────────────────────
 
@@ -838,6 +1191,122 @@ export const HeliosChart = React.memo(function HeliosChart({
   // ── Loading state ─────────────────────────────────────────────────────────────
 
   const barsStatus = barsStore.getResult(ticker).status;
+  // Whether anything is actually plotted right now — drives the skeleton, so
+  // a freshness state can never hide a populated chart. displayBarsRef is set
+  // by updateChartData from the exact series handed to the candle series.
+  const hasDrawableBars = displayBarsRef.current.length > 0;
+
+  // ── Countdown to bar close ────────────────────────────────────────────────────
+  //
+  // Time left in the currently-forming candle, matching TradingView's
+  // convention: mm:ss, counting down to the bucket boundary for whichever
+  // interval is selected (1m from 60s, 1h from up to 3600s).
+  //
+  // Derived from the wall clock against the interval's own bucket width, not
+  // from the newest bar's timestamp. Both agree — aggregateBars buckets on
+  // exact multiples of the interval, and Massive's own bucket starts are
+  // multiples in the CT frame as well as UTC (the CT offset is a whole number
+  // of hours) — but the wall clock keeps ticking during a quiet minute where
+  // no bar has arrived yet, which is exactly when a trader is watching this
+  // number most closely.
+  //
+  // PLACEMENT (revised 2026-09-10): on the price scale, directly under the
+  // last-price label — where TradingView puts it and where a trader looks.
+  // The first version sat in the legend next to the bar time, which had two
+  // real problems: "11:00 01:45" reads as a second timestamp rather than a
+  // countdown, and it hid whenever the legend was showing a hovered bar —
+  // and on touch devices a tap pins the crosshair, so on a phone it vanished
+  // after almost any interaction. On the axis it belongs to the LAST bar,
+  // not the crosshair, so hovering never affects it.
+  const [barCloseCountdown, setBarCloseCountdown] = useState<
+    { text: string; top: number; width: number; isUp: boolean } | null
+  >(null);
+  useEffect(() => {
+    const bucketMs = INTERVAL_MINUTES[interval] * 60_000;
+    const tick = () => {
+      // Meaningless when the venue is closed — nothing is forming.
+      if (marketStatusStore.isFeedExpectedLive() === false) { setBarCloseCountdown(null); return; }
+
+      const chart  = priceChartRef.current;
+      const series = candleSeriesRef.current;
+      const bars   = displayBarsRef.current;
+      if (!chart || !series || bars.length === 0) { setBarCloseCountdown(null); return; }
+
+      // Pixel position of the last close on the price pane — the same point
+      // lightweight-charts centres its own last-price label on.
+      const last = bars[bars.length - 1];
+      const y = series.priceToCoordinate(last.close);
+      if (y === null) { setBarCloseCountdown(null); return; }
+
+      // 1D: a daily candle closes at the regular-session close, not at a
+      // midnight — 15:00 CT (NYSE 4:00 PM ET; see REGULAR_CLOSE_CT_MIN's
+      // citation). Outside the regular session no daily candle is forming
+      // (Massive's daily bar is regular-session only), so there is nothing to
+      // count down to.
+      let remainingMs: number;
+      if (interval === '1d') {
+        const ct = toCentralTime(Date.now());
+        const secOfDay = ct.hour * 3600 + ct.minute * 60 + ct.second;
+        if (secOfDay < REGULAR_OPEN_CT_MIN * 60 || secOfDay >= REGULAR_CLOSE_CT_MIN * 60) {
+          setBarCloseCountdown(null);
+          return;
+        }
+        remainingMs = (REGULAR_CLOSE_CT_MIN * 60 - secOfDay) * 1000 - ct.millisecond;
+      } else {
+        remainingMs = bucketMs - (Date.now() % bucketMs);
+      }
+      const total = Math.max(0, Math.ceil(remainingMs / 1000));
+      const hh = Math.floor(total / 3600);
+      const mm = Math.floor((total % 3600) / 60);
+      const ss = total % 60;
+      const pad = (n: number) => String(n).padStart(2, '0');
+      setBarCloseCountdown({
+        // hh:mm:ss only when there are hours to show — up to 6.5h at 1D.
+        text:  hh > 0 ? `${pad(hh)}:${pad(mm)}:${pad(ss)}` : `${pad(mm)}:${pad(ss)}`,
+        // The last-price label is ~18px tall and centred on y; sit just below it.
+        top:   y + 10,
+        width: chart.priceScale('right').width(),
+        isUp:  last.close >= last.open,
+      });
+    };
+    tick();
+    const id = setInterval(tick, 1000);
+    const unsub = marketStatusStore.subscribe(tick);
+    return () => { clearInterval(id); unsub(); };
+  }, [interval]);
+
+  // ── Feed health ───────────────────────────────────────────────────────────────
+  //
+  // Recomputed on a timer as well as on store changes: 'delayed' and 'down'
+  // are functions of elapsed time, so a feed that simply goes quiet produces
+  // no store event to react to. Ten seconds matches the Home banner's own
+  // cadence.
+  const [feedHealth, setFeedHealth] = useState<marketStatusStore.FeedHealth>({ kind: 'unknown' });
+  useEffect(() => {
+    const recompute = () => {
+      const bars = barsStore.getBarsRaw(ticker);
+      const newest = bars.length > 0 ? bars[bars.length - 1].tUtc : null;
+      const next = marketStatusStore.classifyFeedHealth(newest);
+      // classifyFeedHealth returns a fresh object every call, and this runs
+      // on every store notification — WS frames arrive at ~313/sec (measured
+      // during the Track B work), so setting state unconditionally would
+      // re-render the chart on every frame. That is the exact unguarded
+      // fan-out shape that caused Track B in the first place. Only commit a
+      // change the user could actually see: the kind, or the displayed age,
+      // which is rendered at whole-minute resolution.
+      setFeedHealth(prev => {
+        if (prev.kind !== next.kind) return next;
+        const prevMin = 'ageMs' in prev ? Math.floor(prev.ageMs / 60_000) : -1;
+        const nextMin = 'ageMs' in next ? Math.floor(next.ageMs / 60_000) : -1;
+        return prevMin === nextMin ? prev : next;
+      });
+    };
+    recompute();
+    const timer = setInterval(recompute, 10_000);
+    const unsubBars   = barsStore.subscribe(recompute);
+    const unsubMarket = marketStatusStore.subscribe(recompute);
+    return () => { clearInterval(timer); unsubBars(); unsubMarket(); };
+  }, [ticker]);
 
   // ── Render ────────────────────────────────────────────────────────────────────
 
@@ -913,7 +1382,8 @@ export const HeliosChart = React.memo(function HeliosChart({
               <LegendItem label="EMA8"  value={legend.ema8}  color={C.ema8}  />
               <LegendItem label="EMA21" value={legend.ema21} color={C.ema21} />
               <LegendItem label="EMA55" value={legend.ema55} color={C.ema55} />
-              <LegendItem label="VWAP"  value={legend.vwap}  color={C.vwap}  />
+              {/* No VWAP at 1D — see plotVwap in updateChartData. */}
+              {interval !== '1d' && <LegendItem label="VWAP"  value={legend.vwap}  color={C.vwap}  />}
             </div>
           </div>
         </div>
@@ -922,24 +1392,165 @@ export const HeliosChart = React.memo(function HeliosChart({
       {/* Chart panels mounted here by useEffect */}
       <div ref={containerRef} className="w-full" />
 
-      {/* Loading skeleton */}
-      {barsStatus === 'loading' && (
+      {/* Loading skeleton — only when there is genuinely nothing to draw.
+          barsStore reports `loading` for a ticker that is stale AND has a
+          backfill in flight, and with the market closed EVERY ticker is
+          stale, so any retry would otherwise hide a fully-populated chart
+          behind "Waiting for bars…". Reproduced live on a closed market:
+          real SPY history sat underneath the skeleton for the better part of
+          a minute. Same principle as the feed-health rework below — a
+          freshness state must never hide real data; only an empty series
+          may. */}
+      {barsStatus === 'loading' && !hasDrawableBars && (
         <div className="absolute inset-0 flex items-center justify-center bg-[#0d0f14]/80 z-30">
           <ChartSkeleton />
         </div>
       )}
 
-      {/* Error state */}
-      {barsStatus === 'error' && (
-        <div className="absolute inset-0 flex items-center justify-center bg-[#0d0f14]/80 z-30">
-          <p className="text-col-r font-mono text-sm">
-            {(barsStore.getResult(ticker) as { status: 'error'; reason: string }).reason}
+      {/* What the CVD panel is showing — the real series and since when, or
+          why there is none. The panel used to draw a projection that read as
+          history (see the header's "CVD data source"); a label on the panel
+          itself is what keeps an empty or partial one from being misread. */}
+      {cvdPanelLabel && (
+        <div
+          className="absolute left-0 z-20 pointer-events-none select-none px-2"
+          style={{
+            top:        Math.round(height * PRICE_PANEL_RATIO) + 4,
+            fontFamily: "'JetBrains Mono', 'Fira Code', monospace",
+            fontSize:   9,
+            fontWeight: 700,
+            letterSpacing: '0.06em',
+            color:      C.textMuted,
+          }}
+        >
+          {cvdPanelLabel}
+        </div>
+      )}
+
+      {/* Countdown to bar close — on the price scale, under the last-price
+          label, TradingView-style. Background follows the last bar's
+          direction, matching the price label it sits beneath. pointer-events
+          none so it never steals a tap from the chart. */}
+      {barCloseCountdown && barCloseCountdown.width > 0 && (
+        <div
+          className="absolute z-20 pointer-events-none select-none"
+          style={{
+            top:        barCloseCountdown.top,
+            right:      0,
+            width:      barCloseCountdown.width,
+            textAlign:  'center',
+            fontFamily: "'JetBrains Mono', 'Fira Code', monospace",
+            fontSize:   10,
+            fontWeight: 700,
+            lineHeight: '15px',
+            color:      '#0d0f14',
+            background: barCloseCountdown.isUp ? C.bullBody : C.bearBody,
+          }}
+        >
+          {barCloseCountdown.text}
+        </div>
+      )}
+
+      {/* Feed health — never blocks the chart.
+          This replaced a full-screen dimming overlay driven purely by
+          barsStore's "newest bar > 2 minutes old" rule, which had no idea
+          whether the market was even open. On a closed market that overlay
+          fired on every ticker, all night and all weekend, dimming real and
+          correct history behind a second warning while the app ALREADY said
+          "MARKET CLOSED" at the top of the screen — hiding exactly the data
+          a trader opens a closed-market chart to review.
+          Freshness is still reported; it just no longer takes the chart
+          hostage, and it now knows what the venue is doing. */}
+      {/* 'market-closed' and 'live' both render NOTHING here on purpose.
+          The app shell already states market-closed once, at the top of the
+          screen; repeating it over the chart was half of the original
+          double-warning complaint. The chart speaks only when it knows
+          something the banner does not — that the market is genuinely live
+          and the bars still are not arriving. */}
+      {feedHealth.kind === 'delayed' && (
+        <div className="absolute top-0 right-0 z-30 m-1 rounded border border-amb/40 bg-[#0d0f14]/90 px-2 py-1">
+          <p className="text-amb font-mono text-[10px] leading-tight">
+            DELAYED {formatAge(feedHealth.ageMs)} — last good data shown
+          </p>
+        </div>
+      )}
+      {feedHealth.kind === 'down' && (
+        <div className="absolute top-0 right-0 z-30 m-1 rounded border border-col-r/50 bg-[#0d0f14]/90 px-2 py-1">
+          <p className="text-col-r font-mono text-[10px] leading-tight">
+            FEED DOWN {formatAge(feedHealth.ageMs)} — last good data shown
+          </p>
+        </div>
+      )}
+
+      {/* Backfill failure — degraded, NOT dead. The live buffer alone is a
+          real but very short series (7 bars at 1h), which silently renders
+          as a sparse chart with an unseeded EMA stack and reads as "this
+          ticker just has little history" rather than "the history request
+          failed". Deliberately a corner notice, not the full-screen overlay
+          above: the bars still on screen are real and worth showing. */}
+      {backfillResult.status === 'error' && (
+        <div className="absolute top-0 right-0 z-30 m-1 rounded border border-col-r/40 bg-[#0d0f14]/90 px-2 py-1">
+          <p className="text-col-r font-mono text-[10px] leading-tight">
+            HISTORY UNAVAILABLE — showing live buffer only; EMAs may not seed
+          </p>
+        </div>
+      )}
+
+      {/* Backfill in flight. Same corner treatment, and for the same reason
+          as the failure notice: until it lands, the chart is honestly drawing
+          the live buffer alone — a handful of bars at 1h, with an EMA stack
+          that cannot seed yet. Without this, that intermediate state is
+          visually indistinguishable from the real, fully-loaded chart and
+          reads as a rendering fault. The window is not brief: one relay
+          timeout plus the retry can take ~51s (25s + 1.5s + 25s), and the
+          timeout is real and observed, not hypothetical. The full-screen
+          skeleton above is deliberately not reused — the live bars already
+          on screen are real, and hiding them would be a downgrade. */}
+      {backfillResult.status === 'loading' && (
+        <div className="absolute top-0 right-0 z-30 m-1 rounded border border-amb/40 bg-[#0d0f14]/90 px-2 py-1">
+          <p className="text-amb font-mono text-[10px] leading-tight">
+            LOADING HISTORY… — live buffer only until it lands
           </p>
         </div>
       )}
     </div>
   );
 });
+
+// ── Panel range sync ───────────────────────────────────────────────────────────
+
+/**
+ * Put a sub-panel on the price chart's visible time range. See the
+ * subscribeVisibleTimeRangeChange wiring for why this is by time, and why
+ * getVisibleRange() === null is the "no data at all" guard.
+ */
+function _syncPanelRange(target: IChartApi, range: IRange<Time>) {
+  const current = target.timeScale().getVisibleRange();
+  if (current === null) return;
+  // Already there — skip. _syncPanelsTo runs on every redraw (up to once a
+  // frame), and a no-op setVisibleRange still costs a repaint.
+  if (current.from === range.from && current.to === range.to) return;
+  target.timeScale().setVisibleRange(range);
+}
+
+/**
+ * Re-sync the sub-panels to the price chart NOW, without waiting for the
+ * price chart to report a range change.
+ *
+ * The change event alone is not enough — measured 2026-09-10 at 5m: the
+ * event fired with the right range (09-10 13:50–18:55), yet the aggressor
+ * panel ended up on 08-31 06:45–11:50, so its axis labelled the wrong week
+ * under the candles. updateChartData replaces the panels' data AFTER the
+ * price series', so the event-driven sync lands on the panel's old data and
+ * is lost when ~1,500 new points replace it. Syncing again once the panels
+ * hold their new data (end of updateChartData, and after a view reset) put
+ * the axis panel on the price chart's exact range at 1m, 5m, 15m, 1H and 1D.
+ */
+function _syncPanelsTo(price: IChartApi | null, panels: (IChartApi | null)[]) {
+  const range = price?.timeScale().getVisibleRange() ?? null;
+  if (!range) return;
+  for (const p of panels) if (p) _syncPanelRange(p, range);
+}
 
 // ── Price data update ──────────────────────────────────────────────────────────
 
@@ -963,13 +1574,15 @@ export const HeliosChart = React.memo(function HeliosChart({
 function _updatePriceData(
   displayBars: Bar[],
   rawBars1m:   Bar[],
+  bucketMs:    number,
   candles:     ISeriesApi<'Candlestick'> | null,
   ema8Series:  ISeriesApi<'Line'> | null,
   ema21Series: ISeriesApi<'Line'> | null,
   ema55Series: ISeriesApi<'Line'> | null,
   vwapSeries:  ISeriesApi<'Line'> | null,
+  plotVwap:    boolean = true,
 ): OverlayData {
-  const empty: OverlayData = { ema8: [], ema21: [], ema55: [], vwap: [] };
+  const empty: OverlayData = { ema8: [], ema21: [], ema55: [], vwap: [], sessionVwap: null };
   if (!candles) return empty;
 
   const candleData: CandlestickData<Time>[] = displayBars.map(b => ({
@@ -985,7 +1598,14 @@ function _updatePriceData(
   const ema8   = _computeEmaSeries(displayBars, closes, 8);
   const ema21  = _computeEmaSeries(displayBars, closes, 21);
   const ema55  = _computeEmaSeries(displayBars, closes, 55);
-  const vwap   = _computeVwapSeries(rawBars1m);
+  // VWAP's VALUE still comes from the fixed 1-minute series — that is what
+  // makes it interval-invariant and must not change. But it is now PLOTTED on
+  // the display bars' own timestamps. See _alignSeriesToBars for the real
+  // rendering bug that fixes.
+  // The session series is computed regardless — it is also what
+  // onSessionVwap reports, and that must work at 1D too.
+  const sessionSeries = _computeVwapSeries(rawBars1m);
+  const vwap = plotVwap ? _alignSeriesToBars(sessionSeries, displayBars, bucketMs) : [];
 
   if (ema8Series)  ema8Series.setData(ema8);
   if (ema21Series) ema21Series.setData(ema21);
@@ -994,7 +1614,10 @@ function _updatePriceData(
 
   // Handed back so the live legend reads the exact values the lines were
   // drawn from, rather than recomputing them and risking a disagreement.
-  return { ema8, ema21, ema55, vwap };
+  return {
+    ema8, ema21, ema55, vwap,
+    sessionVwap: sessionSeries.length > 0 ? sessionSeries[sessionSeries.length - 1].value : null,
+  };
 }
 
 /**
@@ -1007,10 +1630,67 @@ function _updatePriceData(
  * a real, distinct merge rather than a reuse of that exact function.
  */
 export function _mergeBarHistory(historical: Bar[], live: Bar[]): Bar[] {
-  const byTUtc = new Map<number, Bar>();
-  for (const b of historical) byTUtc.set(b.tUtc, b);
-  for (const b of live) byTUtc.set(b.tUtc, b); // live wins on overlap
-  return Array.from(byTUtc.values()).sort((a, b) => a.tUtc - b.tUtc);
+  // Real root cause found live (2026-09-09) for the crash aggregateBars.ts's
+  // _assertAscending documents as "genuinely unidentified":
+  //
+  //   Assertion failed: data must be asc ordered by time,
+  //   index=10886, time=1788949140, prev time=1788949462
+  //
+  // index=10886 is not the candle series (183 bars at 1h) — it is the VWAP
+  // series, which is always 1-MINUTE and so runs to ~10k points. And
+  // prev=1788949462 is not minute-aligned (:42s) while the bar after it is.
+  //
+  // This function used to key AND sort on tUtc, while every series builder
+  // emits on tCT (`Math.floor(b.tCT / 1000)`). Sorting on one field and
+  // emitting on another is only safe if the two are perfectly monotonically
+  // related, and _mergeDisplayBars' own comment below already documents that
+  // they are not: for an aggregated bar tUtc is the FIRST SOURCE BAR's
+  // timestamp, not the bucket start. One pair ordered differently in the two
+  // frames is enough to hand lightweight-charts a descending step and crash
+  // the whole chart.
+  //
+  // That is also exactly why this went unfound: the 2026-09-08 hardening put
+  // the dedupe-by-tCT and the strict-ascending guard on the CANDLE path
+  // (_mergeDisplayBars + _assertAscending), and the 822 instrumented render
+  // cycles watched that path. The violation lives on the minute/VWAP path,
+  // which kept the original unguarded tUtc logic. The instrumentation was
+  // real and correct; it was simply pointed at the wrong series.
+  //
+  // Fixed by mirroring the candle path exactly: tCT is the real bar identity
+  // (same argument _mergeDisplayBars makes for buckets), so key on it, sort
+  // on it, and refuse to emit anything that is not strictly ascending in it.
+  const byBucket = new Map<number, Bar>();
+  for (const b of historical) {
+    if (!Number.isFinite(b.tCT)) {
+      console.error('[HeliosChart] _mergeBarHistory: non-finite tCT in HISTORICAL bar, dropped:', JSON.stringify(b));
+      continue;
+    }
+    byBucket.set(b.tCT, b);
+  }
+  for (const b of live) {
+    if (!Number.isFinite(b.tCT)) {
+      console.error('[HeliosChart] _mergeBarHistory: non-finite tCT in LIVE bar, dropped:', JSON.stringify(b));
+      continue;
+    }
+    byBucket.set(b.tCT, b); // live wins on overlap — freshest for the shared tail
+  }
+
+  const sorted = Array.from(byBucket.values()).sort((a, b) => a.tCT - b.tCT);
+
+  // Dedupe by tCT already removes equal keys, so this can only fire if the
+  // sort itself was handed something pathological (a NaN survivor). Kept
+  // anyway: a dropped bar is a cosmetic gap in VWAP, an unsorted array is a
+  // crashed chart.
+  const safe: Bar[] = [];
+  for (const bar of sorted) {
+    if (safe.length > 0 && bar.tCT <= safe[safe.length - 1].tCT) {
+      console.error('[HeliosChart] _mergeBarHistory: order violation, dropped — please report:',
+        JSON.stringify({ prev: safe[safe.length - 1], dropped: bar }));
+      continue;
+    }
+    safe.push(bar);
+  }
+  return safe;
 }
 
 /**
@@ -1121,78 +1801,81 @@ export function _computeEmaSeries(bars: Bar[], closes: number[], period: number)
  * detecting a new real CT calendar day within the array and resetting the
  * accumulator there, regardless of what candle interval is displayed.
  */
-export function _computeVwapSeries(bars: Bar[]): LineData<Time>[] {
-  let cumPV  = 0;
-  let cumVol = 0;
-  let sessionStart: number | null = null;
-
-  return bars.map(b => {
-    const barSession = toCTMidnight(b.tUtc);
-    if (sessionStart === null || barSession !== sessionStart) {
-      sessionStart = barSession;
-      cumPV  = 0;
-      cumVol = 0;
+/**
+ * Re-plot a 1-minute-resolution series onto the DISPLAY bars' own timestamps,
+ * taking each bar's last value inside its bucket.
+ *
+ * ── The real rendering bug this fixes (found and measured 2026-09-09) ──────
+ * Lightweight Charts allocates horizontal space per TIME-SCALE POINT, and the
+ * time scale is the UNION of every series' timestamps on that chart. VWAP is
+ * deliberately always 1-minute (see chartBarsBackfill.ts) and used to be
+ * plotted at 1-minute resolution, so it dumped ~10,000 points onto a chart
+ * whose candle series held a few hundred. Each candle owns exactly ONE slot,
+ * so a candle could never be drawn wider than one minute's worth of pixels —
+ * no matter how few candles were on screen.
+ *
+ * Measured on real SPY backfill, 362px-wide chart, market closed:
+ *
+ *   interval  candles  vwap pts  slots/candle  px per slot  candle width
+ *   1m            500       500             1        ~5.2   readable
+ *   5m          1,531     6,805             5        1.195  1px hairline
+ *   15m           512     6,805            15        0.501  sub-pixel
+ *   1h            192    10,271            60        0.501  sub-pixel
+ *
+ * 15m and 1h both pinned at 0.501px — that is minBarSpacing's 0.5px floor,
+ * i.e. the library refusing to compress further. That is also why the
+ * "compute a readable window from chart width / 6px per bar" logic could not
+ * help: it computes a CANDLE count, but the library was spacing by MINUTE
+ * slots, so the window got silently truncated to whatever fit at the floor
+ * (1h asked for ~60 candles and got 13). Both fixes were running correctly;
+ * their units simply disagreed with the library's.
+ *
+ * And it explains why 1m always looked right: at 1m the VWAP series and the
+ * candle series carry the SAME timestamps, so slots == candles, 1:1.
+ *
+ * The VALUE is untouched — still cumulative from session open over real
+ * 1-minute bars, so VWAP stays identical at every interval by construction,
+ * exactly as chartBarsBackfill.ts's header requires. Only the emitted
+ * timestamps change. This is also precisely what the live legend already
+ * did (_refreshLegend takes the last VWAP inside the hovered candle), so the
+ * plotted line and the legend now agree by construction instead of by luck.
+ */
+export function _alignSeriesToBars(
+  src:      LineData<Time>[],
+  bars:     Bar[],
+  bucketMs: number,
+): LineData<Time>[] {
+  if (src.length === 0 || bars.length === 0) return [];
+  const bucketSec = bucketMs / 1000;
+  const out: LineData<Time>[] = [];
+  let i = 0;
+  // Both inputs are strictly ascending, so this is a single linear pass.
+  for (const bar of bars) {
+    const start = Math.floor(bar.tCT / 1000);
+    const end   = start + bucketSec;
+    let value: number | undefined;
+    while (i < src.length && (src[i].time as number) < end) {
+      if ((src[i].time as number) >= start) value = src[i].value;
+      i++;
     }
-    cumPV  += b.close * b.volume;
-    cumVol += b.volume;
-    return {
-      time:  Math.floor(b.tCT / 1000) as UTCTimestamp,
-      value: cumVol > 0 ? cumPV / cumVol : b.close,
-    };
-  });
+    // A bucket with no real 1-minute data inside it emits nothing rather than
+    // carrying the previous bar's number forward — same discipline as the
+    // legend's em dash: absent is not the same as unchanged.
+    if (value !== undefined) out.push({ time: start as UTCTimestamp, value });
+  }
+  return out;
 }
 
-// ── CVD data update (FIX 4) ────────────────────────────────────────────────────
-
-/**
- * Builds the CVD panel from the current cvdStore snapshot applied across bars.
- *
- * cvdStore holds CvdState { callPct, putPct, netDelta, classification, tickCount }
- * — it does NOT have a per-bar ticks array. The directional skew value is
- * (callPct − putPct), ranging −100 to +100, with positive values meaning
- * call-side dominance and negative values meaning put-side dominance.
- *
- * Strategy: project the current skew value as a cumulative line over bar time.
- * This gives a real-time CVD proxy that updates every time cvdStore notifies.
- * For the aggressor histogram, compute rate-of-change over 3-bar windows of
- * the same synthetic per-bar skew series.
- */
-function _updateCvdFromBars(
-  bars:       Bar[],
-  cvdState:   { callPct: number; putPct: number; netDelta: number },
-  cvdSeries:  ISeriesApi<'Line'> | null,
-  aggrSeries: ISeriesApi<'Histogram'> | null,
-) {
-  if (!cvdSeries || bars.length === 0) return;
-
-  // Current directional skew: positive = call pressure, negative = put pressure
-  const currentSkew = cvdState.callPct - cvdState.putPct; // −100 to +100
-
-  // Build a per-bar synthetic CVD line. Each bar gets the current skew value
-  // scaled by bar index to give a cumulative-delta-like ascending/descending shape.
-  // The final bar always lands at `currentSkew`. Earlier bars are interpolated
-  // linearly from 0 at session open to currentSkew at the latest bar.
-  const n = bars.length;
-  const cvdData: LineData<Time>[] = bars.map((b, i) => ({
-    time:  Math.floor(b.tCT / 1000) as UTCTimestamp,
-    value: n > 1 ? (currentSkew * i) / (n - 1) : currentSkew,
+export function _computeVwapSeries(bars: Bar[]): LineData<Time>[] {
+  // The one VWAP definition — lib/sessionVwap (hlc3 × volume, reset at each
+  // CT calendar day). This used to be close × volume; measured on SPY, QQQ
+  // and TSLA sessions the two never differed by more than 1.4¢, but the
+  // chart must use the same function the engines and cockpits do, or they
+  // can disagree about which side of VWAP price is on.
+  return sessionVwapSeries(bars).map(p => ({
+    time:  Math.floor(p.tCT / 1000) as UTCTimestamp,
+    value: p.value,
   }));
-
-  cvdSeries.setData(cvdData);
-
-  // Aggressor histogram: rate-of-change of CVD skew over 3-bar windows
-  if (aggrSeries && cvdData.length >= 3) {
-    const aggrData: HistogramData<Time>[] = [];
-    for (let i = 2; i < cvdData.length; i++) {
-      const roc = cvdData[i].value - cvdData[i - 2].value;
-      aggrData.push({
-        time:  cvdData[i].time,
-        value: roc,
-        color: roc >= 0 ? C.aggrBull : C.aggrBear,
-      });
-    }
-    aggrSeries.setData(aggrData);
-  }
 }
 
 // ── GEX levels (FIX 5) ─────────────────────────────────────────────────────────
@@ -1225,20 +1908,23 @@ function _applyGexLevelsInternal(
 
   const newLines: (() => void)[] = [];
 
+  // An absent level (null — no wall, no flip) draws nothing. Walls used to
+  // fall back to the spot price, which drew a "wall" exactly at the price.
   const addLevel = (
-    price:    number,
+    price:    number | null,
     color:    string,
-    title:    string,
+    label:    string,
     width:    1 | 2,
     style:    LineStyle,
   ) => {
+    if (price === null) return;
     const line = candleSeries.createPriceLine({
       price,
       color,
       lineWidth:        width,
       lineStyle:        style,
       axisLabelVisible: true,
-      title,
+      title: `${label} $${price.toFixed(2)}`,
     });
     newLines.push(() => candleSeries.removePriceLine(line));
   };
@@ -1247,7 +1933,7 @@ function _applyGexLevelsInternal(
   addLevel(
     ctx.walls.callWall,
     C.callWall,
-    `CALL WALL $${ctx.walls.callWall.toFixed(2)}`,
+    'CALL WALL',
     2,
     LineStyle.Solid,
   );
@@ -1256,7 +1942,7 @@ function _applyGexLevelsInternal(
   addLevel(
     ctx.walls.putWall,
     C.putWall,
-    `PUT WALL $${ctx.walls.putWall.toFixed(2)}`,
+    'PUT WALL',
     2,
     LineStyle.Solid,
   );
@@ -1266,7 +1952,7 @@ function _applyGexLevelsInternal(
     addLevel(
       ctx.upTarget,
       C.callWallSecondary,
-      `C2 $${ctx.upTarget.toFixed(2)}`,
+      'C2',
       1,
       LineStyle.Dashed,
     );
@@ -1277,20 +1963,23 @@ function _applyGexLevelsInternal(
     addLevel(
       ctx.downTarget,
       C.putWallSecondary,
-      `P2 $${ctx.downTarget.toFixed(2)}`,
+      'P2',
       1,
       LineStyle.Dashed,
     );
   }
 
-  // GEX flip level
-  addLevel(
-    ctx.flipLevel,
-    C.flip,
-    `FLIP $${ctx.flipLevel.toFixed(2)}`,
-    1,
-    LineStyle.Dashed,
-  );
+  // GEX flip level — only when it exists. Absent (null, lib/zeroGamma) draws
+  // no line: a line at a stand-in price is worse than no line.
+  if (ctx.flipLevel !== null) {
+    addLevel(
+      ctx.flipLevel,
+      C.flip,
+      'FLIP',
+      1,
+      LineStyle.Dashed,
+    );
+  }
 
   _gexCleanups.set(ctx.ticker, newLines);
 }
@@ -1306,35 +1995,40 @@ export function applyGexLevels(
 ): () => void {
   const newLines: (() => void)[] = [];
 
+  // An absent level (null — no wall, no flip) draws nothing. Walls used to
+  // fall back to the spot price, which drew a "wall" exactly at the price.
   const addLevel = (
-    price:    number,
+    price:    number | null,
     color:    string,
-    title:    string,
+    label:    string,
     width:    1 | 2,
     style:    LineStyle,
   ) => {
+    if (price === null) return;
     const line = candleSeries.createPriceLine({
       price,
       color,
       lineWidth:        width,
       lineStyle:        style,
       axisLabelVisible: true,
-      title,
+      title: `${label} $${price.toFixed(2)}`,
     });
     newLines.push(() => candleSeries.removePriceLine(line));
   };
 
-  addLevel(ctx.walls.callWall, C.callWall, `CALL WALL $${ctx.walls.callWall.toFixed(2)}`, 2, LineStyle.Solid);
-  addLevel(ctx.walls.putWall,  C.putWall,  `PUT WALL $${ctx.walls.putWall.toFixed(2)}`,   2, LineStyle.Solid);
+  addLevel(ctx.walls.callWall, C.callWall, 'CALL WALL', 2, LineStyle.Solid);
+  addLevel(ctx.walls.putWall,  C.putWall,  'PUT WALL',   2, LineStyle.Solid);
 
   if (ctx.upTarget !== ctx.walls.callWall) {
-    addLevel(ctx.upTarget,   C.callWallSecondary, `C2 $${ctx.upTarget.toFixed(2)}`,   1, LineStyle.Dashed);
+    addLevel(ctx.upTarget,   C.callWallSecondary, 'C2',   1, LineStyle.Dashed);
   }
   if (ctx.downTarget !== ctx.walls.putWall) {
-    addLevel(ctx.downTarget, C.putWallSecondary,  `P2 $${ctx.downTarget.toFixed(2)}`, 1, LineStyle.Dashed);
+    addLevel(ctx.downTarget, C.putWallSecondary,  'P2', 1, LineStyle.Dashed);
   }
 
-  addLevel(ctx.flipLevel, C.flip, `FLIP $${ctx.flipLevel.toFixed(2)}`, 1, LineStyle.Dashed);
+  if (ctx.flipLevel !== null) {
+    addLevel(ctx.flipLevel, C.flip, 'FLIP', 1, LineStyle.Dashed);
+  }
 
   return () => newLines.forEach(fn => fn());
 }
@@ -1351,9 +2045,20 @@ function _withClusterSuffix(text: string, m: ChartSignalMarker): string {
   return `${text}×${m.clusterCount}`;
 }
 
-function _buildLtwMarkers(markers: ChartSignalMarker[]): SeriesMarker<Time>[] {
+function _buildLtwMarkers(markers: ChartSignalMarker[], bucketMs: number): SeriesMarker<Time>[] {
   return markers.map(m => {
-    const time   = Math.floor(m.tCT / 1000) as UTCTimestamp;
+    // Snap to the start of the candle the signal fired in.
+    //
+    // lightweight-charts resolves a marker time that is not itself a
+    // time-scale point with a LOWER BOUND — the first point at or AFTER it
+    // (timeToIndex(time, true) in the markers plugin). So a 10:31 signal on a
+    // 5m chart was drawn on the 10:35 candle, and at 1D a 14:00 signal on the
+    // 8th was drawn on the 9th. This used to be hidden: the VWAP line carried
+    // a point for every minute, so 10:31 WAS a time-scale point and resolved
+    // exactly. Aligning VWAP to candle times (_alignSeriesToBars, 2026-09-09)
+    // removed those points and exposed it. Snapping here makes placement
+    // correct by construction, independent of whatever other series exist.
+    const time   = (Math.floor(m.tCT / bucketMs) * bucketMs / 1000) as UTCTimestamp;
     const isCall = m.direction === 'call';
 
     switch (m.state) {
@@ -1403,6 +2108,29 @@ function _buildLtwMarkers(markers: ChartSignalMarker[]): SeriesMarker<Time>[] {
 // panel's own tickMarkFormatter above) — read with UTC methods only, never
 // re-converted through toCentralTime(). See that formatter's comment for
 // the real double-conversion bug this shape previously had.
+/**
+ * Are two tCT values in the same Central-time calendar day?
+ *
+ * tCT is a CT pseudo-epoch — a real UTC epoch already shifted by the CT
+ * offset at construction — so it must be read back with UTC methods only,
+ * exactly as the tickMarkFormatter and formatChartTime already do. Passing
+ * it through toCentralTime() again would apply the offset a second time
+ * (the real 2026-09-04 double-conversion bug).
+ */
+function _isSameCTDay(aTCT: number, bTCT: number): boolean {
+  const a = new Date(aTCT), b = new Date(bTCT);
+  return a.getUTCFullYear() === b.getUTCFullYear()
+      && a.getUTCMonth()    === b.getUTCMonth()
+      && a.getUTCDate()     === b.getUTCDate();
+}
+
+/** "09/08" — CT calendar date of a tCT pseudo-epoch. Matches the axis's own
+ *  day-boundary format so the legend and the x-axis agree. */
+function _formatChartDate(tCT: number): string {
+  const d = new Date(tCT);
+  return `${String(d.getUTCMonth() + 1).padStart(2, '0')}/${String(d.getUTCDate()).padStart(2, '0')}`;
+}
+
 export function formatChartTime(timeAsSeconds: UTCTimestamp): string {
   const d = new Date(timeAsSeconds * 1000);
   return `${String(d.getUTCHours()).padStart(2, '0')}:${String(d.getUTCMinutes()).padStart(2, '0')}`;

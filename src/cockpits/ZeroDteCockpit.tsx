@@ -40,6 +40,7 @@ import * as luldStore         from '../stores/luldStore';
 import * as fundamentalsStore from '../stores/fundamentalsStore';
 import { supabase }           from '../lib/supabase';
 import { toCentralTime }      from '../lib/time';
+import { latestSessionVwap }  from '../lib/sessionVwap';
 import {
   FEED_TICKERS,
   CONTEXT_ONLY_TICKERS,
@@ -117,11 +118,11 @@ interface StackRow {
   c1:  boolean; c2: boolean; c3: boolean; c4: boolean;
   c5:  boolean; c6: boolean; c7: boolean; c8: boolean;
   price:        number;
-  callWall:     number;
-  putWall:      number;
-  flipLevel:    number;
-  upTarget:     number;
-  downTarget:   number;
+  callWall:     number | null;
+  putWall:      number | null;
+  flipLevel:    number | null; // null = absent (lib/zeroGamma) — never 0
+  upTarget:     number | null;
+  downTarget:   number | null;
   cashSettled:  boolean;
   baseRate:     BaseRate | null;
   tradeType:    TradeType;
@@ -307,7 +308,10 @@ function computeConviction(
   const closes = bars.map(b => b.close);
   const ema8  = computeEma(closes, 8);
   const ema21 = computeEma(closes, 21);
-  const vwap  = ctx.walls?.callWall ?? last.close; // approximation
+  // The one VWAP definition (lib/sessionVwap). This line used to be
+  // `ctx.walls?.callWall ?? last.close; // approximation` — the call wall
+  // standing in for VWAP. Null (no volume yet) earns nothing below.
+  const vwap  = latestSessionVwap(bars);
 
   // CVD alignment
   const cvdAligned = direction === 'call'
@@ -321,8 +325,8 @@ function computeConviction(
   if (direction === 'put'  && ema8 < ema21 && last.close < ema8) score += 5;
 
   // VWAP
-  if (direction === 'call' && last.close > vwap) score += 3;
-  if (direction === 'put'  && last.close < vwap) score += 3;
+  if (vwap !== null && direction === 'call' && last.close > vwap) score += 3;
+  if (vwap !== null && direction === 'put'  && last.close < vwap) score += 3;
 
   return Math.min(100, Math.max(0, Math.round(score * convictionMultiplier(tradeType))));
 }
@@ -349,6 +353,7 @@ function entryTriggerText(row: StackRow): string {
     return `Continuation — enter on next candle open above prior high`;
   }
   const wall = row.direction === 'call' ? row.callWall : row.putWall;
+  if (wall === null) return `No GEX wall on this side (absent) — no wall-based trigger`;
   return `GEX wall at ${wall.toFixed(2)} — enter on close ${row.direction === 'call' ? 'above' : 'below'} flip level`;
 }
 
@@ -372,11 +377,12 @@ function buildStackRow(ticker: string): StackRow | null {
     : 'call';
 
   const price       = bars?.length ? bars[bars.length - 1].close : 0;
-  const callWall    = ctx?.walls.callWall  ?? 0;
-  const putWall     = ctx?.walls.putWall   ?? 0;
-  const flipLevel   = ctx?.flipLevel       ?? 0;
-  const upTarget    = ctx?.upTarget        ?? 0;
-  const downTarget  = ctx?.downTarget      ?? 0;
+  // Absent stays absent (null) — these were `?? 0`, a wall at $0.
+  const callWall    = ctx?.walls.callWall  ?? null;
+  const putWall     = ctx?.walls.putWall   ?? null;
+  const flipLevel   = ctx?.flipLevel       ?? null; // absent stays absent — was ?? 0
+  const upTarget    = ctx?.upTarget        ?? null;
+  const downTarget  = ctx?.downTarget      ?? null;
   const gexRegime   = ctx?.gexRegime       ?? 'neutral';
   const cashSettled = CASH_SETTLED_TICKERS.has(ticker);
   const isHalted    = luld?.isCurrentlyHalted ?? false;
@@ -396,7 +402,12 @@ function buildStackRow(ticker: string): StackRow | null {
       delta      = direction === 'call' ? atm.callDelta : atm.putDelta;
       gamma      = direction === 'call' ? atm.callGamma : atm.putGamma;
       theta      = direction === 'call' ? atm.callTheta : atm.putTheta;
-      ivRank     = atm.callIV > 0 ? atm.callIV / 100 : null;
+      // Stays null: an IV RANK needs this ticker's IV history (where today's
+      // IV sits in its own past year), and no IV history is stored anywhere.
+      // This used to be `atm.callIV / 100` — Massive's IV is already a
+      // decimal (0.18), so that produced 0.0018, displayed as "0th pct", and
+      // c7 (< 0.75) passed on every row.
+      ivRank     = null;
     }
   }
 
@@ -438,22 +449,37 @@ function buildStackRow(ticker: string): StackRow | null {
     tradeType,
   };
 
-  const brainR = brainStore.getBaseRate(fingerprint);
-  const baseRate = brainR.status === 'ready' ? brainR.data : null;
+  // No VIX → no fingerprint. The bucket used to default to '<15', looking up
+  // a Brain base rate for a volatility regime nobody measured.
+  const brainR = vixClose !== null ? brainStore.getBaseRate(fingerprint) : null;
+  const baseRate = brainR?.status === 'ready' ? brainR.data : null;
 
-  // 8 criteria
+  // 8 criteria — ABSENT DATA FAILS. Every criterion below passes only on
+  // data that is actually there.
+  //
+  // Measured before this change, market closed 2026-09-10: every row scored
+  // 79 = c2 64 + c5 8 + c6 4 + c7 2 + c8 1 with no live data at all — c2
+  // passed with no LULD data and stale bars, c5 passed because a zero
+  // premium was treated as "no spread problem", c6 returned true when there
+  // were no bars, c7 passed a mis-scaled IV (see ivRank above), c8 passes
+  // whether or not fundamentals ever loaded. "Nothing qualifies" was indistinguishable
+  // from "no data", and it showed as a plausible 79.
   const c1 = !!(baseRate?.isStatisticallyValid && baseRate.n >= 30 && baseRate.winRate >= 0.6);
-  const c2 = !isHalted;
+  // Not halted AND actually trading: `bars` is null unless barsStore has a
+  // bar from the last 2 minutes. NYSE-listed tickers never get a LULD feed
+  // (see NASDAQ_LISTED_TICKERS), so live prints are the only evidence they
+  // are not halted; with no prints at all, the ticker is not tradeable now.
+  const c2 = bars !== null && !isHalted;
   const c3 = leaderCvdOk && tickerCvdOk;
   const c4 = !!(dir && (dir.playDirection === 'calls' || dir.playDirection === 'puts'));
-  const c5 = spreadPct < 0.08 || midPremium === 0;
+  const c5 = midPremium > 0 && spreadPct < 0.08;
   const c6 = (() => {
-    if (!ctx || !bars?.length) return true;
+    if (!ctx || !bars?.length || !(midPremium > 0)) return false;
     const wall = direction === 'call' ? callWall : putWall;
-    return midPremium < Math.abs(wall - price);
+    return wall !== null && midPremium < Math.abs(wall - price);
   })();
-  const c7 = ivRank === null || ivRank < 0.75;
-  const c8 = !hasNews;
+  const c7 = ivRank !== null && ivRank < 0.75; // always absent today — no IV history
+  const c8 = fund !== null && !hasNews;
 
   const score =
     (c1 ? W.c1 : 0) + (c2 ? W.c2 : 0) + (c3 ? W.c3 : 0) + (c4 ? W.c4 : 0) +
@@ -477,9 +503,11 @@ function buildStackRow(ticker: string): StackRow | null {
     baseRate, tradeType, midPremium, delta, gamma, theta, spread, ivRank,
     spreadPct, leaderCvdOk, tickerCvdOk, isHalted, hasNews,
     entryTrigger: entryTriggerText({ ticker, direction, tradeType, callWall, putWall, flipLevel, upTarget, downTarget } as StackRow),
-    invalidation: direction === 'call'
-      ? `Close below ${flipLevel.toFixed(2)} (flip level)`
-      : `Close above ${flipLevel.toFixed(2)} (flip level)`,
+    invalidation: flipLevel === null
+      ? 'No flip level (absent) — no automatic invalidation; set one before entry'
+      : direction === 'call'
+        ? `Close below ${flipLevel.toFixed(2)} (flip level)`
+        : `Close above ${flipLevel.toFixed(2)} (flip level)`,
   } as StackRow;
 
   return row;
@@ -528,7 +556,11 @@ function GlobalHeader({
   // Candles remaining in session
   const candlesRemaining = (() => {
     const ct = toCentralTime(Date.now());
-    const closeMin = 16 * 60;
+    // NYSE regular close, 4:00 PM ET = 3:00 PM CT (verified 2026-08-31 —
+    // the DEFAULT_FORCED_CLOSE citation in relay/engine/risk/forcedClose.ts).
+    // This was 16 * 60: an Eastern wall-clock number in a Central frame,
+    // overstating the count by 12 five-minute candles all session.
+    const closeMin = 15 * 60;
     const nowMin   = ct.hour * 60 + ct.minute;
     const rem = Math.max(0, closeMin - nowMin);
     return Math.floor(rem / 5);
@@ -1024,7 +1056,7 @@ function InlinePreEntryCard({
   const cvdStep3 = cvdStep1 && cvdStep2;
 
   const tradeTypeCfg: Record<TradeType, { color: string; label: string; desc: string }> = {
-    with_session:    { color: 'text-col-g',  label: 'WITH SESSION',    desc: `Target: GEX wall ${(row.direction === 'call' ? row.callWall : row.putWall).toFixed(2)}` },
+    with_session:    { color: 'text-col-g',  label: 'WITH SESSION',    desc: (() => { const w = row.direction === 'call' ? row.callWall : row.putWall; return w === null ? 'Target: no GEX wall (absent)' : `Target: GEX wall ${w.toFixed(2)}`; })() },
     counter_session: { color: 'text-amb',    label: 'COUNTER SESSION', desc: 'Target: VWAP reversion — tighter sizing' },
     continuation:    { color: 'text-white/40', label: 'WITH SESSION',  desc: `Re-entry within 90 min — ×1.05 conviction, size down` },
   };
@@ -1053,7 +1085,7 @@ function InlinePreEntryCard({
             { label: 'Signal actionable', pass: row.c4 },
             { label: 'Spread < 8%', pass: row.c5 },
             { label: 'Break-even reachable', pass: row.c6 },
-            { label: 'IV rank < 75th', pass: row.c7 },
+            { label: 'IV rank < 75th (no IV history — blocked)', pass: row.c7 },
             { label: 'No earnings', pass: row.c8 },
           ].map(({ label, pass }) => (
             <div key={label} className="flex items-center gap-1.5">
@@ -1188,10 +1220,12 @@ function BrainDots({ n }: { n: number | null | undefined }) {
 // ── DisciplineLine: consolidated one-line gate replacing AdaptiveRiskLine + BrainContext ──
 // Shows: MAX LOSS {riskPct}% · AVG P&L {avgPnl}% · WIN RATE {adjWinRate}% (n={n}) · session tag
 function DisciplineLine({ row }: { row: StackRow }) {
-  const stopDist   = row.direction === 'call'
-    ? Math.abs(row.price - row.flipLevel)
-    : Math.abs(row.flipLevel - row.price);
-  const riskPct    = row.price > 0 ? (stopDist / row.price) * 100 : 0;
+  // The stop is the flip level, so with no flip there is no max loss to
+  // state — null renders "—", never 0%. (With the old flip, META showed a
+  // 99% "max loss": the distance to a $5 flip.)
+  const riskPct    = row.flipLevel !== null && row.price > 0
+    ? (Math.abs(row.price - row.flipLevel) / row.price) * 100
+    : null;
   const mult       = convictionMultiplier(row.tradeType);
 
   const br         = row.baseRate;
@@ -1223,8 +1257,8 @@ function DisciplineLine({ row }: { row: StackRow }) {
       <div className="flex items-center gap-2 flex-wrap">
         {/* MAX LOSS */}
         <span className="text-[10px] text-white/40">MAX LOSS</span>
-        <span className={`text-[10px] font-bold tabular-nums ${riskPct > 1.5 ? 'text-amb' : 'text-white/70'}`}>
-          {riskPct.toFixed(2)}%
+        <span className={`text-[10px] font-bold tabular-nums ${riskPct !== null && riskPct > 1.5 ? 'text-amb' : 'text-white/70'}`}>
+          {riskPct === null ? '—' : `${riskPct.toFixed(2)}%`}
         </span>
 
         <span className="text-white/15">·</span>
@@ -1260,7 +1294,9 @@ function DisciplineLine({ row }: { row: StackRow }) {
 
       {/* Stop level sub-line */}
       <p className="text-[9px] text-dim">
-        Stop @ flip level <span className="text-white/50 font-mono">${row.flipLevel.toFixed(2)}</span>
+        {row.flipLevel === null
+          ? <>Stop: flip level <span className="text-amb/70">absent</span></>
+          : <>Stop @ flip level <span className="text-white/50 font-mono">${row.flipLevel.toFixed(2)}</span></>}
         {row.tradeType === 'counter_session' && (
           <span className="text-amb/60"> — size down for counter-session</span>
         )}
@@ -1640,7 +1676,7 @@ export default function ZeroDteCockpit() {
       entryDelta:   delta,
       entryGamma:   gamma,
       entryTheta:   theta,
-      stopLevel:    row.flipLevel || null,
+      stopLevel:    row.flipLevel, // null when the flip is absent (lib/zeroGamma)
       targetLevel:  row.direction === 'call' ? row.upTarget : row.downTarget,
       tradeType:    row.tradeType,
       currentPrice:  entryPrice,

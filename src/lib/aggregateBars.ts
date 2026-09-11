@@ -17,7 +17,12 @@ import type { Bar } from '../stores/types';
 
 // ── Interval types ────────────────────────────────────────────────────────────
 
-export type ChartInterval = '1m' | '5m' | '15m' | '1h';
+// '1d' is browser-only — the chart's daily view. relay/engine/lib/chartBars.ts
+// has no daily rollup and needs none (no engine computes on daily candles).
+// At '1d' the bucket is one CT calendar day, so callers must feed this
+// REGULAR-SESSION minutes only — see regularSessionOnly in
+// chartBarsBackfill.ts for why, and the real data behind it.
+export type ChartInterval = '1m' | '5m' | '15m' | '1h' | '1d';
 
 /** Bucket width in minutes for each supported interval. */
 export const INTERVAL_MINUTES: Readonly<Record<ChartInterval, number>> = {
@@ -25,6 +30,7 @@ export const INTERVAL_MINUTES: Readonly<Record<ChartInterval, number>> = {
   '5m': 5,
   '15m': 15,
   '1h': 60,
+  '1d': 1440,
 };
 
 // ── Generic time-bucketing core ─────────────────────────────────────────────

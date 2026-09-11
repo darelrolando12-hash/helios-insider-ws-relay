@@ -29,16 +29,23 @@ const STALE_THRESHOLD_MS = 5 * 60 * 1000;
  */
 export interface MarketContext extends MarketContextSnapshot {
   /**
+   * The underlying price this snapshot was computed at (the chain
+   * snapshot's own underlying price). Null when unknown. Consumers that need
+   * "spot" must read this — never reconstruct it from walls.
+   */
+  spotPrice: number | null;
+
+  /**
    * Price target above current price implied by GEX structure.
    * Typically the next significant call-wall cluster above the flip level.
    */
-  upTarget: number;
+  upTarget: number | null;   // null when there is no call wall
 
   /**
    * Price target below current price implied by GEX structure.
    * Typically the next significant put-wall cluster below the flip level.
    */
-  downTarget: number;
+  downTarget: number | null; // null when there is no put wall
 
   /**
    * Net GEX in dollar-gamma terms (positive = dealers long gamma).
@@ -93,6 +100,17 @@ export function getResult(ticker: string): Result<MarketContext> {
   }
 
   return ready(ctx, ctx.asOf);
+}
+
+/**
+ * The last MarketContext written for `ticker`, whatever its age — null only
+ * when none has ever been written. Same contract as barsStore.getBarsRaw: for
+ * display surfaces that show old data LABELLED as old rather than hiding it
+ * (getResult withholds a >5-minute-old snapshot entirely). Anything that
+ * scores or trades must keep using getResult.
+ */
+export function getContextRaw(ticker: string): MarketContext | null {
+  return _state.get(ticker) ?? null;
 }
 
 export function isDataReady(ticker: string): boolean {

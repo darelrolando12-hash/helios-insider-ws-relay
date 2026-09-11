@@ -102,7 +102,7 @@ function getFlags(ticker: string, mkt: MarketContext | null, dir: DirectionState
   const flags: string[] = [];
   const fund = fundamentalsStore.getResult(ticker);
   const si = fund.status === 'ready' ? fund.data.shortInterest?.shortFloat : null;
-  if (si != null && si > 0.12) flags.push('SQUEEZE');
+  if (si != null && si > 12) flags.push('SQUEEZE');   // percent — was 0.12 (0.12%), true for any ticker with data
   if (dir?.sessionBias === 'bullish' && dir?.playDirection === 'calls') flags.push('ELITE');
   if (mkt && mkt.gexRegime === 'negative') flags.push('WATCH');
   return flags;
@@ -217,17 +217,22 @@ function GammaSnapshotCard({ onOpenChain }: { onOpenChain: () => void }) {
 
   const spyDir = getDirectionState('SPY');
 
-  // Squeeze tickers — short float > 12%
+  // Squeeze tickers — short float > 10% of float. shortFloat is a PERCENT
+  // (relay: computeShortPctOfFloat × 100) — this compared it to 0.10, i.e.
+  // 0.1%, so any ticker with short-interest data qualified. Absent (null /
+  // undefined) never qualifies.
   const squeezeTickers: string[] = [];
   for (const t of FEED_TICKERS) {
     if (CONTEXT_ONLY_TICKERS.has(t)) continue;
     const r = fundamentalsStore.getResult(t);
-    if (r.status === 'ready' && r.data.shortInterest && (r.data.shortInterest.shortFloat ?? 0) > 0.10) {
-      squeezeTickers.push(t);
-    }
+    const sf = r.status === 'ready' ? r.data.shortInterest?.shortFloat : undefined;
+    if (typeof sf === 'number' && sf > 10) squeezeTickers.push(t);
   }
 
-  const spot      = mkt ? mkt.walls.callWall - (mkt.walls.callWall - mkt.walls.putWall) * 0.4 : null;
+  // The real underlying price the snapshot was computed at. This was
+  // `callWall − (callWall − putWall) × 0.4` — a number derived from the walls,
+  // displayed as "Spot".
+  const spot      = mkt?.spotPrice ?? null;
   const flipLevel = mkt?.flipLevel ?? null;
   const callWall  = mkt?.walls.callWall ?? null;
   const netGex    = mkt?.netGex ?? null;
@@ -320,7 +325,7 @@ function GammaSnapshotCard({ onOpenChain }: { onOpenChain: () => void }) {
               const si = r.status === 'ready' ? r.data.shortInterest?.shortFloat : null;
               return (
                 <span key={t} style={{ fontFamily: 'JetBrains Mono, monospace', fontSize: 10, fontWeight: 700, padding: '2px 7px', background: 'rgba(245,166,35,0.1)', color: 'var(--amb-solid)', borderRadius: 2 }}>
-                  {t}{si ? ` · Short ${(si * 100).toFixed(1)}%` : ''}
+                  {t}{si != null ? ` · Short ${si.toFixed(1)}%` : ''}
                 </span>
               );
             })}

@@ -30,6 +30,7 @@ import * as barsStore    from '../stores/barsStore';
 import * as marketStore  from '../stores/marketStore';
 import * as cvdStore     from '../stores/cvdStore';
 import { computeEma }    from '../engines/confluenceEngine';
+import { latestSessionVwap } from '../lib/sessionVwap';
 import { formatError }   from '../lib/errors';
 
 // ── Exported types ─────────────────────────────────────────────────────────────
@@ -255,8 +256,12 @@ export function updateDirectionState(ticker: string): void {
   const ema8       = computeEma(closes, 8);
   const ema21      = computeEma(closes, 21);
 
-  // Session VWAP (approximate from bars with vwap field, or close-based mean)
-  const vwap = _computeSessionVwap(bars);
+  // The one definition (lib/sessionVwap). This used to be Massive's per-bar
+  // `vw` over the whole buffer with no session reset: 59¢ off the chart's
+  // VWAP on SPY 09-10, and blended with yesterday's after-hours every
+  // morning, so session bias and the chart could disagree about which side
+  // of VWAP price was on.
+  const vwap = latestSessionVwap(bars);
 
   // ── Play Direction (what is price doing RIGHT NOW) ──────────────────────────
   const { playDirection, playDirectionReason } = _computePlayDirection(
@@ -380,7 +385,7 @@ interface SessionBiasResult {
 
 function _computeSessionBias(
   lastBar: { close: number },
-  ctx:     { gexRegime: string; flipLevel: number; walls: { callWall: number; putWall: number } },
+  ctx:     { gexRegime: string; flipLevel: number | null; walls: { callWall: number | null; putWall: number | null } },
   vwap:    number | null,
   closes:  number[],
 ): SessionBiasResult {
@@ -391,8 +396,13 @@ function _computeSessionBias(
   // GEX regime (weight 2)
   if (ctx.gexRegime === 'negative') {
     // Negative GEX = dealers short gamma = trending environment
-    // Direction is determined by price relative to flip level
-    if (lastBar.close < ctx.flipLevel) {
+    // Direction is determined by price relative to flip level — and only
+    // when the flip is known. The old flip was $580 on SPY and $5 on META,
+    // so this branch voted "above flip" (bullish +2) on almost every ticker
+    // regardless of price. An absent flip casts no vote.
+    if (ctx.flipLevel === null) {
+      reasons.push('NEG GEX, flip absent');
+    } else if (lastBar.close < ctx.flipLevel) {
       bearishVotes += 2;
       reasons.push('NEG GEX below flip');
     } else {
@@ -400,7 +410,7 @@ function _computeSessionBias(
       reasons.push('NEG GEX above flip');
     }
   } else if (ctx.gexRegime === 'positive') {
-    reasons.push(`POS GEX (flip: $${ctx.flipLevel.toFixed(2)})`);
+    reasons.push(ctx.flipLevel === null ? 'POS GEX (flip absent)' : `POS GEX (flip: $${ctx.flipLevel.toFixed(2)})`);
     // POS GEX is regime-neutral; price location within walls determines direction
   }
 
@@ -434,29 +444,6 @@ function _computeSessionBias(
   else                bias = 'neutral';
 
   return { bias, reason: reasons.join(' + ') };
-}
-
-// ── Session VWAP computation ───────────────────────────────────────────────────
-
-/**
- * Compute VWAP from bars that have a vwap field, or approximate from close/volume.
- * Returns null if not enough data.
- */
-function _computeSessionVwap(bars: { close: number; volume: number; vwap?: number }[]): number | null {
-  if (bars.length === 0) return null;
-
-  // If bars carry their own vwap field (Massive provides this), use cumulative
-  const withVwap = bars.filter(b => b.vwap !== undefined);
-  if (withVwap.length > 0) {
-    const totalVol = withVwap.reduce((s, b) => s + b.volume, 0);
-    if (totalVol === 0) return null;
-    return withVwap.reduce((s, b) => s + (b.vwap! * b.volume), 0) / totalVol;
-  }
-
-  // Fallback: close-weighted VWAP from OHLC bars
-  const totalVol = bars.reduce((s, b) => s + b.volume, 0);
-  if (totalVol === 0) return null;
-  return bars.reduce((s, b) => s + (b.close * b.volume), 0) / totalVol;
 }
 
 // ── Conviction score utilities ────────────────────────────────────────────────
