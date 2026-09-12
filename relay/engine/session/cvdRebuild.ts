@@ -35,6 +35,16 @@
  * accurate than live classification, it is a real difference in the data, and
  * it is reported in the result rather than smoothed over. Trades sharing the
  * first live trade's millisecond but printed before it are in neither set.
+ *
+ * How big that difference is, measured 2026-09-11 on SPY's first ten minutes
+ * (25,745 trades classified both ways): the uptick rule and the quote test
+ * agree on 72.5% of trades, 36.1% print inside the spread, and the cumulative
+ * delta lands 3× apart (1,259k vs 411k), biased toward "buy" in a rising
+ * tape. Per-minute signs agreed 9 times in 10 — the shape holds, the scale
+ * does not. Quotes are available (/v3/quotes) but cost ~8M rows per ticker
+ * per session against ~470k trades, which is not affordable at boot for 21
+ * tickers; consumers should prefer imbalance ratios over raw cumulative
+ * delta across the rebuilt/live boundary (cvdStore.getCoverage, liveFromUtc).
  */
 
 import type { MassiveRestClient } from '../lib/massive/api.ts';
