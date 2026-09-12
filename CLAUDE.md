@@ -118,6 +118,8 @@ Corollary, from the same incident: **phase-in periods mean the regulation and th
 
 **A trend across years can be pure sample size.** The same flow test on 200 out-of-sample sessions showed a monotone decay — 2023 +4.1, 2024 −1.0, 2025 −6.8, 2026 −18.5 points — and reporting it as a drift was premature. Extending to 1,208 sessions: the edge is +0.2 points and 2026 is **+5.9** (n 65 → 409). Before believing a time trend, ask what the smallest bucket's n is.
 
+**A result its own structure forbids means the measurement broke, not the strategy.** Measured 2026-09-12: a defined-risk iron fly cannot lose more than its max risk, yet the backtest reported losses of 1,834% of max risk from option trade prints, and 28 of 171 below −100% from option NBBO. The cause is illiquid 0DTE wings — a stale last print, or a quote matched up to five minutes away, marks the four legs at different instants and the structure loses its bounds. The fix is not a filter that hides the impossible values (tightening to liquid names and plausible credits still left 5 of 59 out of bounds); it is to reject any mark outside the structure's own range before it reaches a mean. Until that exists, the seller's side is **untested, not refuted**.
+
 **Corollary — a positive mean on both sides is a pricing error, not an edge.** Fading the gap returned +13.7% and following it +9.2% on the same days; a plain call +12.3% and a plain put +10.5%. They cannot all be edges. Only the mirror comparison (the identical entry taken the other way) is pricing-neutral, which is why every directional claim here carries one.
 
 ---
