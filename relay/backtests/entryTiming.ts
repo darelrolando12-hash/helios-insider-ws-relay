@@ -57,6 +57,8 @@ interface Entry {
   /** Underlying continued in `dir` over the next 30 minutes. */
   continued: boolean;
   ret: number[]; mirror: number[]; oracle: number[];
+  /** |price − open| in ATRs at entry, and net delta as a share of volume (0 without flow data). */
+  ext: number; imbalance: number;
   /** Clean-open day (hindsight) — for the "how fast does the money go" curve. */
   clean: boolean;
 }
@@ -106,16 +108,19 @@ async function runTicker(ticker: string): Promise<Entry[]> {
     const usual = median(or30.slice(i - 20, i));
     const clean = R30 >= 1.5 * usual && Math.abs(net30) >= 0.5 * R30 && adv <= 0.25 * R30 && (fav > 0 ? (fav - Math.abs(net30)) / fav : 1) <= 0.5;
 
-    let cumBuy = 0, cumSell = 0;
+    // index 0 of the delta arrays is the 08:30 bar itself; seed with it so the
+    // decision at minute m includes every minute up to and including m.
+    let cumBuy = d ? (d.buy[0] ?? 0) : 0, cumSell = d ? (d.sell[0] ?? 0) : 0;
     for (let m = OPEN + 1; m <= LAST_ENTRY; m++) {
       const k = idx.get(m);
       if (k === undefined) continue;
-      if (d) { const j = m - OPEN - 1; cumBuy += d.buy[j] ?? 0; cumSell += d.sell[j] ?? 0; }
+      if (d) { const j = m - OPEN; cumBuy += d.buy[j] ?? 0; cumSell += d.sell[j] ?? 0; }
       const price = s.bars[k].close;
       const pDir = priceConfirmation(openPrice, price, atr, 0);
       const pDirT = priceConfirmation(openPrice, price, atr);
-      const fDir = d ? flowConfirmation(cumBuy - cumSell, cumBuy + cumSell, 0) : 0;
-      const fDirT = d ? flowConfirmation(cumBuy - cumSell, cumBuy + cumSell) : 0;
+      const flowOk = !!d && (m - OPEN) < d.buy.length;   // the flow window can be shorter than the sweep
+      const fDir = flowOk ? flowConfirmation(cumBuy - cumSell, cumBuy + cumSell, 0) : 0;
+      const fDirT = flowOk ? flowConfirmation(cumBuy - cumSell, cumBuy + cumSell) : 0;
       const dirs: Record<Variant, Dir> = {
         price: pDir, 'price+thr': pDirT, flow: fDir, 'flow+thr': fDirT,
         both: agreement(pDir, fDir), 'both+thr': agreement(pDirT, fDirT),
@@ -128,7 +133,7 @@ async function runTicker(ticker: string): Promise<Entry[]> {
       for (const v of VARIANTS) {
         const dir = dirs[v];
         if (dir === 0) continue;
-        if (!d && (v.startsWith('flow') || v.startsWith('both'))) continue;
+        if (!flowOk && (v.startsWith('flow') || v.startsWith('both'))) continue;
         const ret: number[] = [], mirror: number[] = [], oracle: number[] = [];
         IV_RV.forEach((mult, ki) => {
           const iv = s.rv! * mult;
@@ -145,7 +150,8 @@ async function runTicker(ticker: string): Promise<Entry[]> {
             if (side === dir) oracle[ki] = Math.max(best, exitBid) / ask - 1;
           }
         });
-        out.push({ ticker, day: s.day, oos: s.day >= OOS_FROM, minute: m, variant: v, dir, continued: after !== null && Math.sign(after) === dir, ret, mirror, oracle, clean });
+        out.push({ ticker, day: s.day, oos: s.day >= OOS_FROM, minute: m, variant: v, dir, continued: after !== null && Math.sign(after) === dir, ret, mirror, oracle, clean,
+          ext: atr > 0 ? Math.abs(price - openPrice) / atr : 0, imbalance: d && cumBuy + cumSell > 0 ? (cumBuy - cumSell) / (cumBuy + cumSell) : 0 });
       }
     }
   }
@@ -186,7 +192,20 @@ async function main() {
     cleanRows.push({ minute: m, ...agg(all.filter((e) => e.variant === 'hindsight' && e.minute === m), 0) });
   }
   result.cleanDayPayoff = cleanRows;
+  // Reliability against extension: the other axis of the same trade-off.
+  const EXT = [[0, 0.1], [0.1, 0.25], [0.25, 0.5], [0.5, 99]];
+  result.byExtension = {};
+  result.byImbalance = {};
+  for (const v of ['price', 'flow', 'both']) {
+    for (const [slice, pick] of [['in-sample', (e) => !e.oos], ['out-of-sample', (e) => e.oos]]) {
+      result.byExtension[v + ' · ' + slice] = EXT.map(([lo, hi]) => ({ lo, hi, ...agg(all.filter((e) => e.variant === v && e.ext >= lo && e.ext < hi && pick(e)), 0) }));
+      result.byImbalance[v + ' · ' + slice] = [[0, 0.05], [0.05, 0.15], [0.15, 0.3], [0.3, 9]].map(([lo, hi]) => ({ lo, hi, ...agg(all.filter((e) => e.variant === v && Math.abs(e.imbalance) >= lo && Math.abs(e.imbalance) < hi && pick(e)), 0) }));
+    }
+  }
   writeFileSync(OUT, JSON.stringify(result, null, 1));
+  // Per-entry rows: entries inside one session are not independent, so the
+  // honest test clusters by ticker-session. Dump them and let the caller do it.
+  if (process.env.ENTRIES_OUT) writeFileSync(process.env.ENTRIES_OUT, JSON.stringify(all));
 
   const pc = (x: number | undefined | null) => x === undefined || x === null ? '  —  ' : `${(x * 100).toFixed(1)}%`.padStart(6);
   for (const v of VARIANTS) {

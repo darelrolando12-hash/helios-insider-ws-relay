@@ -34,7 +34,9 @@ export function priceConfirmation(
 ): Dir {
   if (!(atr !== null && atr > 0)) return 0;
   const ext = (closePrice - openPrice) / atr;
-  if (Math.abs(ext) < minExtensionAtr) return 0;
+  // `< threshold` alone cannot catch an exactly-flat move when the threshold
+  // is 0, and "unchanged" is not a direction.
+  if (ext === 0 || Math.abs(ext) < minExtensionAtr) return 0;
   return ext > 0 ? 1 : -1;
 }
 
@@ -50,7 +52,7 @@ export function flowConfirmation(
 ): Dir {
   if (!(cumVolume > 0)) return 0;
   const imbalance = cumDelta / cumVolume;
-  if (Math.abs(imbalance) < minImbalance) return 0;
+  if (imbalance === 0 || Math.abs(imbalance) < minImbalance) return 0;
   return imbalance > 0 ? 1 : -1;
 }
 
