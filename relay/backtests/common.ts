@@ -163,6 +163,16 @@ export function tradingYearsToClose(minuteOfDay: number): number {
   return Math.max(0, CLOSE_MIN - minuteOfDay) / (390 * 252);
 }
 
+/**
+ * Trading years to an expiry `expiryDays` sessions out: today's remaining
+ * minutes plus whole sessions after it. expiryDays = 1 is 0DTE and equals
+ * tradingYearsToClose. Used to ask whether a directional signal too small to
+ * clear 0DTE decay survives in a 1–2 week option.
+ */
+export function tradingYearsToExpiry(minuteOfDay: number, expiryDays: number): number {
+  return (Math.max(0, CLOSE_MIN - minuteOfDay) + Math.max(0, expiryDays - 1) * 390) / (390 * 252);
+}
+
 export function wilson(k: number, n: number): [number, number] {
   if (n === 0) return [0, 0];
   const z = 1.96, p = k / n, d = 1 + z * z / n;

@@ -430,7 +430,16 @@ export async function hydrateFreeFloatFromDb(): Promise<void> {
     .in('ticker', FEED_TICKERS as unknown as string[]);
 
   if (error) {
-    console.error(`[shortInterestIngestion] free float hydrate failed —`, error.message);
+    // Name the consequence, not just the failure: a missing table is a
+    // migration nobody has run, and the log line has to say so or it reads
+    // as transient. Float is refreshed in memory 9 s after boot and weekly
+    // (engine/index.ts), so this costs durability, not correctness.
+    const missing = /does not exist/i.test(error.message);
+    console.error(
+      `[shortInterestIngestion] free float hydrate failed — ${error.message}` +
+      (missing ? ' · MIGRATION NOT RUN: create table public.stock_float (backups/stock-float-table.sql). ' +
+                 'Free float stays absent until the next float run; squeezeEngine cannot derive short-float-of-free-float until then.' : '')
+    );
     return;
   }
   if (!data || data.length === 0) return;

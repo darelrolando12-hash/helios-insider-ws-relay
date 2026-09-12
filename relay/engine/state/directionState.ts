@@ -165,6 +165,26 @@ export const FEED_TICKERS = [
 
 export type FeedTicker = typeof FEED_TICKERS[number];
 
+/**
+ * Index products print no trades of their own — there is no trade feed to
+ * classify, so CVD is structurally absent for them, permanently. Measured
+ * 2026-09-11: the boot rebuild returned `quality=absent — 0 trade(s)
+ * fetched` for SPX and NDX while the other 21 replayed their whole sessions.
+ *
+ * `confluenceEngine` returns before scoring whenever CVD is not ready, so
+ * leaving these in the scored set makes two of the feed permanently silent
+ * in a way that looks exactly like a quiet market — the silent-zero shape
+ * CLAUDE.md opens with. They keep their bars, chain and GEX (they are in
+ * FEED_TICKERS) and are excluded from signal scoring explicitly instead.
+ *
+ * To score them for real, the flow would have to come from somewhere that
+ * does trade: the index ETF (SPY / QQQ) or the index options themselves.
+ */
+export const NO_TRADE_FEED_TICKERS = new Set<string>(['SPX', 'NDX']);
+
+/** Feed tickers that can actually be scored — FEED_TICKERS minus the index products. */
+export const SCORED_TICKERS = FEED_TICKERS.filter((t) => !NO_TRADE_FEED_TICKERS.has(t));
+
 // ── Internal state ─────────────────────────────────────────────────────────────
 
 const _stateByTicker = new Map<string, DirectionState>();

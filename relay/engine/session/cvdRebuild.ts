@@ -41,6 +41,7 @@ import type { MassiveRestClient } from '../lib/massive/api.ts';
 import { classifyTick } from '../engines/cvdEngine.ts';
 import * as cvdStore from '../stores/cvdStore.ts';
 import { toCentralTime } from '../lib/time.ts';
+import { NO_TRADE_FEED_TICKERS } from '../state/directionState.ts';
 import type { CvdTick, AssetClass } from '../stores/types.ts';
 
 /**
@@ -141,6 +142,11 @@ export async function rebuildTicker(
     ticker, quality: 'absent', tradesFetched: 0, ticksApplied: 0, droppedAsLive: 0, pages: 0,
     sessionOpenUtc: open, classifiedWithoutQuotes: true,
   };
+
+  if (NO_TRADE_FEED_TICKERS.has(ticker)) {
+    // An index prints no trades; 'absent' would read as a failed rebuild.
+    return { ...base, quality: 'none-needed', reason: 'index product: no trade feed, so CVD is structurally absent' };
+  }
 
   const openCt = toCentralTime(open);
   const weekday = new Date(Date.UTC(openCt.year, openCt.month - 1, openCt.day)).getUTCDay();

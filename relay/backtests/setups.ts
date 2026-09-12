@@ -30,11 +30,13 @@ import { writeFileSync } from 'node:fs';
 import { evaluateExit, SESSION_CUTOFF_CT_MIN, type ExitParams, type OpenPosition } from '../engine/exits/exitRules.ts';
 import { sessionVwapSeries } from '../engine/lib/sessionVwap.ts';
 import { detectAll, OPEN_MIN, CLOSE_MIN, type SetupSession, type SetupSignal } from '../engine/setups/setups.ts';
-import { EVAL_FROM, OOS_FROM, SPREAD_PCT, DEFAULT_SPREAD_PCT, loadSessions, bs, tradingYearsToClose, type Session } from './common.ts';
+import { EVAL_FROM, OOS_FROM, SPREAD_PCT, DEFAULT_SPREAD_PCT, loadSessions, bs, tradingYearsToExpiry, type Session } from './common.ts';
 
 const TICKERS = (process.env.TICKERS ?? 'SPY,QQQ,IWM,AAPL,TSLA,NVDA,META,AMD').split(',');
 const OUT = process.env.OUT ?? './setups-backtest.json';
 const IV_RV = [1.0, 1.3] as const;
+/** Expiry in trading sessions: 1 = 0DTE. A directional edge too small to clear 0DTE decay can still pay in a weekly. */
+const EXPIRY_DAYS = Number(process.env.EXPIRY_DAYS ?? 1);
 const CUT = SESSION_CUTOFF_CT_MIN;
 
 type Rule = 'R0' | 'R1' | 'R2' | 'R4' | 'R6' | 'R7';
@@ -109,7 +111,7 @@ function simulate(ss: SetupSession, sig: SetupSignal, direction: 'long' | 'short
   for (const r of [...RULES.map((x) => x.name), 'ORACLE'] as (Rule | 'ORACLE')[]) ret[r] = [];
   IV_RV.forEach((mult, k) => {
     const iv = rv * mult;
-    const ask = bs(S0, S0, tradingYearsToClose(m0), iv, call) * (1 + spread / 2);
+    const ask = bs(S0, S0, tradingYearsToExpiry(m0, EXPIRY_DAYS), iv, call) * (1 + spread / 2);
     const pos: OpenPosition = { direction: call ? 'call' : 'put', entryMinute: m0, entryPremium: ask, thesis, target };
     const exited = new Map<Rule, number>();
     let best = -Infinity, lastBid = ask * (1 - spread / 2) / (1 + spread / 2);
@@ -117,7 +119,7 @@ function simulate(ss: SetupSession, sig: SetupSignal, direction: 'long' | 'short
       const minute = ss.minutes[j] + 1;               // this bar's close
       if (minute > CLOSE_MIN) break;
       const b = ss.bars[j];
-      const bid = bs(b.close, S0, tradingYearsToClose(minute), iv, call) * (1 - spread / 2);
+      const bid = bs(b.close, S0, tradingYearsToExpiry(minute, EXPIRY_DAYS), iv, call) * (1 - spread / 2);
       lastBid = bid; if (bid > best) best = bid;
       for (const r of RULES) {
         if (exited.has(r.name) || (!withRules && r.name !== 'R0')) continue;
@@ -204,9 +206,12 @@ async function main() {
   const all: SetupTrade[] = [];
   for (const t of TICKERS) for (const x of await runTicker(t)) all.push(x);
   const rows = report(all);
-  writeFileSync(OUT, JSON.stringify({ generated: new Date().toISOString(), ivRv: IV_RV, rows }, null, 1));
+  writeFileSync(OUT, JSON.stringify({ generated: new Date().toISOString(), ivRv: IV_RV, expiryDays: EXPIRY_DAYS, rows }, null, 1));
+  // Per-signal rows, for conditioning the same trades on something else
+  // (regime proxy, liquidity, time of day) without re-running the sweep.
+  if (process.env.TRADES_OUT) writeFileSync(process.env.TRADES_OUT, JSON.stringify(all));
   const p = (x: number | undefined | null) => x === undefined || x === null ? '   —  ' : `${(x * 100).toFixed(1)}%`.padStart(6);
-  console.log('\nOUT OF SAMPLE (after 2024-09-10) — ATM 0DTE, 30-minute exit unless stated');
+  console.log(`\nOUT OF SAMPLE (after 2024-09-10) — ATM ${EXPIRY_DAYS === 1 ? '0DTE' : `${EXPIRY_DAYS}-session expiry`}, 30-minute exit unless stated`);
   console.log('setup                      n    win@1.0 mirror  edge   z   | win@1.3 mean@1.3 | R7 mean@1.3  R4 mean@1.3 | IS: n  win@1.0  z');
   for (const r of rows) {
     const o = r.oos, i = r.is;

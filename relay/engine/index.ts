@@ -20,7 +20,7 @@ import {
 import { ENGINE_MODE, IS_ENABLED, logModeBanner } from './mode.ts';
 import { massiveBus, type RelayControl } from './bus.ts';
 import { MassiveRestClient } from './lib/massive/api.ts';
-import { FEED_TICKERS } from './state/directionState.ts';
+import { FEED_TICKERS, SCORED_TICKERS } from './state/directionState.ts';
 import { msUntilQuietWindow } from './lib/time.ts';
 
 import * as barsStore        from './stores/barsStore.ts';
@@ -242,11 +242,21 @@ export async function startEngine(
   if (_shuttingDown) return;
 
   // ── Phase 5: scoring engines ──────────────────────────────────────────────
+  // SCORED_TICKERS, not FEED_TICKERS: index products have no trade feed, so
+  // their CVD can never be ready and confluenceEngine would return before
+  // scoring — silence indistinguishable from a quiet market. Excluded out
+  // loud instead (see state/directionState.ts NO_TRADE_FEED_TICKERS).
+  const unscored = FEED_TICKERS.filter((t) => !SCORED_TICKERS.includes(t));
+  if (unscored.length > 0) {
+    console.log(`[engine] NOT scored: ${unscored.join(', ')} — index products print no trades, so CVD is ` +
+      `structurally absent. They keep bars, chain and GEX. This is deliberate, not a quiet market.`);
+  }
+
   confluenceEngine.init();
-  for (const ticker of FEED_TICKERS) confluenceEngine.watchTicker(ticker);
+  for (const ticker of SCORED_TICKERS) confluenceEngine.watchTicker(ticker);
 
   squeezeEngine.init();
-  for (const ticker of FEED_TICKERS) squeezeEngine.scoreTicker(ticker);
+  for (const ticker of SCORED_TICKERS) squeezeEngine.scoreTicker(ticker);
 
   dumpRipDetector.setPriceProvider((ticker: string) => {
     const result = barsStore.getResult(ticker);
