@@ -110,6 +110,16 @@ Two habits that catch it:
 
 Corollary, from the same incident: **phase-in periods mean the regulation and the counterparty can disagree.** Firms have until 2027-10-20 to adopt the new framework, so "the rule changed" and "our broker changed" are separate facts needing separate evidence. Check the counterparty's own current behaviour — Webull's live `assets/balance` response returning `day_trades_left: "UNLIMITED"` on a sub-$25,000 margin account is stronger evidence than any documentation about what the rule is.
 
+### Two ways a backtest lies about significance
+
+**Measured 2026-09-11/12, both against claims this repo's own reports had already made.**
+
+**Correlated observations inflate z.** Twenty entry minutes inside one session are not twenty independent samples: the entry-timing sweep read z −2.6 per minute and −1.50 clustered by session. Worse across tickers: the universe scan's gap-fade edge read z 3.24 (most-liquid quintile) and 3.55 ("the rest") treating each ticker-session as independent — clustered by DAY, because a market-wide move gaps and reverts every ticker together, it was −0.08 and +1.0 (z 0.60). **Cluster by the unit the shock arrives in**: the session for intraday entries, the day for cross-sectional tests.
+
+**A trend across years can be pure sample size.** The same flow test on 200 out-of-sample sessions showed a monotone decay — 2023 +4.1, 2024 −1.0, 2025 −6.8, 2026 −18.5 points — and reporting it as a drift was premature. Extending to 1,208 sessions: the edge is +0.2 points and 2026 is **+5.9** (n 65 → 409). Before believing a time trend, ask what the smallest bucket's n is.
+
+**Corollary — a positive mean on both sides is a pricing error, not an edge.** Fading the gap returned +13.7% and following it +9.2% on the same days; a plain call +12.3% and a plain put +10.5%. They cannot all be edges. Only the mirror comparison (the identical entry taken the other way) is pricing-neutral, which is why every directional claim here carries one.
+
 ---
 
 ## HARD ENVIRONMENT CONSTRAINTS
