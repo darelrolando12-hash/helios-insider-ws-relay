@@ -60,6 +60,7 @@ import {
 } from './ingestion/earningsCalendarIngestion.ts';
 
 import { rebuildAll } from './session/cvdRebuild.ts';
+import { buildRegimeRows, writeRegimeSnapshot, regimeRowsWritten, REGIME_LOG_INTERVAL_MS } from './session/regimeLog.ts';
 
 /**
  * The bus instance, exposed so relay/index.js can feed frames into it without
@@ -281,6 +282,7 @@ export async function startEngine(
   // Therefore: log the result of EVERY cycle, not only on change. A silent
   // success and a silent failure must not look the same in the logs.
   startMarketStatusPolling(rest);
+  startRegimeLogging();
 
   // ── Phase 8: chain aggregator, 250ms per ticker ───────────────────────────
   // Firing ~22 first fetches in one tick caused Massive to hard-reset every
@@ -371,6 +373,25 @@ async function guarded(name: string, fn: () => Promise<void>): Promise<void> {
   } catch (err) {
     console.error(`[engine] ${name} failed:`, err instanceof Error ? err.message : err);
   }
+}
+
+// ── Gamma-regime forward log ─────────────────────────────────────────────────
+
+/**
+ * The gamma flip is the only model input that cannot be re-fetched for a past
+ * day (session/regimeLog.ts explains the probe). Regime interaction is the
+ * last untested reason a directional rule could work, so the record has to
+ * start accruing now, on its own, whether or not anyone is watching.
+ */
+function startRegimeLogging() {
+  const tick = () => {
+    if (_wasMarketOpen !== true) return;              // regular session only
+    const rows = buildRegimeRows(marketStore.getAllContextsRaw(), Date.now());
+    void writeRegimeSnapshot(rows).catch((e) => console.error('[regimeLog] write failed —', e));
+  };
+  everyInterval(tick, REGIME_LOG_INTERVAL_MS);
+  // A daily line so the accrual is visible without querying the table.
+  everyInterval(() => console.log(`[regimeLog] ${regimeRowsWritten()} regime rows written since boot.`), 6 * 60 * 60_000);
 }
 
 // ── Market status polling ────────────────────────────────────────────────────

@@ -193,13 +193,13 @@ async function main() {
   }
   result.cleanDayPayoff = cleanRows;
   // Reliability against extension: the other axis of the same trade-off.
-  const EXT = [[0, 0.1], [0.1, 0.25], [0.25, 0.5], [0.5, 99]];
+  const EXT: [number, number][] = [[0, 0.1], [0.1, 0.25], [0.25, 0.5], [0.5, 99]];
   result.byExtension = {};
   result.byImbalance = {};
   for (const v of ['price', 'flow', 'both']) {
-    for (const [slice, pick] of [['in-sample', (e) => !e.oos], ['out-of-sample', (e) => e.oos]]) {
+    for (const [slice, pick] of [['in-sample', (e: Entry) => !e.oos], ['out-of-sample', (e: Entry) => e.oos]] as [string, (e: Entry) => boolean][]) {
       result.byExtension[v + ' · ' + slice] = EXT.map(([lo, hi]) => ({ lo, hi, ...agg(all.filter((e) => e.variant === v && e.ext >= lo && e.ext < hi && pick(e)), 0) }));
-      result.byImbalance[v + ' · ' + slice] = [[0, 0.05], [0.05, 0.15], [0.15, 0.3], [0.3, 9]].map(([lo, hi]) => ({ lo, hi, ...agg(all.filter((e) => e.variant === v && Math.abs(e.imbalance) >= lo && Math.abs(e.imbalance) < hi && pick(e)), 0) }));
+      result.byImbalance[v + ' · ' + slice] = ([[0, 0.05], [0.05, 0.15], [0.15, 0.3], [0.3, 9]] as [number, number][]).map(([lo, hi]) => ({ lo, hi, ...agg(all.filter((e) => e.variant === v && Math.abs(e.imbalance) >= lo && Math.abs(e.imbalance) < hi && pick(e)), 0) }));
     }
   }
   writeFileSync(OUT, JSON.stringify(result, null, 1));

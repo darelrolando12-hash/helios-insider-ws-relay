@@ -45,4 +45,22 @@ const _rawClient = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
  */
 export const supabase = wrapForEngineMode(_rawClient);
 
+/**
+ * Observation-only client — deliberately NOT gated by shadow mode.
+ *
+ * Shadow mode exists to stop the engine and the browser writing the same
+ * rows twice while both run (signals, ledger, paper trades, ingestion).
+ * That risk does not exist for an append-only observation log that only
+ * this process produces and nothing else writes — and gating it would mean
+ * the observation never accrues, which is the whole point of recording it.
+ *
+ * Allowed here: forward measurement logs of state that cannot be
+ * reconstructed later from vendor history (see session/regimeLog.ts — the
+ * gamma flip is not in any historical endpoint; bars, trades and quotes are).
+ *
+ * NOT allowed here: anything a browser also writes, anything a user sees as
+ * a signal or a trade, anything that would be replayed into the ledger.
+ */
+export const supabaseObservations = _rawClient;
+
 export type { SupabaseClient } from '@supabase/supabase-js';
