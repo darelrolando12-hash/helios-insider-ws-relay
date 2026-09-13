@@ -75,9 +75,51 @@ let _rowsWritten = 0;
 /** Rows written since boot — for the boot/daily summary log. */
 export function regimeRowsWritten(): number { return _rowsWritten; }
 
-export async function writeRegimeSnapshot(rows: readonly RegimeLogRow[]): Promise<void> {
+/**
+ * Rows waiting for their realised outcome. The regime is only interesting
+ * against what price then did, and joining a 5-minute log back to minute bars
+ * months later is fiddly enough to be worth avoiding — so each row's +30 and
+ * +60 minute move is filled in from the next snapshots.
+ *
+ * Best-effort by design: a restart loses what is pending, and those rows keep
+ * null forward returns. That is recoverable — bars can always be re-fetched —
+ * unlike the flip itself, which is why the flip is written immediately rather
+ * than held back until the outcome is known.
+ */
+interface Pending { id: number; ticker: string; spot: number; at: number; done30: boolean; done60: boolean }
+const _pending: Pending[] = [];
+
+export function pendingOutcomeCount(): number { return _pending.length; }
+
+/** Fill in +30 / +60 minute moves for earlier rows, using this tick's spots. */
+export async function settleOutcomes(rows: readonly RegimeLogRow[], nowUtcMs: number): Promise<void> {
+  const spotOf = new Map(rows.filter((r) => r.spot !== null).map((r) => [r.ticker, r.spot as number]));
+  for (const p of _pending) {
+    const spot = spotOf.get(p.ticker);
+    if (spot === undefined || !(p.spot > 0)) continue;
+    const age = nowUtcMs - p.at;
+    const patch: Record<string, number> = {};
+    if (!p.done30 && age >= 30 * 60_000 && age < 45 * 60_000) { patch.fwd_30m_pct = (spot - p.spot) / p.spot; p.done30 = true; }
+    if (!p.done60 && age >= 60 * 60_000 && age < 75 * 60_000) { patch.fwd_60m_pct = (spot - p.spot) / p.spot; p.done60 = true; }
+    if (Object.keys(patch).length === 0) continue;
+    const { error } = await supabaseObservations.from('gex_regime_log').update(patch).eq('id', p.id);
+    if (error) console.error(`[regimeLog] outcome update failed — ${error.message}`);
+  }
+  // Drop anything past the 60-minute window, settled or not.
+  for (let i = _pending.length - 1; i >= 0; i--) {
+    if (nowUtcMs - _pending[i].at >= 75 * 60_000) _pending.splice(i, 1);
+  }
+}
+
+export async function writeRegimeSnapshot(rows: readonly RegimeLogRow[], nowUtcMs: number = Date.now()): Promise<void> {
   if (rows.length === 0) return;
-  const { error } = await supabaseObservations.from('gex_regime_log').insert(rows as RegimeLogRow[]);
+  const { data, error } = await supabaseObservations.from('gex_regime_log').insert(rows as RegimeLogRow[]).select('id, ticker, spot');
+  if (!error && data) {
+    for (const r of data as { id: number; ticker: string; spot: number | null }[]) {
+      if (r.spot !== null && r.spot > 0) _pending.push({ id: r.id, ticker: r.ticker, spot: r.spot, at: nowUtcMs, done30: false, done60: false });
+    }
+    await settleOutcomes(rows, nowUtcMs);
+  }
   if (error) {
     if (/does not exist/i.test(error.message)) {
       if (!_missingTableReported) {

@@ -61,6 +61,7 @@ import {
 
 import { rebuildAll } from './session/cvdRebuild.ts';
 import { buildRegimeRows, writeRegimeSnapshot, regimeRowsWritten, REGIME_LOG_INTERVAL_MS } from './session/regimeLog.ts';
+import { buildShadowSignalRow, writeShadowSignal, shadowSignalsWritten } from './session/shadowSignalLog.ts';
 
 /**
  * The bus instance, exposed so relay/index.js can feed frames into it without
@@ -271,6 +272,13 @@ export async function startEngine(
   // Must follow confluenceEngine.init() — the ledger subscribes to its signal
   // stream.
   initLedger();
+  // Step 1 of running forward: record what the engine decides while shadow mode
+  // stops it writing. Its own table, so nothing can collide with the ledger.
+  confluenceEngine.onSignal((signal) => {
+    void writeShadowSignal(buildShadowSignalRow(signal, Date.now()))
+      .catch((e) => console.error('[shadowSignalLog] write failed —', e));
+  });
+  console.log('[engine] Shadow-signal observation log attached to the confluence stream.');
   startResolver();
 
   // ── Phase 7: market status — the highest-risk wiring in the whole boot ────
@@ -387,11 +395,11 @@ function startRegimeLogging() {
   const tick = () => {
     if (_wasMarketOpen !== true) return;              // regular session only
     const rows = buildRegimeRows(marketStore.getAllContextsRaw(), Date.now());
-    void writeRegimeSnapshot(rows).catch((e) => console.error('[regimeLog] write failed —', e));
+    void writeRegimeSnapshot(rows, Date.now()).catch((e) => console.error('[regimeLog] write failed —', e));
   };
   everyInterval(tick, REGIME_LOG_INTERVAL_MS);
   // A daily line so the accrual is visible without querying the table.
-  everyInterval(() => console.log(`[regimeLog] ${regimeRowsWritten()} regime rows written since boot.`), 6 * 60 * 60_000);
+  everyInterval(() => console.log(`[regimeLog] ${regimeRowsWritten()} regime rows and ${shadowSignalsWritten()} shadow signals written since boot.`), 6 * 60 * 60_000);
 }
 
 // ── Market status polling ────────────────────────────────────────────────────
