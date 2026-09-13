@@ -17,6 +17,7 @@ import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { buildPrompts } from './wegic-prompts.mjs';
 
 // fileURLToPath, not URL.pathname: the repo path contains a space, which the
 // raw pathname keeps as %20 and git then cannot find.
@@ -60,7 +61,7 @@ const p1 = [
   ``,
   `**Permissions:** the engine uses the same anon key as the app. Each block grants the anon role exactly the operations the engine performs and adds matching row-level-security policies, so the writes cannot silently match zero rows.`,
   ``,
-  `**Check right after running** (the first query in each block's comments): the grants query must list INSERT and SELECT for \`anon\` on both tables, plus UPDATE on \`gex_regime_log\`.`,
+  `**Check right after running** (the first query in each block's comments): table grants must list INSERT and SELECT for \`anon\` on both tables; the UPDATE on \`gex_regime_log\` is granted on two columns only, so it shows in \`information_schema.column_privileges\` (fwd_30m_pct, fwd_60m_pct), not in the table-grants view.`,
   ``,
 ];
 sqlFiles.forEach((p, i) => { p1.push(`## ${i + 1}. \`${path.basename(p, '.sql')}\``, '', block(p, show(p))); });
@@ -95,7 +96,7 @@ const WHAT = {
   'src/main.tsx': "Publishes the exchange's open/closed status to the new market-status store on every poll.",
   'src/components/HeliosChart.tsx': "The chart rebuild: 1m / 5m / 15m / 1H / 1D on Massive's native aggregates, the full EMA stack, a live legend, a session VWAP that resets each day, the bar-close countdown under the price label, signal markers on their own candle, the time axis no longer clipped on phones, correct dates at 5m/15m/1H, and CVD/aggressor panels fed by the relay's real delta series — labelled UNAVAILABLE rather than faked when the relay cannot supply it.",
   'src/pages/Home/index.tsx': "Adds the 1D option and the Key Levels card (VWAP, Call Wall, Put Wall, Zero Gamma — or \"absent\" with the reason) and fixes the chart container so the time axis is never clipped.",
-  'src/cockpits/ZeroDteCockpit.tsx': "Missing data now blocks a criterion instead of passing it (the \"79 on every row\" score), IV rank shows as unavailable (no IV history exists), candles count to the real 15:00 CT close, one VWAP, null-safe flip and walls. The badges are observational: ALIGNED / MIXED instead of TRADE / REDUCE, a steady ALIGNED instead of a pulsing ENTER NOW, and a note that no setup has shown a profitable edge out of sample. Why: six rounds of backtests found no such edge, and the fully aligned state measured as a losing trade on real prices.",
+  'src/cockpits/ZeroDteCockpit.tsx': "Missing data now blocks a criterion instead of passing it (the \"79 on every row\" score), IV rank shows as unavailable (no IV history exists), candles count to the real 15:00 CT close, one VWAP, null-safe flip and walls. The badges are observational: ALIGNED / MIXED instead of TRADE / REDUCE, a steady ALIGNED instead of a pulsing ENTER NOW, and a note that ENTER is gated, not retired: it returns for any setup that beats its opposite trade out of sample and holds on real option prices, and none has yet. Why: six rounds of backtests found no such edge, and the fully aligned state measured as a losing trade on real prices.",
   'src/cockpits/BestContractsCockpit.tsx': "The opening-candle blocker covers the real 08:30–08:35 CT candle (it was an hour late); spread, break-even and IV criteria block when data is missing; \"TRIGGERING\" is now a steady \"CRITERIA MET\".",
   'src/cockpits/IndexesCockpit.tsx': "Tiles keep showing the last price, marked STALE, instead of going blank when bars are old; one VWAP definition.",
   'src/cockpits/SwingCockpit.tsx': "Short interest and short volume are treated as percents (they displayed as 3,937.8%); one VWAP definition.",
@@ -183,7 +184,11 @@ const readme = [
 ];
 fs.writeFileSync(path.join(OUT, 'PACKAGE-2-README.md'), readme.join('\n'));
 
-const sizes = fs.readdirSync(OUT).map((f) => `${f} ${Math.round(fs.statSync(path.join(OUT, f)).size / 1024)} KB`);
+const prompts = buildPrompts({ OUT, shortSha, sqlFiles, show, existedAtExport, PARTS, WHAT, fenceFor });
+console.log(`prompts: Prompt 1 ${Math.round(prompts.prompt1Bytes / 1024)} KB · Prompt 2 in ${prompts.messages} messages, largest ${Math.round(prompts.largestMessageBytes / 1024)} KB · split files: ${prompts.splitFiles.join(', ') || 'none'}`);
+console.log('every prompt file reassembles to the commit and every message is under 40 KB');
+
+const sizes = fs.readdirSync(OUT).filter((f) => fs.statSync(path.join(OUT, f)).isFile()).map((f) => `${f} ${Math.round(fs.statSync(path.join(OUT, f)).size / 1024)} KB`);
 console.log(`built from ${shortSha} into ${path.relative(REPO, OUT)}`);
 console.log(`package 2: ${packaged.length} files (${summary.filter((s) => s.isNew).length} new), ${summary.reduce((a, s) => a + s.lines, 0)} lines · held out: ${heldOut.length} test files`);
 console.log('every block round-trips against the commit');

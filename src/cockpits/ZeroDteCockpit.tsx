@@ -1170,7 +1170,7 @@ function InlinePreEntryCard({
         <p className="text-[9px] text-white/25 uppercase tracking-wider">Setup Level</p>
         <p className="text-xs text-white/80">{row.entryTrigger}</p>
         <p className="text-[9px] text-col-r/70 mt-1">⚡ Invalidation: {row.invalidation}</p>
-        <p className="text-[9px] text-white/35 mt-1">Observation, not an instruction — no setup in this system has shown a profitable directional edge in out-of-sample backtests.</p>
+        <p className="text-[9px] text-white/35 mt-1">ENTER is gated, not retired: an entry label returns for any setup that beats its opposite trade out of sample, clears the pre-registered bar, and holds on real option prices. None has yet — until one does, this row is an observation, not an instruction.</p>
       </div>
 
       {/* Section G: News alert */}

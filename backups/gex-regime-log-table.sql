@@ -69,11 +69,19 @@ drop policy if exists gex_regime_log_update on public.gex_regime_log;
 create policy gex_regime_log_update on public.gex_regime_log
   for update to anon using (true) with check (true);
 
--- Verify immediately after running (expect INSERT, SELECT, UPDATE for anon):
+-- Verify immediately after running. Table-level grants (expect INSERT and
+-- SELECT for anon) are in role_table_grants; the UPDATE is granted on two
+-- columns only, so it appears in column_privileges, NOT role_table_grants
+-- (expect fwd_30m_pct and fwd_60m_pct):
 --   select grantee, privilege_type
 --   from information_schema.role_table_grants
 --   where table_schema = 'public' and table_name = 'gex_regime_log'
 --   order by 1, 2;
+--   select grantee, column_name, privilege_type
+--   from information_schema.column_privileges
+--   where table_schema = 'public' and table_name = 'gex_regime_log'
+--     and grantee = 'anon' and privilege_type = 'UPDATE'
+--   order by 2;
 --
 -- Verify after one session (with_flip > 0 for most tickers; with_outcome
 -- close to count minus the last hour):

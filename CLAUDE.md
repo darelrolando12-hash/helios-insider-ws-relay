@@ -209,6 +209,18 @@ Brain self-excludes cleanly when a fingerprint has no history. **Known open issu
 
 ---
 
+## CONFIRMED ANTI-SIGNALS — blockers, not fades
+
+**red-to-green** (`engine/setups/antiSignals.ts`). Pre-registered (commit 76ab65e) before the holdout was analysed, then run on 53 tickers that played no part in finding it: the signal's direction lost to the identical trade taken the other way by **3.6 points out of sample (z −3.22, 11,851 signals, 502 days)** and 4.3 in sample (z −4.46). Result committed unedited (bd18d5e). It held its size on new data (−4.5 in discovery → −3.6), where K5 halved.
+
+- **A block, not a trade.** 3.6 points is under the ~8-point floor the pre-registration set for tradeability — the round trip is paid in both directions (K5: following −8.2%, fading only +4.0% on real prices). The real-price check of the fade was deliberately skipped: it could only confirm that an edge already deemed untradeable is untradeable.
+- **Scope.** Confirmed on less-liquid names (ranks ~49–101), including leveraged and crypto-linked products. Found — same sign both halves — but not independently confirmed on the 48 most liquid, SPY/QQQ/AAPL among them. Untested everywhere else. `antiSignalBlock()` applies to every ticker and returns that scope so a consumer can say "confirmed" or "extrapolated".
+- **Not wired to anything live.** No engine or cockpit acts on `setups.ts` detections today. Any path that turns a setup into a displayed entry must call `antiSignalBlock()` first.
+
+**ENTER is gated, not retired.** The cockpits stopped saying ENTER NOW / TRADE (commit b1f76f6) because the confluence logic under that label measured as losing at full alignment (−8.2% mean on real 0DTE prices, both halves). An entry label comes back for any setup that beats its mirror out of sample, clears the pre-registered bar, and holds on real option prices. None has yet.
+
+---
+
 ## KNOWN GAPS — tracked, not silent
 
 Real gaps that are understood and deliberately not yet fixed. A gap recorded only in a code comment is invisible; this is the visible list. None are urgent, all are real.
