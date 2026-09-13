@@ -1318,7 +1318,7 @@ function ContractCard({
   const borderClass = isActive
     ? 'border-col-g/40'
     : isTriggering
-    ? 'border-amb/40 animate-pulse-border'
+    ? 'border-amb/40'
     : isBlocked
     ? 'border-col-r/20'
     : 'border-white/8';
@@ -1896,7 +1896,7 @@ function DirectionPill({ direction }: { direction: 'call' | 'put' }) {
 function StatusBadge({ status }: { status: CardStatus }) {
   const map: Record<CardStatus, { label: string; cls: string }> = {
     forming:    { label: 'FORMING',    cls: 'bg-white/5 text-dim border-white/10' },
-    triggering: { label: 'TRIGGERING', cls: 'bg-amb/15 text-amb border-amb/25 animate-pulse' },
+    triggering: { label: 'CRITERIA MET', cls: 'bg-amb/15 text-amb border-amb/25' },   // a state, not a prompt to act
     active:     { label: 'ACTIVE',     cls: 'bg-col-g/15 text-col-g border-col-g/25' },
     blocked:    { label: 'BLOCKED',    cls: 'bg-col-r/15 text-col-r border-col-r/25' },
     ghost:      { label: 'GHOST',      cls: 'bg-white/5 text-white/20 border-white/10' },

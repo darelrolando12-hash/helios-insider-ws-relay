@@ -347,14 +347,14 @@ function globalVerdict(
 
 function entryTriggerText(row: StackRow): string {
   if (row.tradeType === 'counter_session') {
-    return `Enter on VWAP reclaim ${row.direction === 'call' ? 'above' : 'below'} with CVD confirming`;
+    return `VWAP reclaim ${row.direction === 'call' ? 'above' : 'below'} with CVD confirming`;
   }
   if (row.tradeType === 'continuation') {
-    return `Continuation — enter on next candle open above prior high`;
+    return `Continuation — next candle open above prior high`;
   }
   const wall = row.direction === 'call' ? row.callWall : row.putWall;
   if (wall === null) return `No GEX wall on this side (absent) — no wall-based trigger`;
-  return `GEX wall at ${wall.toFixed(2)} — enter on close ${row.direction === 'call' ? 'above' : 'below'} flip level`;
+  return `GEX wall at ${wall.toFixed(2)} — close ${row.direction === 'call' ? 'above' : 'below'} flip level`;
 }
 
 
@@ -567,9 +567,14 @@ function GlobalHeader({
   })();
 
   const verdict = globalVerdict(spyState, qqqState, activeCount);
+  // Observational labels, not instructions. Six rounds of backtests found no
+  // profitable directional edge, and the fully-aligned funnel measured as a
+  // losing trade on real 0DTE prices (36.9% win, -8.2% mean, 2026-09-12).
+  // Wording that tells the user to act ('TRADE', 'ENTER NOW') asserted an edge
+  // the data does not support. The states and their logic are unchanged.
   const verdictCfg: Record<Verdict, { bg: string; text: string; label: string }> = {
-    'TRADE':      { bg: 'bg-col-g',    text: 'text-void', label: 'TRADE' },
-    'REDUCE':     { bg: 'bg-amb',      text: 'text-void', label: 'REDUCE' },
+    'TRADE':      { bg: 'bg-col-g/20', text: 'text-col-g', label: 'ALIGNED' },
+    'REDUCE':     { bg: 'bg-amb/20',   text: 'text-amb',   label: 'MIXED' },
     'STAND DOWN': { bg: 'bg-col-r',    text: 'text-void', label: 'STAND DOWN' },
   };
   const vc = verdictCfg[verdict];
@@ -939,11 +944,16 @@ function OpportunityRow({
   onImIn:        (row: StackRow, premium: number, delta: number, gamma: number, theta: number) => void;
   onOpenTV:      (ticker: string) => void;
 }) {
+  // Observational labels, not instructions. Six rounds of backtests found no
+  // profitable directional edge, and the fully-aligned funnel measured as a
+  // losing trade on real 0DTE prices (36.9% win, -8.2% mean, 2026-09-12).
+  // Wording that tells the user to act ('TRADE', 'ENTER NOW') asserted an edge
+  // the data does not support. The states and their logic are unchanged.
   const phaseCfg: Record<RowPhase, { border: string; pill: string; label: string }> = {
     'no-signal':     { border: 'border-white/5',   pill: 'bg-white/5 text-white/20',                                    label: 'NO SIGNAL' },
     'forming':       { border: 'border-line',      pill: 'bg-panel2 text-mut',                                          label: 'WATCHING' },
     'consolidating': { border: 'border-amb/25',    pill: 'bg-amb-dim text-amb',                                         label: 'CONSOLIDATING' },
-    'triggering':    { border: 'border-col-g/50',  pill: 'bg-col-g text-[rgb(2,21,13)] !font-black animate-vbpulse',    label: 'ENTER NOW' },
+    'triggering':    { border: 'border-col-g/50',  pill: 'bg-col-g/15 text-col-g font-bold',                           label: 'ALIGNED' },
     'active':        { border: 'border-amb/35',    pill: 'bg-amb/10 text-amb',                                         label: 'ACTIVE' },
   };
   const pc = phaseCfg[row.rowPhase];
@@ -1155,11 +1165,12 @@ function InlinePreEntryCard({
         </div>
       )}
 
-      {/* Section F: Entry trigger */}
+      {/* Section F: Setup level — observational, see the note under it */}
       <div className="bg-white/3 border border-white/8 rounded-lg p-2.5 space-y-1">
-        <p className="text-[9px] text-white/25 uppercase tracking-wider">Entry Trigger</p>
+        <p className="text-[9px] text-white/25 uppercase tracking-wider">Setup Level</p>
         <p className="text-xs text-white/80">{row.entryTrigger}</p>
         <p className="text-[9px] text-col-r/70 mt-1">⚡ Invalidation: {row.invalidation}</p>
+        <p className="text-[9px] text-white/35 mt-1">Observation, not an instruction — no setup in this system has shown a profitable directional edge in out-of-sample backtests.</p>
       </div>
 
       {/* Section G: News alert */}
