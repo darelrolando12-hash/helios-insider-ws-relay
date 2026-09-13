@@ -40,6 +40,16 @@
  *
  * Pricing, spreads, mirror control and the IS/OOS split are the same as
  * every other backtest in this folder.
+ *
+ * ── ADDED AFTER THE FIRST RUN — a diagnostic, NOT pre-registered ───────────
+ * The consensus gradient: edge by how many of the four conditions hold, 0..4.
+ * If "maximum consensus reverts" were a mechanism it would strengthen as
+ * conditions stack; a cliff at four alone is what one lucky cell looks like.
+ * 8 tickers, out of sample: -1.3 -> +2.2 -> -3.0 -> -0.7 -> -11.9 points.
+ * 48 tickers, out of sample: -0.3 -> +0.2 -> -1.4 -> -0.4 -> -5.9 points.
+ * It fails both times — evidence against K5's mechanism. (This note was meant
+ * to land with the gradient code on 2026-09-12; the scripted edit silently
+ * matched nothing on a CRLF file, see CLAUDE.md WORKFLOW step 2.)
  */
 
 import { writeFileSync } from 'node:fs';
