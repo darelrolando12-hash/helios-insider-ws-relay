@@ -205,6 +205,21 @@ async function main() {
       if (Math.abs(oos.z) >= 2) console.log(`  ${key} ${setup.padEnd(26)} OOS n=${String(oos.n).padStart(5)} edge ${pc(oos.edge)} z ${oos.z.toFixed(2).padStart(6)} | IS edge ${pc(is.edge)} z ${is.z.toFixed(2)}`);
     }
   }
+  // Consensus gradient (post-hoc diagnostic — see header)
+  const conditions = (r: Row) => (r.inPlay ? 1 : 0) + (r.tf15 ? 1 : 0) + (r.tf60 ? 1 : 0) + (r.poc ? 1 : 0);
+  console.log('\nCONSENSUS GRADIENT — edge by number of conditions met (post-hoc diagnostic)');
+  result.gradient = {};
+  for (const [slice, pick] of [['in-sample', (r: Row) => !r.oos], ['out-of-sample', (r: Row) => r.oos]] as [string, (r: Row) => boolean][]) {
+    const line: string[] = [];
+    result.gradient[slice] = [];
+    for (let c = 0; c <= 4; c++) {
+      const d = dayClustered(all.filter((r) => pick(r) && conditions(r) === c), 0);
+      result.gradient[slice].push({ conditions: c, ...(d ?? {}) });
+      line.push(d ? `${c}: ${(d.edge * 100).toFixed(1)}pts (z ${d.z.toFixed(2)}, n ${d.n})` : `${c}: —`);
+    }
+    console.log(`  ${slice.padEnd(14)} ${line.join(' · ')}`);
+  }
+
   console.log(`  cells tested: ${cells} · |z| ≥ 2: ${hits2} (chance ≈ ${(cells * 0.046).toFixed(1)}) · |z| ≥ 3.2: ${hits32} (chance ≈ ${(cells * 0.0014).toFixed(2)})`);
   result.cellCount = { cells, hits2, hits32 };
   writeFileSync(OUT, JSON.stringify(result, null, 1));
