@@ -5,34 +5,58 @@
 -- writes are intercepted and logged instead of executed, and Railway's log
 -- buffer holds only the last few hundred lines. A forward record of live
 -- decisions with real timestamps is the one test a backtest cannot be wrong
--- about, and it costs nothing to start accruing months before it is needed.
+-- about, and it is also the engine's side of the diff that must pass before
+-- the shadow -> live cutover.
 --
--- Written by relay/engine/session/shadowSignalLog.ts through the
--- observation-only Supabase client. Nothing else writes this table — the real
--- `signals` table stays owned by signalLedger and stays shadow-gated — so
--- there is no duplicate-write risk. This is NOT the shadow->live cutover;
--- that is a separate, coordinated change (CLAUDE.md, SHADOW MODE).
+-- Written by relay/engine/session/shadowSignalLog.ts with the ANON key,
+-- through the observation-only client. Nothing else writes this table — the
+-- real `signals` table stays owned by signalLedger and stays shadow-gated —
+-- so there is no duplicate-write risk. This is NOT the cutover itself.
+-- The engine performs one operation here (INSERT); SELECT is granted so the
+-- cutover diff can be run with the same key.
 --
 -- Safe to run more than once.
 
 create table if not exists public.engine_shadow_signals (
-  id            bigserial primary key,
-  observed_at   timestamptz not null,
-  session_date  date        not null,
-  ticker        text        not null,
-  signal_type   text        not null,
-  confidence    numeric     not null,
-  trigger_price numeric     not null,
-  fired_at      bigint      not null,
-  sources       text[],
-  catalyst_data_quality text,
-  signal_id     text        not null
+  id                     bigserial   primary key,
+  observed_at            timestamptz not null,
+  session_date           date        not null,
+  ticker                 text        not null,
+  signal_type            text        not null,
+  confidence             numeric     not null,
+  trigger_price          numeric     not null,
+  fired_at               bigint      not null,
+  sources                text[],
+  catalyst_data_quality  text,
+  signal_id              text        not null
 );
 
 create index if not exists engine_shadow_signals_session_ticker
   on public.engine_shadow_signals (session_date, ticker, observed_at);
 
--- Verify, after one session:
+-- Permissions for the anon role, which is the only key the engine has.
+-- Without these the insert fails and the engine logs it; under row level
+-- security without policies a read would silently return nothing.
+grant select, insert on public.engine_shadow_signals to anon;
+grant usage, select on sequence public.engine_shadow_signals_id_seq to anon;
+
+alter table public.engine_shadow_signals enable row level security;
+
+drop policy if exists engine_shadow_signals_select on public.engine_shadow_signals;
+create policy engine_shadow_signals_select on public.engine_shadow_signals
+  for select to anon using (true);
+
+drop policy if exists engine_shadow_signals_insert on public.engine_shadow_signals;
+create policy engine_shadow_signals_insert on public.engine_shadow_signals
+  for insert to anon with check (true);
+
+-- Verify immediately after running (expect INSERT and SELECT for anon):
+--   select grantee, privilege_type
+--   from information_schema.role_table_grants
+--   where table_schema = 'public' and table_name = 'engine_shadow_signals'
+--   order by 1, 2;
+--
+-- Verify after one session:
 --   select session_date, signal_type, count(*)
 --   from public.engine_shadow_signals
 --   group by 1, 2 order by 1 desc, 3 desc;

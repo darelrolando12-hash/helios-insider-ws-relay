@@ -48,16 +48,93 @@ naming the file. That line in Railway is the signal that this part is still pend
 
 ## Part B — the cutover itself, in order
 
-**Do not start Part B until Part A has produced at least two weeks of rows.** The
-shadow-signal log is what makes step 2 checkable: it is the record of what the
-engine decided, which is exactly what the diff in step 2 compares.
+### Prerequisites — all four, or the diff fails for reasons that are not bugs
 
-1. **Diff the engine against the browser on the same live data.**
-   Run both for a full session and compare, per ticker and minute: signal type,
-   confidence, trigger price. `engine_shadow_signals` holds the engine's side;
-   `signals` holds the browser's. They must match in count and in type before
-   anything flips. Any systematic difference is a bug in one of them — find it
-   first. (CLAUDE.md, SHADOW MODE: "only flip to live when they match".)
+- **Part A is live and populating.** `engine_shadow_signals` is the engine's side
+  of the diff; with no table there is nothing to compare.
+- **The comprehensive UI handoff (Package 2) is live on Wegic.** Wegic's current
+  build has no signal hysteresis, so a score hovering around a threshold
+  re-emits on every crossing (measured: 20 emissions → 1 on a replayed hovering
+  score). The engine has the hysteresis. Diffing before Package 2 compares a
+  flapping browser against a debounced engine and "fails" every session.
+- **A browser tab is open from before 08:30 CT until 15:00 CT on each diff
+  session.** The browser has no CVD rebuild — its CVD starts when the page
+  loads — so a tab opened at 10:00 scores a different CVD (25 of 100 points)
+  all day and fires at different moments. Open the app before the bell and
+  leave it open; sessions without that are not qualifying sessions.
+- **SPX and NDX are excluded.** The engine deliberately does not score them
+  (index products print no trades); the browser still does.
+
+### What "matching" means, numerically
+
+A browser row and an engine row **match** when they have the same `ticker` and
+the same signal type, and their fire times are within **120 seconds**
+(`abs(engine_shadow_signals.fired_at − signals.entry_utc) ≤ 120000`), paired
+one-to-one, earliest first. Both columns hold the UTC millisecond the signal
+fired in its own process, so a small gap is expected; two minutes is generous.
+
+A **qualifying session passes** when all of these hold:
+
+| check | threshold |
+|---|---|
+| engine recall — share of engine signals with a browser match | ≥ 90% |
+| browser recall — share of browser signals with an engine match | ≥ 90% |
+| confidence gap on matched pairs, `abs(confidence − conviction)` | median ≤ 3 pts, 95th percentile ≤ 8 pts |
+| price gap on matched pairs, `abs(trigger_price − entry_price) / entry_price` | median ≤ 0.05% |
+
+**The cutover gate:** three consecutive qualifying sessions pass, AND across
+those three sessions no single ticker or signal type with at least 10 signals
+has recall below 75% in either direction. A pass on totals that hides one
+systematically missing ticker is not a pass.
+
+This replaces "wait two weeks": the diff needs enough sessions to expose a
+systematic difference, not a large sample. Three clean sessions is that.
+
+### The diff query (run once per session date)
+
+```sql
+with e as (
+  select id, ticker, signal_type, confidence, trigger_price, fired_at
+  from public.engine_shadow_signals
+  where session_date = date '2026-09-14'            -- the session to check
+    and ticker not in ('SPX', 'NDX')
+), b as (
+  select id, ticker, signal_type, conviction, entry_price, entry_utc
+  from public.signals
+  where to_timestamp(entry_utc / 1000.0) at time zone 'America/Chicago' >= timestamp '2026-09-14 08:30'
+    and to_timestamp(entry_utc / 1000.0) at time zone 'America/Chicago' <  timestamp '2026-09-14 15:00'
+    and ticker not in ('SPX', 'NDX')
+    and coalesce(is_backtested, false) = false
+), pairs as (
+  -- nearest browser row within 120 s for each engine row
+  select distinct on (e.id) e.id as eid, b.id as bid, e.ticker, e.signal_type,
+         abs(e.confidence - b.conviction)                  as conf_gap,
+         abs(e.trigger_price - b.entry_price) / b.entry_price as price_gap
+  from e join b
+    on b.ticker = e.ticker and b.signal_type = e.signal_type
+   and abs(e.fired_at - b.entry_utc) <= 120000
+  order by e.id, abs(e.fired_at - b.entry_utc)
+), one_to_one as (
+  select distinct on (bid) * from pairs order by bid, conf_gap
+)
+select
+  (select count(*) from e)                                              as engine_signals,
+  (select count(*) from b)                                              as browser_signals,
+  count(*)                                                              as matched,
+  round(count(*)::numeric / nullif((select count(*) from e), 0), 3)    as engine_recall,
+  round(count(*)::numeric / nullif((select count(*) from b), 0), 3)    as browser_recall,
+  percentile_cont(0.5)  within group (order by conf_gap)                as conf_gap_median,
+  percentile_cont(0.95) within group (order by conf_gap)                as conf_gap_p95,
+  percentile_cont(0.5)  within group (order by price_gap)               as price_gap_median
+from one_to_one;
+```
+
+For the per-ticker check, add `group by ticker` (and separately `group by
+signal_type`) to the final select, with the same counts computed per group.
+
+1. **Run the diff** on each qualifying session until the gate above passes. Any
+   systematic difference is a bug in one of the two engines — find and fix it
+   first, then restart the count of three.
 
 2. **Disable browser writes, in the same deploy as the flip.**
    Wegic side: stop `signalLedger` / ingestion writes in the browser build.
