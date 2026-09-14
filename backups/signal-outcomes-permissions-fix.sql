@@ -31,6 +31,23 @@
 -- fixed here for the same reason it wasn't fixed on the other two tables,
 -- though revoking ALL removes it too as a side effect.
 --
+-- ── Round 1 of this fix was incomplete — corrected 2026-09-13 ──────────────
+-- The first version below only did `drop policy if exists signal_outcomes_update`
+-- before creating the new one, on the wrong assumption that any pre-existing
+-- UPDATE policy would share that name. It didn't: the original unrestricted
+-- policy already had its own name, `anon_update_outcomes`, from whenever this
+-- table was first set up — unknown to us until Wegic ran a full pg_policies
+-- listing and reported it back. Postgres runs multiple PERMISSIVE policies
+-- for the same command as an OR: a row is allowed through if it satisfies
+-- ANY of them. So the old unconditioned policy stayed active side by side
+-- with the new restricted one, and the table was exactly as open as before —
+-- adding a stricter policy does not override a looser one under a different
+-- name; the looser one has to be dropped explicitly, by its real name.
+-- The general lesson: `drop policy if exists <name-you-expect>` is only safe
+-- when you know every existing policy's actual name — list them first
+-- (`select policyname from pg_policies where tablename = '<table>'`) rather
+-- than assume, especially on a table this session did not create itself.
+--
 -- Safe to run more than once.
 
 revoke all on public.signal_outcomes from anon;
@@ -38,6 +55,9 @@ grant select, insert, update on public.signal_outcomes to anon;
 -- (the sequence/id grant, if any, is unchanged by this file — signal_outcomes'
 -- primary key convention was not part of this investigation)
 
+-- The original permissive policy, name confirmed by Wegic 2026-09-13 — must
+-- be dropped explicitly, not assumed away by dropping our own policy's name.
+drop policy if exists anon_update_outcomes on public.signal_outcomes;
 drop policy if exists signal_outcomes_update on public.signal_outcomes;
 create policy signal_outcomes_update on public.signal_outcomes
   for update to anon
@@ -64,8 +84,12 @@ create policy signal_outcomes_update on public.signal_outcomes
 --   select policyname, cmd, qual, with_check
 --   from pg_policies
 --   where tablename = 'signal_outcomes'
---   order by cmd;
--- Expected: the UPDATE policy's qual/with_check both reference signals.status = 'pending'.
+--   order by cmd, policyname;
+-- List every row — do not just check for the one you expect. Confirm by eye:
+-- exactly ONE row with cmd = 'UPDATE', named signal_outcomes_update, and its
+-- qual/with_check both reference signals.status = 'pending'. If a second
+-- UPDATE row shows up under any other name, it must be dropped by that name
+-- before this table is actually fixed — send the full list back either way.
 --
 -- Verify it does not break the live write path (run this AFTER the next
 -- resolution pass while the market is open — outcomeResolver polls every 60s):
