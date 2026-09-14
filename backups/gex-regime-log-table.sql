@@ -51,6 +51,23 @@ create index if not exists gex_regime_log_session_ticker
 -- the outcome UPDATE would match zero rows and report success — the silent
 -- failure this project has already hit once on `signals` (a DELETE that
 -- returned 200 and removed nothing).
+--
+-- REVOKE ALL first: Supabase's own project bootstrap sets a default
+-- privilege on the `public` schema that grants ALL table privileges to
+-- anon automatically on every CREATE TABLE, before this file's GRANTs ever
+-- run. A GRANT can only add privileges, never narrow ones a schema default
+-- already opened — confirmed 2026-09-13, after running this file without
+-- the REVOKE: anon held DELETE, INSERT, REFERENCES, SELECT, TRIGGER,
+-- TRUNCATE and UPDATE on every column, not just SELECT/INSERT and the two
+-- outcome columns. RLS blocked DELETE in practice (no delete policy — same
+-- shape as the `signals` bug above) and TRUNCATE is not reachable through
+-- PostgREST (no HTTP verb for it), but the unrestricted UPDATE was real and
+-- reachable through the ordinary REST client: with the update policy below
+-- unconditioned (`using (true)`), anon could overwrite flip_level, spot,
+-- gex_regime or observed_at on any existing row — the exact data this table
+-- exists to make un-overwritable. Revoking first and re-granting narrowly
+-- is idempotent; safe to run again on a table already fixed.
+revoke all on public.gex_regime_log from anon;
 grant select, insert on public.gex_regime_log to anon;
 grant update (fwd_30m_pct, fwd_60m_pct) on public.gex_regime_log to anon;
 grant usage, select on sequence public.gex_regime_log_id_seq to anon;

@@ -37,6 +37,13 @@ create index if not exists engine_shadow_signals_session_ticker
 -- Permissions for the anon role, which is the only key the engine has.
 -- Without these the insert fails and the engine logs it; under row level
 -- security without policies a read would silently return nothing.
+--
+-- REVOKE ALL first — see gex-regime-log-table.sql's grant comment for why:
+-- Supabase's schema-level default grants ALL to anon on every new table
+-- automatically, and a GRANT alone cannot narrow that. Confirmed 2026-09-13
+-- on this table too (anon held DELETE/REFERENCES/TRIGGER/TRUNCATE/UPDATE in
+-- addition to the intended SELECT/INSERT). Idempotent; safe to re-run.
+revoke all on public.engine_shadow_signals from anon;
 grant select, insert on public.engine_shadow_signals to anon;
 grant usage, select on sequence public.engine_shadow_signals_id_seq to anon;
 

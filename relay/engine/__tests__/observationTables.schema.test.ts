@@ -53,6 +53,30 @@ function anonGrants(sql: string, table: string): string[] {
 const policyFor = (sql: string, table: string, op: string) =>
   new RegExp(`create policy \\w+ on public\\.${table}\\s+for ${op} to anon`).test(sql);
 
+/**
+ * Position of `revoke all on public.<table> from anon;` relative to the
+ * first `grant … to anon` line — or null if the revoke is missing.
+ *
+ * Confirmed 2026-09-13: Supabase's own project bootstrap grants ALL table
+ * privileges to anon automatically on every CREATE TABLE, before any
+ * migration-specific GRANT runs — a GRANT can only add privileges, never
+ * narrow what that schema default already opened. Without an explicit
+ * REVOKE first, anon held DELETE, REFERENCES, TRIGGER, TRUNCATE and UPDATE
+ * on every column of both tables, not just what the GRANT lines below name.
+ * The reachable one (checked against PostgREST's exposed methods, which
+ * include `patch` for anon on every table here): UPDATE — with the update
+ * policy unconditioned (`using (true)`), anon could overwrite any column on
+ * any existing row through the ordinary REST client, including flip_level,
+ * the one value this table exists to make un-overwritable.
+ */
+function revokeBeforeGrant(sql: string, table: string): 'missing' | 'wrong-order' | 'ok' {
+  const revokeAt = sql.search(new RegExp(`^revoke all on public\\.${table} from anon;`, 'm'));
+  const grantAt = sql.search(new RegExp(`^grant .+ on public\\.${table} to anon;`, 'm'));
+  if (revokeAt === -1) return 'missing';
+  if (grantAt !== -1 && revokeAt > grantAt) return 'wrong-order';
+  return 'ok';
+}
+
 describe('gex_regime_log — DDL matches what regimeLog.ts writes', () => {
   const sql = read('../../../backups/gex-regime-log-table.sql');
   const src = read('../session/regimeLog.ts');
@@ -94,6 +118,10 @@ describe('gex_regime_log — DDL matches what regimeLog.ts writes', () => {
     expect(sql).toMatch(/alter table public\.gex_regime_log enable row level security;/);
     for (const op of ['select', 'insert', 'update']) expect(policyFor(sql, 'gex_regime_log', op), `no ${op} policy`).toBe(true);
   });
+
+  it('revokes the schema default before granting — a GRANT alone cannot narrow it', () => {
+    expect(revokeBeforeGrant(sql, 'gex_regime_log'), 'missing or misordered REVOKE ALL … FROM anon before the GRANTs').toBe('ok');
+  });
 });
 
 describe('engine_shadow_signals — DDL matches what shadowSignalLog.ts writes', () => {
@@ -117,5 +145,9 @@ describe('engine_shadow_signals — DDL matches what shadowSignalLog.ts writes',
     expect(g).not.toContain('delete');
     expect(sql).toMatch(/grant usage, select on sequence public\.engine_shadow_signals_id_seq to anon;/);
     for (const op of ['select', 'insert']) expect(policyFor(sql, 'engine_shadow_signals', op), `no ${op} policy`).toBe(true);
+  });
+
+  it('revokes the schema default before granting — a GRANT alone cannot narrow it', () => {
+    expect(revokeBeforeGrant(sql, 'engine_shadow_signals'), 'missing or misordered REVOKE ALL … FROM anon before the GRANTs').toBe('ok');
   });
 });
