@@ -18,6 +18,7 @@
 import * as barsStore from './barsStore';
 import { FEED_TICKERS } from '../state/directionState';
 import { formatError }  from '../lib/errors';
+import { RELAY_REST_URL } from '../config';
 
 // ── NewsArticle ────────────────────────────────────────────────────────────────
 
@@ -221,19 +222,18 @@ function _isMarketOpen(): boolean {
   return barsStore.getResult('SPY').status === 'ready';
 }
 
-const _API_KEY = import.meta.env.VITE_MASSIVE_API_KEY ?? '';
-const _BASE_URL = 'https://api.massive.com';
+// Through the relay's /rest/ proxy, which attaches the apiKey server-side
+// (relay/index.js: "the browser never sends or sees the key"). Reading
+// VITE_MASSIVE_API_KEY here instead would inline the key into the client
+// bundle at build time, where anyone loading the page can read it — and the
+// old call also put it in a URL query string, which proxies and CDNs log.
+const _BASE_URL = `${RELAY_REST_URL}/rest`;
 
 async function _poll(): Promise<void> {
   if (!_isMarketOpen()) return;
 
-  if (!_API_KEY) {
-    console.warn('[newsStore] VITE_MASSIVE_API_KEY not set — skipping poll');
-    return;
-  }
-
   try {
-    const url = `${_BASE_URL}/v2/reference/news?limit=50&order=desc&apiKey=${_API_KEY}`;
+    const url = `${_BASE_URL}/v2/reference/news?limit=50&order=desc`;
     const res = await fetch(url);
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
 
